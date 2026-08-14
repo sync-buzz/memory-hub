@@ -1,6 +1,6 @@
 [package]
-name = "git-memory"
-description = "Standalone, Git-backed project memory"
+name = "git-memory-mcp"
+description = "Public MCP stdio interface for Git Memory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,18 +9,14 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
-[[bin]]
-name = "git-memory"
-path = "src/main.rs"
-
 [dependencies]
-clap.workspace = true
-git-memory-mcp = { path = "../git-memory-mcp" }
+git-memory-core = { path = "../git-memory-core" }
+git-memory-store = { path = "../git-memory-store" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-git-memory-contract = { path = "../git-memory-contract" }
 tempfile.workspace = true
 
 [lints]

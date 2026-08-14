@@ -4,11 +4,11 @@ Git Memory is a standalone, Git-backed project memory engine. The executable is
 named `git-memory`, so Git exposes it as `git memory` whenever it is available on
 `PATH`.
 
-The repository currently contains the bootstrap CLI, the product-neutral
-envelope and policy contract, the atomic Git object store, and a reusable
-black-box behavioral contract harness. The production MCP interface, index,
-search, and encryption implementation are intentionally outside the current
-scope.
+The repository contains the bootstrap CLI, the product-neutral envelope and
+policy contract, the atomic Git object store, the public MCP stdio interface,
+and a reusable black-box behavioral contract harness. Index, search, remote
+exchange, and encryption implementations are intentionally capability-gated for
+later releases.
 
 ## Build and verify
 
@@ -67,6 +67,25 @@ libgit2 ref compare-and-swap, rebase concurrent different-record writes, and
 return structured same-record conflicts. It also owns checkpoints, history,
 diff, and deterministic import/export. See
 [`crates/git-memory-store/README.md`](crates/git-memory-store/README.md).
+
+## MCP interface
+
+Start the only public machine interface with an explicit repository:
+
+```sh
+git memory mcp --project /absolute/path/to/repository
+```
+
+The server speaks MCP `2025-11-25` over stdio. Initialization publishes the
+Memory interface, store, envelope, and index versions together with capability
+availability, installation/project identifiers, encryption mode, and the
+resolved Git directory. Clients may require a Memory interface major through
+`_meta.gitMemory.memoryInterfaceVersion`; an incompatible major is rejected
+before Git Memory creates or moves a ref.
+
+See [`crates/git-memory-mcp/README.md`](crates/git-memory-mcp/README.md) for the
+resource and tool schemas, version handshake, errors, and revision subscription
+contract.
 
 ## Bootstrap commands
 

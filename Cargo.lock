@@ -218,6 +218,8 @@ name = "git-memory"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "git-memory-contract",
+ "git-memory-mcp",
  "serde",
  "serde_json",
  "tempfile",
@@ -242,6 +244,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "git-memory-mcp"
+version = "0.1.0"
+dependencies = [
+ "git-memory-core",
+ "git-memory-store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

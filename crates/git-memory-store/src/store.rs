@@ -46,6 +46,34 @@ enum RebaseMode {
 }
 
 impl GitStore {
+    /// Resolve the actual Git directory without initializing Memory refs.
+    ///
+    /// This read-only discovery path is used during protocol negotiation so an
+    /// incompatible client can be rejected before the first store mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if `project` is not an absolute repository path.
+    pub fn discover_git_dir(project: impl AsRef<Path>) -> Result<PathBuf, StoreError> {
+        let project = project.as_ref();
+        if !project.is_absolute() {
+            return Err(StoreError::new(
+                StoreErrorKind::InvalidArgument,
+                "project must be an absolute repository root or Git directory",
+                serde_json::json!({"field": "project"}),
+            ));
+        }
+        Repository::open(project)
+            .map(|repository| repository.path().to_path_buf())
+            .map_err(|error| StoreError::repository("discover explicit project", error))
+    }
+
+    /// Return the resolved Git directory owned by this store.
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     /// Open an explicit absolute repository root or Git directory and initialize
     /// the private staged ref when needed.
     ///
@@ -62,9 +90,7 @@ impl GitStore {
                 serde_json::json!({"field": "project"}),
             ));
         }
-        let repository = Repository::open(project)
-            .map_err(|error| StoreError::repository("open explicit project", error))?;
-        let git_dir = repository.path().to_path_buf();
+        let git_dir = Self::discover_git_dir(project)?;
         let store = Self { git_dir };
         store.ensure_staged()?;
         Ok(store)

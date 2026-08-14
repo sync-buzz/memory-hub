@@ -22,6 +22,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the public Git Memory MCP interface over standard input/output.
+    Mcp {
+        /// Repository or Git directory. Defaults to the current directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+
     /// Check whether Git Memory can operate in a repository.
     Doctor {
         /// Repository or a path inside it. Defaults to the current directory.
@@ -63,6 +70,20 @@ where
     };
 
     match cli.command {
+        Command::Mcp { project } => {
+            let project = match project.map_or_else(std::env::current_dir, Ok) {
+                Ok(project) => project,
+                Err(error) => {
+                    eprintln!("git-memory: unable to resolve current directory: {error}");
+                    return Code::Internal;
+                }
+            };
+            if let Err(error) = git_memory_mcp::serve(&project) {
+                eprintln!("git-memory: MCP server failed: {error}");
+                return Code::Internal;
+            }
+            Code::Success
+        }
         Command::Doctor { project, output } => {
             let report = doctor::inspect(project.as_deref());
             let render_result = match output {
