@@ -1,0 +1,56 @@
+# Git Memory behavioral contract
+
+This crate is the reusable black-box acceptance suite for Git Memory servers.
+It is intentionally a separate workspace package and has no dependency on the
+`git-memory` package. Consumers call `run_contract` or execute the
+`git-memory-contract` runner; they do not copy scenario sources.
+
+## Target boundary
+
+`ReleaseBinaryTarget` launches:
+
+```text
+<binary> mcp --project <temporary-git-repository>
+```
+
+`FakeServerTarget` launches the deterministic fake directly. Both are fresh
+stdio processes and receive newline-delimited JSON-RPC 2.0. The client performs
+MCP initialization before each operation. No public in-process Rust server
+adapter exists.
+
+The fake is a harness executable, not a second Git Memory runtime. Its state is
+deterministic, project-scoped, and atomically replaced on disk so that a new
+process can observe an interrupted session's outcome.
+
+## Exercised public surface
+
+- resource `memory://revision/current`;
+- tool `memory_apply_transaction` with `transaction_id`,
+  `expected_revision`, and a bulk `operations` array;
+- tool `memory_get_record` with an explicit immutable `revision`;
+- MCP tool errors using
+  `isError: true` and `structuredContent.error.{kind,data}`.
+
+Successful transaction results contain `revision` and `changed_keys`. A stale
+transaction touching keys unchanged since its expected revision is reapplied to
+the current snapshot. A stale transaction touching a changed key returns
+`kind: conflict` with expected/current revisions, conflicting keys, and a
+recovery action. Retrying the same `transaction_id` converges on its original
+revision.
+
+The fixture records use only generic `note` records and neutral opaque client
+metadata. They contain no product-specific entity kinds or metadata.
+
+## Reuse
+
+From Rust, depend on this package and supply a process target:
+
+```rust,no_run
+use git_memory_contract::{ReleaseBinaryTarget, run_contract};
+
+let report = run_contract(&ReleaseBinaryTarget::new("/opt/bin/git-memory"));
+assert!(report.passed, "{report:#?}");
+```
+
+For language-independent CI, run the binary with `--output json`. The report has
+a versioned shape and one result per shared scenario.

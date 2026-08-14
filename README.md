@@ -4,9 +4,9 @@ Git Memory is a standalone, Git-backed project memory engine. The executable is
 named `git-memory`, so Git exposes it as `git memory` whenever it is available on
 `PATH`.
 
-This repository currently contains the bootstrap CLI only. The canonical store,
-MCP interface, index, search, and encryption are intentionally outside this
-initial scope.
+The repository currently contains the bootstrap CLI and a reusable black-box
+behavioral contract harness. The canonical store, production MCP interface,
+index, search, and encryption are intentionally outside the current scope.
 
 ## Build and verify
 
@@ -18,6 +18,33 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## Behavioral contract harness
+
+`git-memory-contract` runs one shared suite through the public MCP stdio
+interface. It never links to private Git Memory implementation crates. A
+consumer can run the suite against a shipped binary:
+
+```sh
+cargo run -p git-memory-contract -- \
+  --release-binary /path/to/git-memory
+```
+
+The repository also ships a deterministic process-level fake for client and
+harness development:
+
+```sh
+cargo build -p git-memory-contract --bins
+cargo run -p git-memory-contract -- \
+  --fake-binary target/debug/git-memory-contract-fake
+```
+
+Both targets execute the same scenarios: atomic batch rejection, immutable
+snapshot reads, stale writers touching different keys, same-key conflict, and
+recovery/idempotent retry after a severed stdio session. Failures are asserted
+from structured `kind` and `data`, never from stderr text. See
+[`crates/git-memory-contract/README.md`](crates/git-memory-contract/README.md) for
+the process contract and reuse instructions.
 
 ## Bootstrap commands
 
