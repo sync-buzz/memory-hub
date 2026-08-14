@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -86,7 +86,9 @@ pub(crate) fn interrupt_transaction(
             "arguments": arguments
         }
     }))?;
-    if target.has_synchronized_interruption() {
+    if let Some(marker) = target.interruption_marker(project) {
+        wait_for_marker(&marker)?;
+    } else if target.has_synchronized_interruption() {
         session.wait_for_progress(INTERRUPT_PROGRESS_TOKEN)?;
     }
     session
@@ -94,6 +96,20 @@ pub(crate) fn interrupt_transaction(
         .kill()
         .map_err(|error| CallError::Transport(error.to_string()))?;
     let _ = session.child.wait();
+    Ok(())
+}
+
+fn wait_for_marker(marker: &Path) -> Result<(), CallError> {
+    let started = Instant::now();
+    while !marker.is_file() {
+        if started.elapsed() >= RESPONSE_TIMEOUT {
+            return Err(CallError::Transport(format!(
+                "pre-ref-update marker was not created at {}",
+                marker.display()
+            )));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     Ok(())
 }
 

@@ -36,12 +36,22 @@ struct State {
     next_revision: u64,
     snapshots: BTreeMap<String, Snapshot>,
     completed: BTreeMap<String, TransactionResult>,
+    #[serde(default)]
+    checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TransactionResult {
     revision: String,
     changed_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Checkpoint {
+    commit: String,
+    revision: String,
+    message: String,
+    timestamp: i64,
 }
 
 impl Default for State {
@@ -51,6 +61,7 @@ impl Default for State {
             next_revision: 1,
             snapshots: BTreeMap::from([("r0".to_owned(), Snapshot::default())]),
             completed: BTreeMap::new(),
+            checkpoints: Vec::new(),
         }
     }
 }
@@ -171,6 +182,11 @@ fn call_tool(
             apply_transaction(state_path, &arguments, progress_token, output)
         }
         "memory_get_record" => get_record(state_path, &arguments),
+        "memory_checkpoint" => checkpoint(state_path, &arguments),
+        "memory_history" => history(state_path, &arguments),
+        "memory_diff" => diff(state_path, &arguments),
+        "memory_export" => export(state_path, &arguments),
+        "memory_import" => import(state_path, &arguments),
         _ => {
             return Err(RpcFailure {
                 code: -32_602,
@@ -228,7 +244,12 @@ fn list_tools() -> Value {
                     },
                     "required": ["key", "revision"]
                 }
-            }
+            },
+            {"name": "memory_checkpoint", "description": "Checkpoint", "inputSchema": {"type": "object"}},
+            {"name": "memory_history", "description": "History", "inputSchema": {"type": "object"}},
+            {"name": "memory_diff", "description": "Diff", "inputSchema": {"type": "object"}},
+            {"name": "memory_export", "description": "Export", "inputSchema": {"type": "object"}},
+            {"name": "memory_import", "description": "Import", "inputSchema": {"type": "object"}}
         ]
     })
 }
@@ -352,6 +373,175 @@ fn get_record(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure
     Ok(json!({"revision": revision, "record": snapshot.records.get(key)}))
 }
 
+fn checkpoint(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let message = required_string(arguments, "message")?;
+    let (_lock, mut state) = load_locked_state(state_path)?;
+    let checkpoint = Checkpoint {
+        commit: format!("c{}", state.checkpoints.len() + 1),
+        revision: state.current.clone(),
+        message: message.to_owned(),
+        timestamp: i64::try_from(state.checkpoints.len()).unwrap_or(i64::MAX),
+    };
+    state.checkpoints.push(checkpoint.clone());
+    save_state(state_path, &state).map_err(state_failure)?;
+    Ok(json!(checkpoint))
+}
+
+fn history(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .min(1_000);
+    let limit = usize::try_from(limit).unwrap_or(1_000);
+    let state = load_state(state_path).map_err(state_failure)?;
+    let checkpoints = state
+        .checkpoints
+        .iter()
+        .rev()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(json!({"checkpoints": checkpoints}))
+}
+
+fn diff(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let from_revision = required_string(arguments, "from_revision")?;
+    let to_revision = required_string(arguments, "to_revision")?;
+    let state = load_state(state_path).map_err(state_failure)?;
+    let from = state
+        .snapshots
+        .get(from_revision)
+        .ok_or_else(|| ToolFailure {
+            kind: "snapshot_not_found",
+            data: json!({"revision": from_revision}),
+        })?;
+    let to = state
+        .snapshots
+        .get(to_revision)
+        .ok_or_else(|| ToolFailure {
+            kind: "snapshot_not_found",
+            data: json!({"revision": to_revision}),
+        })?;
+    let keys = from
+        .records
+        .keys()
+        .chain(to.records.keys())
+        .collect::<BTreeSet<_>>();
+    let changes = keys
+        .into_iter()
+        .filter_map(|key| {
+            let kind = match (from.records.get(key), to.records.get(key)) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "deleted",
+                (Some(left), Some(right)) if left != right => "modified",
+                _ => return None,
+            };
+            Some(json!({
+                "id": {"addressing": "plaintext", "value": key},
+                "kind": kind
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "fromRevision": from_revision,
+        "toRevision": to_revision,
+        "changes": changes
+    }))
+}
+
+fn export(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let revision = required_string(arguments, "revision")?;
+    let state = load_state(state_path).map_err(state_failure)?;
+    let snapshot = state.snapshots.get(revision).ok_or_else(|| ToolFailure {
+        kind: "snapshot_not_found",
+        data: json!({"revision": revision}),
+    })?;
+    let records = snapshot
+        .records
+        .iter()
+        .map(|(key, record)| json!([{"addressing": "plaintext", "value": key}, record]))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "revision": revision,
+        "bundle": {"schema_version": 1, "records": records}
+    }))
+}
+
+fn import(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let transaction_id = required_string(arguments, "transaction_id")?;
+    let expected_revision = required_string(arguments, "expected_revision")?;
+    let bundle = arguments
+        .get("bundle")
+        .ok_or_else(|| invalid_argument("bundle"))?;
+    if bundle.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err(invalid_argument("bundle"));
+    }
+    let records = bundle
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_argument("bundle"))?;
+    let mut imported = BTreeMap::new();
+    for entry in records {
+        let key = entry
+            .pointer("/0/value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_argument("bundle"))?;
+        let record = entry
+            .get(1)
+            .cloned()
+            .ok_or_else(|| invalid_argument("bundle"))?;
+        imported.insert(key.to_owned(), record);
+    }
+
+    let (_lock, mut state) = load_locked_state(state_path)?;
+    if let Some(completed) = state.completed.get(transaction_id) {
+        return Ok(json!(completed));
+    }
+    if expected_revision != state.current {
+        return Err(ToolFailure {
+            kind: "conflict",
+            data: json!({
+                "expected_revision": expected_revision,
+                "current_revision": state.current,
+                "conflicting_keys": [],
+                "recovery_action": "refresh_and_retry"
+            }),
+        });
+    }
+    let current = state
+        .snapshots
+        .get(&state.current)
+        .ok_or_else(|| ToolFailure {
+            kind: "fake_state_invariant",
+            data: json!({"missing_revision": state.current}),
+        })?;
+    let changed_keys = current
+        .records
+        .keys()
+        .chain(imported.keys())
+        .filter(|key| current.records.get(*key) != imported.get(*key))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let revision = format!("r{}", state.next_revision);
+    state.next_revision += 1;
+    state.current.clone_from(&revision);
+    state
+        .snapshots
+        .insert(revision.clone(), Snapshot { records: imported });
+    let result = TransactionResult {
+        revision,
+        changed_keys,
+    };
+    state
+        .completed
+        .insert(transaction_id.to_owned(), result.clone());
+    save_state(state_path, &state).map_err(state_failure)?;
+    Ok(json!(result))
+}
+
 fn operation_key(operation: &Value) -> Result<&str, ToolFailure> {
     match operation.get("op").and_then(Value::as_str) {
         Some("put") => operation
@@ -409,6 +599,12 @@ fn pause_before_commit(
     progress_token: Option<&str>,
     output: &mut impl Write,
 ) -> Result<(), ToolFailure> {
+    if let Some(marker) = std::env::var_os("GIT_MEMORY_CONTRACT_PAUSE_BEFORE_REF_UPDATE") {
+        fs::write(marker, b"ready").map_err(state_failure)?;
+        loop {
+            thread::park();
+        }
+    }
     if std::env::var_os("GIT_MEMORY_CONTRACT_PAUSE_BEFORE_COMMIT").is_none() {
         return Ok(());
     }
@@ -471,7 +667,15 @@ mod tests {
         let tool_names = names(&tools, "tools");
         assert_eq!(
             tool_names,
-            ["memory_apply_transaction", "memory_get_record"]
+            [
+                "memory_apply_transaction",
+                "memory_get_record",
+                "memory_checkpoint",
+                "memory_history",
+                "memory_diff",
+                "memory_export",
+                "memory_import"
+            ]
         );
 
         let resources = list_resources();

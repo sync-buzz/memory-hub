@@ -22,6 +22,7 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ("different_key_race", different_key_race),
     ("same_key_conflict", same_key_conflict),
     ("interrupted_write_recovery", interrupted_write_recovery),
+    ("history_diff_import_export", history_diff_import_export),
 ];
 
 #[derive(Debug, Serialize)]
@@ -378,6 +379,202 @@ fn interrupted_write_recovery(target: &dyn ServerTarget, project: &Path) -> Resu
     )?;
     assert_record_absent(target, project, "discard", &revision)?;
     assert_record_content(target, project, "discard", &base, "old value")
+}
+
+fn history_diff_import_export(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
+    let base = current_revision(target, project)?;
+    let first = apply(
+        target,
+        project,
+        "history-first",
+        &base,
+        vec![
+            put(record("alpha", "version one")),
+            put(record("removed", "temporary")),
+        ],
+    )
+    .map_err(display)?;
+    let first_revision = string_field(&first, "revision")?;
+    let first_checkpoint = call_tool(
+        target,
+        project,
+        "memory_checkpoint",
+        json!({"message": "first checkpoint"}),
+    )
+    .map_err(display)?;
+
+    let second = apply(
+        target,
+        project,
+        "history-second",
+        &first_revision,
+        vec![
+            put(record("alpha", "version two")),
+            put(record("added", "new value")),
+            delete("removed"),
+        ],
+    )
+    .map_err(display)?;
+    let second_revision = string_field(&second, "revision")?;
+    let second_checkpoint = call_tool(
+        target,
+        project,
+        "memory_checkpoint",
+        json!({"message": "second checkpoint"}),
+    )
+    .map_err(display)?;
+
+    assert_history_and_diff(
+        target,
+        project,
+        &first_revision,
+        &second_revision,
+        &first_checkpoint,
+        &second_checkpoint,
+    )?;
+    assert_export_import_round_trip(target, project, &second_revision)
+}
+
+fn assert_history_and_diff(
+    target: &dyn ServerTarget,
+    project: &Path,
+    first_revision: &str,
+    second_revision: &str,
+    first_checkpoint: &Value,
+    second_checkpoint: &Value,
+) -> Result<(), String> {
+    let history =
+        call_tool(target, project, "memory_history", json!({"limit": 10})).map_err(display)?;
+    let checkpoints = history
+        .get("checkpoints")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("history response has no checkpoints: {history}"))?;
+    equal(checkpoints.len(), 2, "checkpoint history length differs")?;
+    equal(
+        checkpoints[0].get("commit"),
+        second_checkpoint.get("commit"),
+        "newest checkpoint differs",
+    )?;
+    equal(
+        checkpoints[1].get("commit"),
+        first_checkpoint.get("commit"),
+        "oldest checkpoint differs",
+    )?;
+
+    let diff = call_tool(
+        target,
+        project,
+        "memory_diff",
+        json!({"from_revision": first_revision, "to_revision": second_revision}),
+    )
+    .map_err(display)?;
+    assert_changes(
+        &diff,
+        &[
+            ("added", "added"),
+            ("alpha", "modified"),
+            ("removed", "deleted"),
+        ],
+    )
+}
+
+fn assert_export_import_round_trip(
+    target: &dyn ServerTarget,
+    project: &Path,
+    revision: &str,
+) -> Result<(), String> {
+    let exported = call_tool(
+        target,
+        project,
+        "memory_export",
+        json!({"revision": revision}),
+    )
+    .map_err(display)?;
+    let repeated = call_tool(
+        target,
+        project,
+        "memory_export",
+        json!({"revision": revision}),
+    )
+    .map_err(display)?;
+    let bundle = exported
+        .get("bundle")
+        .cloned()
+        .ok_or_else(|| format!("export response has no bundle: {exported}"))?;
+    let repeated_bundle = repeated
+        .get("bundle")
+        .ok_or_else(|| format!("repeated export response has no bundle: {repeated}"))?;
+    let bundle_bytes = serde_json::to_vec(&bundle).map_err(|error| error.to_string())?;
+    equal(
+        bundle_bytes.clone(),
+        serde_json::to_vec(repeated_bundle).map_err(|error| error.to_string())?,
+        "repeated export bytes differ",
+    )?;
+
+    let changed = apply(
+        target,
+        project,
+        "before-import",
+        revision,
+        vec![put(record("drift", "must disappear"))],
+    )
+    .map_err(display)?;
+    let changed_revision = string_field(&changed, "revision")?;
+    let imported = call_tool(
+        target,
+        project,
+        "memory_import",
+        json!({
+            "transaction_id": "history-import",
+            "expected_revision": changed_revision,
+            "bundle": bundle
+        }),
+    )
+    .map_err(display)?;
+    let imported_revision = string_field(&imported, "revision")?;
+    assert_record_absent(target, project, "drift", &imported_revision)?;
+    let round_trip = call_tool(
+        target,
+        project,
+        "memory_export",
+        json!({"revision": imported_revision}),
+    )
+    .map_err(display)?;
+    let round_trip_bundle = round_trip
+        .get("bundle")
+        .ok_or_else(|| format!("round-trip export response has no bundle: {round_trip}"))?;
+    equal(
+        bundle_bytes,
+        serde_json::to_vec(round_trip_bundle).map_err(|error| error.to_string())?,
+        "export-import-export bytes differ",
+    )
+}
+
+fn assert_changes(value: &Value, expected: &[(&str, &str)]) -> Result<(), String> {
+    let mut actual = value
+        .get("changes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("diff response has no changes: {value}"))?
+        .iter()
+        .map(|change| {
+            let key = change
+                .pointer("/id/value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("diff change has no plaintext id: {change}"))?;
+            let kind = change
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("diff change has no kind: {change}"))?;
+            Ok((key.to_owned(), kind.to_owned()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    actual.sort_unstable();
+    let mut expected = expected
+        .iter()
+        .map(|(key, kind)| ((*key).to_owned(), (*kind).to_owned()))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    equal(actual, expected, "diff changes differ")
 }
 
 fn assert_record_content(

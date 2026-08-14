@@ -22,6 +22,13 @@ pub trait ServerTarget: Sync {
         self.command(project)
     }
 
+    /// Marker created after transaction objects are written and immediately
+    /// before the staged ref compare-and-swap. Targets without this failpoint
+    /// return `None` and retain an intentionally ambiguous kill point.
+    fn interruption_marker(&self, _project: &Path) -> Option<PathBuf> {
+        None
+    }
+
     /// Whether `interruption_command` acknowledges the pre-commit failpoint.
     fn has_synchronized_interruption(&self) -> bool {
         false
@@ -65,6 +72,23 @@ impl ServerTarget for ReleaseBinaryTarget {
             .arg("--project")
             .arg(project);
         command
+    }
+
+    fn interruption_command(&self, project: &Path) -> Command {
+        let mut command = self.command(project);
+        command.env(
+            "GIT_MEMORY_CONTRACT_PAUSE_BEFORE_REF_UPDATE",
+            project.join(".git-memory-contract-pre-ref-update"),
+        );
+        command
+    }
+
+    fn interruption_marker(&self, project: &Path) -> Option<PathBuf> {
+        Some(project.join(".git-memory-contract-pre-ref-update"))
+    }
+
+    fn has_synchronized_interruption(&self) -> bool {
+        true
     }
 }
 

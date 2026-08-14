@@ -2,7 +2,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use git_memory_core::StoredRecord;
 use git2::{ErrorCode, Oid, Repository, Signature};
@@ -17,6 +20,7 @@ use crate::{
 const MAX_CAS_ATTEMPTS: usize = 32;
 const EXPORT_SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const CONTRACT_PAUSE_BEFORE_REF_UPDATE: &str = "GIT_MEMORY_CONTRACT_PAUSE_BEFORE_REF_UPDATE";
 
 mod chain;
 mod records;
@@ -204,6 +208,7 @@ impl GitStore {
                 &request_hash,
                 &changed_ids.iter().cloned().collect::<Vec<_>>(),
             )?;
+            pause_before_ref_update()?;
             match repository.reference_matching(
                 STAGED_REF,
                 new_oid,
@@ -484,6 +489,25 @@ impl GitStore {
             Err(error) if error.code() == ErrorCode::Exists => Ok(()),
             Err(error) => Err(StoreError::repository("initialize staged ref", error)),
         }
+    }
+}
+
+/// Test-only process failpoint used by the public behavioral contract. The
+/// marker proves that all new objects exist while the staged ref still points
+/// at the previous revision; the contract runner then terminates the process.
+fn pause_before_ref_update() -> Result<(), StoreError> {
+    let Some(marker) = std::env::var_os(CONTRACT_PAUSE_BEFORE_REF_UPDATE) else {
+        return Ok(());
+    };
+    fs::write(&marker, b"ready").map_err(|error| {
+        StoreError::new(
+            StoreErrorKind::Repository,
+            "write contract failpoint marker",
+            serde_json::json!({"detail": error.to_string()}),
+        )
+    })?;
+    loop {
+        thread::park_timeout(Duration::from_secs(60));
     }
 }
 

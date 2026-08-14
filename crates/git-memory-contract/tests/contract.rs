@@ -25,7 +25,8 @@ fn deterministic_fake_passes_every_shared_scenario() {
             "snapshot_consistency",
             "different_key_race",
             "same_key_conflict",
-            "interrupted_write_recovery"
+            "interrupted_write_recovery",
+            "history_diff_import_export"
         ]
     );
 }
@@ -56,7 +57,7 @@ fn command_line_runner_emits_a_machine_readable_report() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["target"], "deterministic_fake");
     assert_eq!(report["passed"], true);
-    assert_eq!(report["scenarios"].as_array().map(Vec::len), Some(5));
+    assert_eq!(report["scenarios"].as_array().map(Vec::len), Some(6));
 }
 
 #[test]
