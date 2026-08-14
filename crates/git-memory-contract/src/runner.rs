@@ -1,3 +1,5 @@
+// Scenario values are intentionally moved into one-shot protocol messages and
+// reports, keeping the black-box runner free of borrowed JSON lifetimes.
 #![allow(clippy::needless_pass_by_value)]
 
 use std::path::Path;
@@ -10,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::ServerTarget;
 use crate::client::{CallError, call_tool, interrupt_transaction, read_resource};
-use crate::fixtures::{put, record};
+use crate::fixtures::{delete, put, record};
 
 type Scenario = fn(&dyn ServerTarget, &Path) -> Result<(), String>;
 
@@ -123,42 +125,57 @@ fn apply(
 
 fn atomic_batch(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
     let base = current_revision(target, project)?;
+    let seeded = apply(
+        target,
+        project,
+        "atomic-seed",
+        &base,
+        vec![put(record("obsolete", "remove me"))],
+    )
+    .map_err(display)?;
+    let seeded_revision = string_field(&seeded, "revision")?;
     let result = apply(
         target,
         project,
         "atomic-success",
-        &base,
-        vec![put(record("alpha", "first")), put(record("beta", "second"))],
+        &seeded_revision,
+        vec![
+            put(record("alpha", "first")),
+            put(record("beta", "second")),
+            delete("obsolete"),
+        ],
     )
     .map_err(display)?;
     let revision = string_field(&result, "revision")?;
+    assert_string_set(&result, "changed_keys", &["alpha", "beta", "obsolete"])?;
+
+    assert_record_content(target, project, "obsolete", &seeded_revision, "remove me")?;
+    assert_record_absent(target, project, "alpha", &seeded_revision)?;
+    assert_record_absent(target, project, "beta", &seeded_revision)?;
     assert_record_content(target, project, "alpha", &revision, "first")?;
     assert_record_content(target, project, "beta", &revision, "second")?;
+    assert_record_absent(target, project, "obsolete", &revision)?;
 
-    let before_invalid = current_revision(target, project)?;
     let error = require_error(
         apply(
             target,
             project,
             "atomic-invalid",
-            &before_invalid,
+            &revision,
             vec![
-                put(record("gamma", "must not persist")),
+                put(record("partial", "must not persist")),
                 json!({"op": "delete"}),
             ],
         ),
         "a structurally invalid operation must reject the entire batch",
     )?;
-    assert_tool_error(&error, "invalid_argument", "field", json!("key"))?;
+    assert_machine_error(&error, "invalid_argument", "field", json!("key"))?;
     equal(
         current_revision(target, project)?,
-        before_invalid.clone(),
-        "failed batch changed current revision",
+        revision.clone(),
+        "rejected batch changed current revision",
     )?;
-    if get_record(target, project, "gamma", &before_invalid)?.is_some() {
-        return Err("failed batch persisted one of its records".to_owned());
-    }
-    Ok(())
+    assert_record_absent(target, project, "partial", &revision)
 }
 
 fn snapshot_consistency(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
@@ -172,14 +189,26 @@ fn snapshot_consistency(target: &dyn ServerTarget, project: &Path) -> Result<(),
     )
     .map_err(display)?;
     let first_revision = string_field(&first, "revision")?;
-    let second = apply(
-        target,
-        project,
-        "snapshot-second",
-        &first_revision,
-        vec![put(record("stable", "version two"))],
-    )
-    .map_err(display)?;
+    let (second, old_read) = concurrent_pair(
+        || {
+            apply(
+                target,
+                project,
+                "snapshot-second",
+                &first_revision,
+                vec![put(record("stable", "version two"))],
+            )
+        },
+        || get_record(target, project, "stable", &first_revision),
+    )?;
+    let second = second.map_err(display)?;
+    let old_read = old_read?
+        .ok_or_else(|| "old snapshot lost its record during concurrent write".to_owned())?;
+    equal(
+        old_read.get("content").and_then(Value::as_str),
+        Some("version one"),
+        "concurrent old-snapshot read changed",
+    )?;
     let second_revision = string_field(&second, "revision")?;
     assert_record_content(target, project, "stable", &first_revision, "version one")?;
     assert_record_content(target, project, "stable", &second_revision, "version two")
@@ -187,10 +216,8 @@ fn snapshot_consistency(target: &dyn ServerTarget, project: &Path) -> Result<(),
 
 fn different_key_race(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
     let base = current_revision(target, project)?;
-    let barrier = Barrier::new(3);
-    let (left, right) = thread::scope(|scope| {
-        let left = scope.spawn(|| {
-            barrier.wait();
+    let (left, right) = concurrent_pair(
+        || {
             apply(
                 target,
                 project,
@@ -198,9 +225,8 @@ fn different_key_race(target: &dyn ServerTarget, project: &Path) -> Result<(), S
                 &base,
                 vec![put(record("left", "left writer"))],
             )
-        });
-        let right = scope.spawn(|| {
-            barrier.wait();
+        },
+        || {
             apply(
                 target,
                 project,
@@ -208,12 +234,10 @@ fn different_key_race(target: &dyn ServerTarget, project: &Path) -> Result<(), S
                 &base,
                 vec![put(record("right", "right writer"))],
             )
-        });
-        barrier.wait();
-        (join_call(left), join_call(right))
-    });
-    let left = left?;
-    let right = right?;
+        },
+    )?;
+    let left = left.map_err(display)?;
+    let right = right.map_err(display)?;
     let left_revision = string_field(&left, "revision")?;
     let right_revision = string_field(&right, "revision")?;
     if left_revision == right_revision {
@@ -226,10 +250,8 @@ fn different_key_race(target: &dyn ServerTarget, project: &Path) -> Result<(), S
 
 fn same_key_conflict(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
     let base = current_revision(target, project)?;
-    let barrier = Barrier::new(3);
-    let (first, second) = thread::scope(|scope| {
-        let first = scope.spawn(|| {
-            barrier.wait();
+    let (first, second) = concurrent_pair(
+        || {
             apply(
                 target,
                 project,
@@ -237,9 +259,8 @@ fn same_key_conflict(target: &dyn ServerTarget, project: &Path) -> Result<(), St
                 &base,
                 vec![put(record("shared", "first writer"))],
             )
-        });
-        let second = scope.spawn(|| {
-            barrier.wait();
+        },
+        || {
             apply(
                 target,
                 project,
@@ -247,11 +268,9 @@ fn same_key_conflict(target: &dyn ServerTarget, project: &Path) -> Result<(), St
                 &base,
                 vec![put(record("shared", "second writer"))],
             )
-        });
-        barrier.wait();
-        (join_raw_call(first), join_raw_call(second))
-    });
-    let (winner, error) = match (first?, second?) {
+        },
+    )?;
+    let (winner, error) = match (first, second) {
         (Ok(winner), Err(error)) | (Err(error), Ok(winner)) => (winner, error),
         (Ok(_), Ok(_)) => return Err("both same-key writers succeeded".to_owned()),
         (Err(first), Err(second)) => {
@@ -287,15 +306,45 @@ fn same_key_conflict(target: &dyn ServerTarget, project: &Path) -> Result<(), St
 
 fn interrupted_write_recovery(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
     let base = current_revision(target, project)?;
+    let seeded = apply(
+        target,
+        project,
+        "recovery-seed",
+        &base,
+        vec![put(record("discard", "old value"))],
+    )
+    .map_err(display)?;
+    let base = string_field(&seeded, "revision")?;
     let arguments = json!({
         "transaction_id": "recovery-retry",
         "expected_revision": base,
-        "operations": [put(record("recoverable", "complete value"))]
+        "operations": [
+            put(record("recoverable-a", "first complete value")),
+            put(record("recoverable-b", "second complete value")),
+            delete("discard")
+        ]
     });
     interrupt_transaction(target, project, arguments.clone()).map_err(display)?;
 
-    // An interrupted request may have committed or may not have been observed by
-    // the server. Retrying the same transaction must converge in either case.
+    let after_interruption = current_revision(target, project)?;
+    let discard = get_record(target, project, "discard", &after_interruption)?;
+    let first = get_record(target, project, "recoverable-a", &after_interruption)?;
+    let second = get_record(target, project, "recoverable-b", &after_interruption)?;
+    let all_old =
+        record_has_content(discard.as_ref(), "old value") && first.is_none() && second.is_none();
+    let all_new = discard.is_none()
+        && record_has_content(first.as_ref(), "first complete value")
+        && record_has_content(second.as_ref(), "second complete value");
+    if !all_old && !all_new {
+        return Err("interrupted transaction exposed a partial batch".to_owned());
+    }
+    if target.has_synchronized_interruption() && (!all_old || after_interruption != base) {
+        return Err("pre-commit interruption changed the deterministic fake state".to_owned());
+    }
+
+    // A release process can be killed on either side of its atomic commit. The
+    // outcome may therefore be old or new, but retrying the transaction must
+    // converge and must never expose a partial batch.
     let result = call_tool(
         target,
         project,
@@ -311,7 +360,22 @@ fn interrupted_write_recovery(target: &dyn ServerTarget, project: &Path) -> Resu
         revision.clone(),
         "idempotent retry produced another revision",
     )?;
-    assert_record_content(target, project, "recoverable", &revision, "complete value")
+    assert_record_content(
+        target,
+        project,
+        "recoverable-a",
+        &revision,
+        "first complete value",
+    )?;
+    assert_record_content(
+        target,
+        project,
+        "recoverable-b",
+        &revision,
+        "second complete value",
+    )?;
+    assert_record_absent(target, project, "discard", &revision)?;
+    assert_record_content(target, project, "discard", &base, "old value")
 }
 
 fn assert_record_content(
@@ -327,6 +391,48 @@ fn assert_record_content(
         record.get("content").and_then(Value::as_str),
         Some(expected),
         &format!("record {key:?} has unexpected content"),
+    )
+}
+
+fn assert_record_absent(
+    target: &dyn ServerTarget,
+    project: &Path,
+    key: &str,
+    revision: &str,
+) -> Result<(), String> {
+    if get_record(target, project, key, revision)?.is_none() {
+        Ok(())
+    } else {
+        Err(format!("record {key:?} unexpectedly exists at {revision}"))
+    }
+}
+
+fn record_has_content(record: Option<&Value>, expected: &str) -> bool {
+    record
+        .and_then(|value| value.get("content"))
+        .and_then(Value::as_str)
+        == Some(expected)
+}
+
+fn assert_string_set(value: &Value, field: &str, expected: &[&str]) -> Result<(), String> {
+    let mut actual = value
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("response has no array field {field:?}: {value}"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("response field {field:?} contains a non-string"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    actual.sort_unstable();
+    let mut expected = expected.iter().map(ToString::to_string).collect::<Vec<_>>();
+    expected.sort_unstable();
+    equal(
+        actual,
+        expected,
+        &format!("response field {field:?} differs"),
     )
 }
 
@@ -351,6 +457,32 @@ fn assert_tool_error(
     )
 }
 
+fn assert_machine_error(
+    error: &CallError,
+    expected_kind: &str,
+    data_key: &str,
+    expected_value: Value,
+) -> Result<(), String> {
+    let (kind, data) = match error {
+        CallError::Tool { kind, data } => (kind.as_str(), data),
+        CallError::Rpc { data, .. } => {
+            let kind = data
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("JSON-RPC error has no machine-readable kind: {error}"))?;
+            let data = data.get("data").unwrap_or(data);
+            (kind, data)
+        }
+        _ => return Err(format!("expected machine-readable error, got {error}")),
+    };
+    equal(kind, expected_kind, "machine-readable error kind differs")?;
+    equal(
+        data.get(data_key),
+        Some(&expected_value),
+        &format!("machine-readable error data.{data_key} differs"),
+    )
+}
+
 fn require_error(result: Result<Value, CallError>, context: &str) -> Result<CallError, String> {
     match result {
         Ok(value) => Err(format!("{context}; received success: {value}")),
@@ -358,18 +490,33 @@ fn require_error(result: Result<Value, CallError>, context: &str) -> Result<Call
     }
 }
 
-fn join_call(
-    handle: thread::ScopedJoinHandle<'_, Result<Value, CallError>>,
-) -> Result<Value, String> {
-    join_raw_call(handle)?.map_err(display)
-}
-
-fn join_raw_call(
-    handle: thread::ScopedJoinHandle<'_, Result<Value, CallError>>,
-) -> Result<Result<Value, CallError>, String> {
-    handle
-        .join()
-        .map_err(|_| "contract worker thread panicked".to_owned())
+fn concurrent_pair<L, R>(
+    left: impl FnOnce() -> L + Send,
+    right: impl FnOnce() -> R + Send,
+) -> Result<(L, R), String>
+where
+    L: Send,
+    R: Send,
+{
+    let barrier = Barrier::new(3);
+    thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            barrier.wait();
+            left()
+        });
+        let right = scope.spawn(|| {
+            barrier.wait();
+            right()
+        });
+        barrier.wait();
+        let left = left
+            .join()
+            .map_err(|_| "left contract worker thread panicked".to_owned())?;
+        let right = right
+            .join()
+            .map_err(|_| "right contract worker thread panicked".to_owned())?;
+        Ok((left, right))
+    })
 }
 
 fn string_field(value: &Value, field: &str) -> Result<String, String> {

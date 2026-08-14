@@ -1,24 +1,25 @@
-#![allow(clippy::expect_used)]
+// Fake responses own short-lived JSON values at the serialization boundary.
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use clap::Parser;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use git_memory_contract::{MCP_PROTOCOL_VERSION, MEMORY_INTERFACE_VERSION};
+use git_memory_contract::MCP_PROTOCOL_VERSION;
 
 #[derive(Debug, Parser)]
 #[command(about = "Deterministic black-box fake for the Git Memory contract")]
 struct Cli {
     /// Accepted so this binary can also exercise the release-process adapter.
     #[arg(hide = true)]
-    mcp: Option<String>,
+    _mode: Option<String>,
 
     #[arg(long)]
     project: PathBuf,
@@ -60,6 +61,13 @@ struct ToolFailure {
     data: Value,
 }
 
+#[derive(Debug)]
+struct RpcFailure {
+    code: i64,
+    message: &'static str,
+    data: Value,
+}
+
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let state_path = cli.project.join(".git-memory-contract-fake.json");
@@ -81,50 +89,72 @@ fn main() -> io::Result<()> {
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
-        let response = dispatch(&state_path, &request);
-        write_response(
-            &mut output,
-            json!({"jsonrpc": "2.0", "id": id, "result": response}),
-        )?;
+        let response = match dispatch(&state_path, &request, &mut output) {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(error) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": error.code, "message": error.message, "data": error.data}
+            }),
+        };
+        write_response(&mut output, response)?;
     }
     Ok(())
 }
 
-fn dispatch(state_path: &Path, request: &Value) -> Value {
+fn dispatch(
+    state_path: &Path,
+    request: &Value,
+    output: &mut impl Write,
+) -> Result<Value, RpcFailure> {
     match request.get("method").and_then(Value::as_str) {
-        Some("initialize") => json!({
+        Some("initialize") => Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"resources": {}, "tools": {}},
-            "serverInfo": {"name": "git-memory-contract-fake", "version": env!("CARGO_PKG_VERSION")},
-            "memoryInterfaceVersion": MEMORY_INTERFACE_VERSION
-        }),
+            "serverInfo": {"name": "git-memory-contract-fake", "version": env!("CARGO_PKG_VERSION")}
+        })),
+        Some("resources/list") => Ok(list_resources()),
         Some("resources/read") => read_resource(state_path, request),
-        Some("tools/call") => call_tool(state_path, request),
-        _ => json!({}),
+        Some("tools/list") => Ok(list_tools()),
+        Some("tools/call") => call_tool(state_path, request, output),
+        _ => Err(RpcFailure {
+            code: -32_601,
+            message: "method not found",
+            data: json!({"kind": "method_not_found"}),
+        }),
     }
 }
 
-fn read_resource(state_path: &Path, request: &Value) -> Value {
+fn read_resource(state_path: &Path, request: &Value) -> Result<Value, RpcFailure> {
     let uri = request
         .pointer("/params/uri")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if uri != "memory://revision/current" {
-        return tool_failure("resource_not_found", json!({"uri": uri}));
+        return Err(RpcFailure {
+            code: -32_602,
+            message: "resource not found",
+            data: json!({"kind": "resource_not_found", "data": {"uri": uri}}),
+        });
     }
     match load_state(state_path) {
         Ok(state) => {
             let text = json!({"revision": state.current}).to_string();
-            json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]})
+            Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}))
         }
-        Err(error) => tool_failure(
-            "fake_state_unavailable",
-            json!({"detail": error.to_string()}),
-        ),
+        Err(error) => Err(RpcFailure {
+            code: -32_603,
+            message: "fake state unavailable",
+            data: json!({"kind": "fake_state_unavailable", "data": {"detail": error.to_string()}}),
+        }),
     }
 }
 
-fn call_tool(state_path: &Path, request: &Value) -> Value {
+fn call_tool(
+    state_path: &Path,
+    request: &Value,
+    output: &mut impl Write,
+) -> Result<Value, RpcFailure> {
     let name = request
         .pointer("/params/name")
         .and_then(Value::as_str)
@@ -134,23 +164,81 @@ fn call_tool(state_path: &Path, request: &Value) -> Value {
         .cloned()
         .unwrap_or(Value::Null);
     let result = match name {
-        "memory_apply_transaction" => apply_transaction(state_path, &arguments),
+        "memory_apply_transaction" => {
+            let progress_token = request
+                .pointer("/params/_meta/progressToken")
+                .and_then(Value::as_str);
+            apply_transaction(state_path, &arguments, progress_token, output)
+        }
         "memory_get_record" => get_record(state_path, &arguments),
-        _ => Err(ToolFailure {
-            kind: "tool_not_found",
-            data: json!({"name": name}),
-        }),
+        _ => {
+            return Err(RpcFailure {
+                code: -32_602,
+                message: "tool not found",
+                data: json!({"kind": "tool_not_found", "data": {"name": name}}),
+            });
+        }
     };
-    match result {
-        Ok(content) => json!({
-            "content": [{"type": "text", "text": "request completed"}],
-            "structuredContent": content
-        }),
+    Ok(match result {
+        Ok(content) => {
+            let text = content.to_string();
+            json!({
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": content
+            })
+        }
         Err(failure) => tool_failure(failure.kind, failure.data),
-    }
+    })
 }
 
-fn apply_transaction(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+fn list_resources() -> Value {
+    json!({
+        "resources": [{
+            "name": "Current memory revision",
+            "uri": "memory://revision/current",
+            "mimeType": "application/json"
+        }]
+    })
+}
+
+fn list_tools() -> Value {
+    json!({
+        "tools": [
+            {
+                "name": "memory_apply_transaction",
+                "description": "Atomically apply a generic record transaction",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "transaction_id": {"type": "string"},
+                        "expected_revision": {"type": "string"},
+                        "operations": {"type": "array", "items": {"type": "object"}}
+                    },
+                    "required": ["transaction_id", "expected_revision", "operations"]
+                }
+            },
+            {
+                "name": "memory_get_record",
+                "description": "Read a generic record from an immutable snapshot",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "revision": {"type": "string"}
+                    },
+                    "required": ["key", "revision"]
+                }
+            }
+        ]
+    })
+}
+
+fn apply_transaction(
+    state_path: &Path,
+    arguments: &Value,
+    progress_token: Option<&str>,
+    output: &mut impl Write,
+) -> Result<Value, ToolFailure> {
     let transaction_id = required_string(arguments, "transaction_id")?;
     let expected_revision = required_string(arguments, "expected_revision")?;
     let operations = arguments
@@ -177,7 +265,10 @@ fn apply_transaction(state_path: &Path, arguments: &Value) -> Result<Value, Tool
         .snapshots
         .get(&state.current)
         .cloned()
-        .expect("current fake snapshot must exist");
+        .ok_or_else(|| ToolFailure {
+            kind: "fake_state_invariant",
+            data: json!({"missing_revision": state.current}),
+        })?;
 
     let mut keys = BTreeSet::new();
     for operation in operations {
@@ -245,6 +336,7 @@ fn apply_transaction(state_path: &Path, arguments: &Value) -> Result<Value, Tool
     state
         .completed
         .insert(transaction_id.to_owned(), result.clone());
+    pause_before_commit(progress_token, output)?;
     save_state(state_path, &state).map_err(state_failure)?;
     Ok(json!(result))
 }
@@ -311,6 +403,33 @@ fn load_locked_state(state_path: &Path) -> Result<(File, State), ToolFailure> {
     Ok((lock, state))
 }
 
+fn pause_before_commit(
+    progress_token: Option<&str>,
+    output: &mut impl Write,
+) -> Result<(), ToolFailure> {
+    if std::env::var_os("GIT_MEMORY_CONTRACT_PAUSE_BEFORE_COMMIT").is_none() {
+        return Ok(());
+    }
+    let progress_token = progress_token.ok_or_else(|| invalid_argument("_meta.progressToken"))?;
+    write_response(
+        output,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": progress_token,
+                "progress": 0,
+                "total": 1,
+                "message": "transaction prepared"
+            }
+        }),
+    )
+    .map_err(state_failure)?;
+    loop {
+        thread::park();
+    }
+}
+
 fn save_state(path: &Path, state: &State) -> io::Result<()> {
     let parent = path
         .parent()
@@ -323,10 +442,12 @@ fn save_state(path: &Path, state: &State) -> io::Result<()> {
 }
 
 fn tool_failure(kind: &str, data: Value) -> Value {
+    let structured = json!({"error": {"kind": kind, "data": data}});
+    let text = structured.to_string();
     json!({
         "isError": true,
-        "structuredContent": {"error": {"kind": kind, "data": data}},
-        "content": [{"type": "text", "text": "request failed"}]
+        "structuredContent": structured,
+        "content": [{"type": "text", "text": text}]
     })
 }
 
@@ -334,4 +455,48 @@ fn write_response(output: &mut impl Write, response: Value) -> io::Result<()> {
     serde_json::to_writer(&mut *output, &response).map_err(io::Error::other)?;
     output.write_all(b"\n")?;
     output.flush()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{dispatch, list_resources, list_tools};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn advertised_capabilities_have_discovery_endpoints() {
+        let tools = list_tools();
+        let tool_names = names(&tools, "tools");
+        assert_eq!(
+            tool_names,
+            ["memory_apply_transaction", "memory_get_record"]
+        );
+
+        let resources = list_resources();
+        assert_eq!(names(&resources, "resources"), ["Current memory revision"]);
+    }
+
+    #[test]
+    fn unknown_method_is_a_json_rpc_error() {
+        let project = tempfile::tempdir().expect("temporary project should be created");
+        let mut output = Vec::new();
+        let error = dispatch(
+            &project.path().join("state.json"),
+            &json!({"method": "unknown"}),
+            &mut output,
+        )
+        .expect_err("unknown method should fail");
+        assert_eq!(error.code, -32_601);
+        assert_eq!(error.data["kind"], "method_not_found");
+        assert!(output.is_empty());
+    }
+
+    fn names<'a>(value: &'a Value, field: &str) -> Vec<&'a str> {
+        value[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .collect()
+    }
 }

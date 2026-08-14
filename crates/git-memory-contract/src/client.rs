@@ -1,3 +1,5 @@
+// Owned JSON values keep the call sites lifetime-free and are discarded after
+// one serialization/parsing boundary; borrowing them would not improve reuse.
 #![allow(clippy::needless_pass_by_value)]
 
 use std::io::{self, BufRead, BufReader, Write};
@@ -9,9 +11,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::{MCP_PROTOCOL_VERSION, MEMORY_INTERFACE_VERSION, ServerTarget};
+use crate::{MCP_PROTOCOL_VERSION, ServerTarget};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const INTERRUPT_PROGRESS_TOKEN: &str = "git-memory-contract/pre-commit";
 
 #[derive(Debug)]
 pub(crate) enum CallError {
@@ -70,15 +73,22 @@ pub(crate) fn interrupt_transaction(
     project: &Path,
     arguments: Value,
 ) -> Result<(), CallError> {
-    let mut session = Session::start(target.command(project))?;
+    let mut session = Session::start(target.interruption_command(project))?;
     session.initialize()?;
     let id = session.take_id();
     session.send(json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
-        "params": {"name": "memory_apply_transaction", "arguments": arguments}
+        "params": {
+            "_meta": {"progressToken": INTERRUPT_PROGRESS_TOKEN},
+            "name": "memory_apply_transaction",
+            "arguments": arguments
+        }
     }))?;
+    if target.has_synchronized_interruption() {
+        session.wait_for_progress(INTERRUPT_PROGRESS_TOKEN)?;
+    }
     session
         .child
         .kill()
@@ -160,16 +170,62 @@ impl Session {
     }
 
     fn initialize(&mut self) -> Result<(), CallError> {
-        self.request(
+        let result = self.request(
             "initialize",
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "git-memory-contract", "version": env!("CARGO_PKG_VERSION")},
-                "memoryInterfaceVersion": MEMORY_INTERFACE_VERSION
+                "clientInfo": {"name": "git-memory-contract", "version": env!("CARGO_PKG_VERSION")}
             }),
         )?;
+        let negotiated = result.get("protocolVersion").and_then(Value::as_str);
+        if negotiated != Some(MCP_PROTOCOL_VERSION) {
+            return Err(CallError::Protocol(format!(
+                "server negotiated unsupported MCP version {negotiated:?}"
+            )));
+        }
+        for capability in ["resources", "tools"] {
+            if !result
+                .pointer(&format!("/capabilities/{capability}"))
+                .is_some_and(Value::is_object)
+            {
+                return Err(CallError::Protocol(format!(
+                    "server did not advertise required {capability} capability"
+                )));
+            }
+        }
+        for field in ["name", "version"] {
+            if result
+                .pointer(&format!("/serverInfo/{field}"))
+                .and_then(Value::as_str)
+                .is_none()
+            {
+                return Err(CallError::Protocol(format!(
+                    "initialize result has no serverInfo.{field}"
+                )));
+            }
+        }
         self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+    }
+
+    fn wait_for_progress(&self, expected_token: &str) -> Result<(), CallError> {
+        loop {
+            let message = self
+                .responses
+                .recv_timeout(RESPONSE_TIMEOUT)
+                .map_err(|error| {
+                    CallError::Transport(format!("pre-commit acknowledgement unavailable: {error}"))
+                })?
+                .map_err(CallError::Transport)?;
+            if message.get("method").and_then(Value::as_str) == Some("notifications/progress")
+                && message
+                    .pointer("/params/progressToken")
+                    .and_then(Value::as_str)
+                    == Some(expected_token)
+            {
+                return Ok(());
+            }
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, CallError> {

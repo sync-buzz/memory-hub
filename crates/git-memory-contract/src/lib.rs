@@ -13,7 +13,4 @@ pub use runner::{ContractReport, ScenarioReport, run_contract};
 pub use target::{FakeServerTarget, ReleaseBinaryTarget, ServerTarget};
 
 /// MCP protocol revision exercised by this version of the contract.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-
-/// Git Memory public interface major version exercised by this contract.
-pub const MEMORY_INTERFACE_VERSION: &str = "1.0";
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";

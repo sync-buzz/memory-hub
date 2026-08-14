@@ -1,3 +1,4 @@
+// Fixture builders intentionally consume their one-shot JSON inputs.
 #![allow(clippy::needless_pass_by_value)]
 
 use serde_json::{Value, json};
@@ -16,4 +17,8 @@ pub(crate) fn record(key: &str, content: &str) -> Value {
 
 pub(crate) fn put(record: Value) -> Value {
     json!({"op": "put", "record": record})
+}
+
+pub(crate) fn delete(key: &str) -> Value {
+    json!({"op": "delete", "key": key})
 }

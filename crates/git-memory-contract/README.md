@@ -15,12 +15,17 @@ It is intentionally a separate workspace package and has no dependency on the
 
 `FakeServerTarget` launches the deterministic fake directly. Both are fresh
 stdio processes and receive newline-delimited JSON-RPC 2.0. The client performs
-MCP initialization before each operation. No public in-process Rust server
+MCP `2025-11-25` initialization and validates the negotiated protocol and
+required capabilities before each operation. No public in-process Rust server
 adapter exists.
 
 The fake is a harness executable, not a second Git Memory runtime. Its state is
 deterministic, project-scoped, and atomically replaced on disk so that a new
-process can observe an interrupted session's outcome.
+process can observe an interrupted session's outcome. For the recovery scenario
+it emits a standard MCP progress notification at a deterministic pre-commit
+failpoint; the harness terminates it only after that acknowledgement. A release
+binary is terminated at the public process boundary, where either the complete
+old or complete new state is valid, but a partial batch is never valid.
 
 ## Exercised public surface
 
@@ -37,6 +42,10 @@ the current snapshot. A stale transaction touching a changed key returns
 `kind: conflict` with expected/current revisions, conflicting keys, and a
 recovery action. Retrying the same `transaction_id` converges on its original
 revision.
+
+The atomic scenario applies a valid mixed put/delete batch. Snapshot consistency
+is read from one process while another process writes, and both race scenarios
+start two independent MCP processes behind the same barrier.
 
 The fixture records use only generic `note` records and neutral opaque client
 metadata. They contain no product-specific entity kinds or metadata.

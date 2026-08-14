@@ -39,10 +39,11 @@ cargo run -p git-memory-contract -- \
   --fake-binary target/debug/git-memory-contract-fake
 ```
 
-Both targets execute the same scenarios: atomic batch rejection, immutable
-snapshot reads, stale writers touching different keys, same-key conflict, and
-recovery/idempotent retry after a severed stdio session. Failures are asserted
-from structured `kind` and `data`, never from stderr text. See
+Both targets execute the same scenarios: mixed put/delete atomic batches,
+immutable snapshot reads concurrent with writes, two-process writers touching
+different keys, same-key conflict, and recovery/idempotent retry after a
+severed stdio session. Failures are asserted from structured `kind` and `data`,
+never from stderr text. See
 [`crates/git-memory-contract/README.md`](crates/git-memory-contract/README.md) for
 the process contract and reuse instructions.
 

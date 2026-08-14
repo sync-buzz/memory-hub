@@ -12,6 +12,20 @@ pub trait ServerTarget: Sync {
 
     /// Construct a fresh MCP server process for `project`.
     fn command(&self, project: &Path) -> Command;
+
+    /// Construct the process used for the interrupted-write scenario.
+    ///
+    /// Targets may enable a process-level test failpoint here. The default uses
+    /// the exact release command and therefore treats the commit outcome as
+    /// intentionally ambiguous after termination.
+    fn interruption_command(&self, project: &Path) -> Command {
+        self.command(project)
+    }
+
+    /// Whether `interruption_command` acknowledges the pre-commit failpoint.
+    fn has_synchronized_interruption(&self) -> bool {
+        false
+    }
 }
 
 /// Adapter for a shipped `git-memory` executable.
@@ -78,5 +92,15 @@ impl ServerTarget for FakeServerTarget {
         let mut command = Command::new(&self.binary);
         command.arg("--project").arg(project);
         command
+    }
+
+    fn interruption_command(&self, project: &Path) -> Command {
+        let mut command = self.command(project);
+        command.env("GIT_MEMORY_CONTRACT_PAUSE_BEFORE_COMMIT", "1");
+        command
+    }
+
+    fn has_synchronized_interruption(&self) -> bool {
+        true
     }
 }
