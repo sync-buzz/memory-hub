@@ -174,6 +174,8 @@ pub struct Checkpoint {
     pub revision: Revision,
     pub message: String,
     pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_revision: Option<String>,
 }
 
 /// Deterministic record-only export. Revision and transaction receipts are

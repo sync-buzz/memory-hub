@@ -41,6 +41,8 @@ struct CheckpointMetadata {
     kind: String,
     revision: Revision,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_revision: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -240,6 +242,46 @@ impl GitStore {
     ///
     /// Returns [`StoreError`] if commit creation or main-ref CAS fails.
     pub fn checkpoint(&self, message: &str) -> Result<Checkpoint, StoreError> {
+        self.checkpoint_inner(message, None)
+    }
+
+    /// Checkpoint the current staged snapshot against one processed code
+    /// commit. Repeating the newest code revision is idempotent, which lets a
+    /// reconciler recover after a cursor write is interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the code revision is malformed, missing, or
+    /// checkpoint creation/ref CAS fails.
+    pub fn checkpoint_code(
+        &self,
+        code_revision: &str,
+        message: &str,
+    ) -> Result<Checkpoint, StoreError> {
+        let repository = self.repository()?;
+        let code_oid = Oid::from_str(code_revision).map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::InvalidArgument,
+                "code revision is not a Git object id",
+                serde_json::json!({"field": "code_revision"}),
+            )
+        })?;
+        repository
+            .find_commit(code_oid)
+            .map_err(|error| StoreError::repository("find code revision", error))?;
+        if let Some(existing) = self.history(1)?.into_iter().next()
+            && existing.code_revision.as_deref() == Some(code_revision)
+        {
+            return Ok(existing);
+        }
+        self.checkpoint_inner(message, Some(code_revision))
+    }
+
+    fn checkpoint_inner(
+        &self,
+        message: &str,
+        code_revision: Option<&str>,
+    ) -> Result<Checkpoint, StoreError> {
         if message.trim().is_empty() {
             return Err(StoreError::new(
                 StoreErrorKind::InvalidArgument,
@@ -267,6 +309,7 @@ impl GitStore {
             kind: "checkpoint".into(),
             revision: revision.clone(),
             message: message.to_owned(),
+            code_revision: code_revision.map(str::to_owned),
         };
         let commit_message = serde_json::to_string(&metadata)
             .map_err(|error| serialization_error("serialize checkpoint", error))?;
@@ -286,6 +329,7 @@ impl GitStore {
             revision,
             message: message.to_owned(),
             timestamp: signature.when().seconds(),
+            code_revision: code_revision.map(str::to_owned),
         })
     }
 
@@ -319,6 +363,7 @@ impl GitStore {
                 revision: metadata.revision,
                 message: metadata.message,
                 timestamp: commit.time().seconds(),
+                code_revision: metadata.code_revision,
             });
             let Ok(parent) = commit.parent_id(0) else {
                 break;

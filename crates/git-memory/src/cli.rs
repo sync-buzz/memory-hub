@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use git_memory_reconcile::{DivergenceMode, Reconciler};
 
 use crate::doctor;
 use crate::exit::Code;
@@ -34,6 +35,21 @@ enum Command {
         /// Repository or a path inside it. Defaults to the current directory.
         #[arg(long, value_name = "PATH")]
         project: Option<PathBuf>,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human)]
+        output: Output,
+    },
+
+    /// Reconcile code commits with Memory freshness and checkpoints.
+    Reconcile {
+        /// Repository or Git directory. Defaults to the current directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+
+        /// Explicitly recover when code history diverged after rebase/reset.
+        #[arg(long)]
+        full_rebuild: bool,
 
         /// Select human-readable or stable JSON output.
         #[arg(long, value_enum, default_value_t = Output::Human)]
@@ -102,6 +118,53 @@ where
                 Code::DoctorFailed
             }
         }
+        Command::Reconcile {
+            project,
+            full_rebuild,
+            output,
+        } => {
+            let Some(project) = absolute_project(project) else {
+                eprintln!("git-memory: unable to resolve current directory");
+                return Code::Internal;
+            };
+            let mode = if full_rebuild {
+                DivergenceMode::FullRebuild
+            } else {
+                DivergenceMode::Report
+            };
+            match Reconciler::open(project).and_then(|reconciler| reconciler.reconcile(mode)) {
+                Ok(report) => {
+                    let rendered = match output {
+                        Output::Json => serde_json::to_string(&report),
+                        Output::Human => Ok(format!(
+                            "Git Memory reconciled {} code commit(s); HEAD {}",
+                            report.processed.len(),
+                            report.head.as_deref().unwrap_or("unborn")
+                        )),
+                    };
+                    match rendered {
+                        Ok(rendered) => println!("{rendered}"),
+                        Err(error) => {
+                            eprintln!("git-memory: unable to render reconcile report: {error}");
+                            return Code::Internal;
+                        }
+                    }
+                    Code::Success
+                }
+                Err(error) => {
+                    eprintln!("git-memory: reconcile failed: {error}");
+                    Code::DoctorFailed
+                }
+            }
+        }
+    }
+}
+
+fn absolute_project(project: Option<PathBuf>) -> Option<PathBuf> {
+    match project {
+        Some(project) if project.is_absolute() => Some(project),
+        Some(project) => std::env::current_dir().ok().map(|cwd| cwd.join(project)),
+        None => std::env::current_dir().ok(),
     }
 }
 

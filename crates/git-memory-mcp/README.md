@@ -12,8 +12,8 @@ Git Memory handshake in `capabilities.experimental.gitMemory` and
 
 ```json
 {
-  "memoryInterfaceVersion": {"major": 1, "minor": 0},
-  "storeVersion": {"major": 1, "minor": 0},
+  "memoryInterfaceVersion": {"major": 1, "minor": 1},
+  "storeVersion": {"major": 1, "minor": 1},
   "envelopeVersion": {"major": 1, "minor": 0},
   "indexVersion": {"major": 0, "minor": 0},
   "modelFingerprint": null,
@@ -21,7 +21,8 @@ Git Memory handshake in `capabilities.experimental.gitMemory` and
   "installationId": "installation-<sha256>",
   "projectId": "project-<sha256>",
   "projectPath": "/absolute/repository/path",
-  "gitDir": "/absolute/repository/path/.git/"
+  "gitDir": "/absolute/repository/path/.git/",
+  "reconciliation": {"status": "ok", "report": {}}
 }
 ```
 
@@ -64,6 +65,7 @@ surface is:
 | `memory_diff` | `from_revision`, `to_revision` | `{fromRevision, toRevision, changes}` |
 | `memory_export` | `revision` | `{revision, bundle}` |
 | `memory_import` | `transaction_id`, `expected_revision`, `bundle` | `{revision, changed_keys}` |
+| `memory_reconcile` | optional `divergence: report\|full_rebuild` | `ReconcileReport` |
 | `memory_doctor` | none | repository/store health |
 | `memory_encryption_status` | none | current plaintext/encryption availability |
 
@@ -72,8 +74,12 @@ A transaction operation is either `{"op":"put","record":StoredRecord}` or
 `key`). The complete operation array is validated before one `GitStore::apply`
 call; a bulk mutation is therefore one MCP call and one atomic store transaction.
 
-The stable future-facing catalogue also declares reconcile, search/backlinks,
-reindex, remote transport, and model operations. Until their owning roadmap
+Initialization and every mutating tool reconcile code history first. Divergence
+returns `kind: diverged` until the client explicitly calls `memory_reconcile`
+with `divergence: full_rebuild`.
+
+The stable future-facing catalogue also declares search/backlinks, reindex,
+remote transport, and model operations. Until their owning roadmap
 specs land, calls fail explicitly with `kind: capability_unavailable`, the
 planned spec, and an upgrade recovery action; the server never pretends that a
 degraded implementation completed the operation.

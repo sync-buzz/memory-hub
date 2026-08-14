@@ -4,7 +4,8 @@ In-process Git object store behind the `GitStore` interface.
 
 - `refs/memory/staged` points to an append-only transaction commit chain; each
   commit owns the current immutable record tree and exact changed-record ids.
-- `refs/memory/main` points to a commit chain of explicit checkpoints.
+- `refs/memory/main` points to a commit chain of explicit checkpoints; code
+  reconciliation checkpoints also carry the full processed code revision.
 - record filenames are SHA-256/opaque identifiers, never semantic encrypted
   keys; transaction metadata lives in commit messages rather than growing the
   record tree;

@@ -12,6 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use git_memory_core::{CURRENT_ENVELOPE_VERSION, PolicyResolver, StoredRecord};
+use git_memory_reconcile::{DivergenceMode, ReconcileError, ReconcileErrorKind, Reconciler};
 use git_memory_store::{GitStore, Operation, RecordId, Revision, StoreError, Transaction};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -19,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const MEMORY_INTERFACE_MAJOR: u16 = 1;
-pub const MEMORY_INTERFACE_MINOR: u16 = 0;
+pub const MEMORY_INTERFACE_MINOR: u16 = 1;
 
 /// Run one MCP session until stdin reaches EOF.
 ///
@@ -70,14 +71,16 @@ struct Session {
     project: PathBuf,
     initialized: bool,
     revision_subscribed: bool,
+    reconciliation: Value,
 }
 
 impl Session {
-    const fn new(project: PathBuf) -> Self {
+    fn new(project: PathBuf) -> Self {
         Self {
             project,
             initialized: false,
             revision_subscribed: false,
+            reconciliation: json!({"status": "pending"}),
         }
     }
 
@@ -150,6 +153,15 @@ impl Session {
                 }),
             ));
         }
+        self.reconciliation = match Reconciler::open(&self.project)
+            .and_then(|reconciler| reconciler.reconcile(DivergenceMode::Report))
+        {
+            Ok(report) => json!({"status": "ok", "report": report}),
+            Err(error) if error.kind == ReconcileErrorKind::Diverged => {
+                json!({"status": "diverged", "error": error})
+            }
+            Err(error) => return Err(RpcFailure::reconcile(error)),
+        };
         let handshake = self.handshake();
         self.initialized = true;
         Ok(json!({
@@ -179,7 +191,7 @@ impl Session {
         let git_dir = GitStore::discover_git_dir(&canonical).ok();
         json!({
             "memoryInterfaceVersion": version(MEMORY_INTERFACE_MAJOR, MEMORY_INTERFACE_MINOR),
-            "storeVersion": version(1, 0),
+            "storeVersion": version(1, 1),
             "envelopeVersion": CURRENT_ENVELOPE_VERSION,
             "indexVersion": version(0, 0),
             "modelFingerprint": null,
@@ -187,7 +199,8 @@ impl Session {
             "installationId": installation_id,
             "projectId": project_id,
             "projectPath": canonical,
-            "gitDir": git_dir
+            "gitDir": git_dir,
+            "reconciliation": self.reconciliation
         })
     }
 
@@ -269,13 +282,34 @@ impl Session {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let reconciliation_changed = if matches!(
+            name,
+            "memory_apply_transaction" | "memory_checkpoint" | "memory_import"
+        ) {
+            match self.reconcile_before_mutation() {
+                Ok(changed) => changed,
+                Err(error) => return Ok(rpc_result(id, tool_error(error))),
+            }
+        } else {
+            false
+        };
         let result = self.execute_tool(name, &arguments);
+        if reconciliation_changed && result.is_err() && self.revision_subscribed {
+            write_json(
+                output,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": {"uri": "memory://revision/current"}
+                }),
+            )?;
+        }
         match result {
             Ok(ToolOutcome {
                 content,
                 revision_changed,
             }) => {
-                if revision_changed && self.revision_subscribed {
+                if (revision_changed || reconciliation_changed) && self.revision_subscribed {
                     write_json(
                         output,
                         &json!({
@@ -309,7 +343,7 @@ impl Session {
             "memory_export" => self.export(arguments),
             "memory_import" => self.import(arguments),
             "memory_doctor" => self.doctor(),
-            "memory_reconcile" => Err(unavailable("reconcile", "GITMEMO-6")),
+            "memory_reconcile" => self.reconcile(arguments),
             "memory_search" | "memory_backlinks" | "memory_reindex" => {
                 Err(unavailable("search_index", "GITMEMO-7/GITMEMO-9"))
             }
@@ -456,6 +490,35 @@ impl Session {
             "revision": current.revision()
         })))
     }
+
+    fn reconcile(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let mode = match arguments.get("divergence").and_then(Value::as_str) {
+            None | Some("report") => DivergenceMode::Report,
+            Some("full_rebuild") => DivergenceMode::FullRebuild,
+            Some(_) => return Err(RpcFailure::invalid_argument("divergence").into()),
+        };
+        let report = Reconciler::open(&self.project)
+            .and_then(|reconciler| reconciler.reconcile(mode))
+            .map_err(ToolFailure::reconcile)?;
+        let revision_changed = report
+            .processed
+            .iter()
+            .any(|commit| !commit.stale_keys.is_empty());
+        Ok(ToolOutcome {
+            content: json!(report),
+            revision_changed,
+        })
+    }
+
+    fn reconcile_before_mutation(&self) -> Result<bool, ToolFailure> {
+        let report = Reconciler::open(&self.project)
+            .and_then(|reconciler| reconciler.reconcile(DivergenceMode::Report))
+            .map_err(ToolFailure::reconcile)?;
+        Ok(report
+            .processed
+            .iter()
+            .any(|commit| !commit.stale_keys.is_empty()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -593,6 +656,17 @@ fn list_tools() -> Value {
             ),
         ),
         tool(
+            "memory_reconcile",
+            "Reconcile code history with Memory checkpoints",
+            object_schema(
+                &[(
+                    "divergence",
+                    json!({"type":"string","enum":["report","full_rebuild"]}),
+                )],
+                &[],
+            ),
+        ),
+        tool(
             "memory_doctor",
             "Validate repository and canonical store access",
             object_schema(&[], &[]),
@@ -604,10 +678,6 @@ fn list_tools() -> Value {
         ),
     ];
     for (name, description) in [
-        (
-            "memory_reconcile",
-            "Reconcile code history with Memory checkpoints",
-        ),
         ("memory_search", "Search the derived Memory index"),
         ("memory_backlinks", "Find records linking to a record"),
         ("memory_reindex", "Rebuild the derived Memory index"),
@@ -796,6 +866,17 @@ impl RpcFailure {
             json!({"kind": snake_store_kind(error.kind), "message": error.message, "data": error.data}),
         )
     }
+    fn reconcile(error: ReconcileError) -> Self {
+        Self::new(
+            -32_603,
+            "Git Memory reconciliation unavailable",
+            json!({
+                "kind": snake_reconcile_kind(error.kind),
+                "message": error.message,
+                "data": error.data
+            }),
+        )
+    }
 
     fn into_tool_failure(self) -> ToolFailure {
         let kind = self
@@ -837,6 +918,13 @@ impl ToolFailure {
             data: error.data,
         }
     }
+    fn reconcile(error: ReconcileError) -> Self {
+        Self {
+            kind: snake_reconcile_kind(error.kind).to_owned(),
+            message: error.message,
+            data: error.data,
+        }
+    }
 }
 
 enum ToolCallFailure {
@@ -864,6 +952,16 @@ fn snake_store_kind(kind: git_memory_store::StoreErrorKind) -> &'static str {
         StoreErrorKind::TransactionReused => "transaction_reused",
         StoreErrorKind::Repository => "repository",
         StoreErrorKind::RetryExhausted => "retry_exhausted",
+    }
+}
+
+fn snake_reconcile_kind(kind: ReconcileErrorKind) -> &'static str {
+    match kind {
+        ReconcileErrorKind::InvalidProject => "invalid_project",
+        ReconcileErrorKind::Repository => "repository",
+        ReconcileErrorKind::Cursor => "cursor",
+        ReconcileErrorKind::Diverged => "diverged",
+        ReconcileErrorKind::Store => "store",
     }
 }
 

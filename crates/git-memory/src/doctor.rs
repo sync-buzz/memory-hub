@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git_memory_reconcile::{DivergenceMode, ReconcileErrorKind, Reconciler};
 use serde::Serialize;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -51,7 +52,7 @@ impl Report {
 pub(crate) fn inspect(project: Option<&Path>) -> Report {
     let requested_project = project.map_or_else(default_project, Path::to_path_buf);
     let display_project = requested_project.display().to_string();
-    let mut checks = Vec::with_capacity(3);
+    let mut checks = Vec::with_capacity(4);
 
     checks.push(project_check(&requested_project));
 
@@ -61,11 +62,17 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
 
     if git_available && requested_project.is_dir() {
         checks.push(repository_check(&requested_project));
+        checks.push(reconciliation_check(&requested_project));
     } else {
         checks.push(Check::error(
             "git.repository",
             "repository_check_skipped",
             "repository check was skipped because a prerequisite failed",
+        ));
+        checks.push(Check::error(
+            "memory.reconciliation",
+            "reconciliation_check_skipped",
+            "reconciliation check was skipped because a prerequisite failed",
         ));
     }
 
@@ -81,6 +88,36 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
         version: env!("CARGO_PKG_VERSION"),
         project: display_project,
         checks,
+    }
+}
+
+fn reconciliation_check(project: &Path) -> Check {
+    match Reconciler::open(project)
+        .and_then(|reconciler| reconciler.reconcile(DivergenceMode::Report))
+    {
+        Ok(report) => Check::ok(
+            "memory.reconciliation",
+            format!(
+                "code history is reconciled at {}",
+                report.head.as_deref().unwrap_or("unborn HEAD")
+            ),
+            None,
+        ),
+        Err(error) => Check::error(
+            "memory.reconciliation",
+            reconcile_kind(error.kind),
+            error.message,
+        ),
+    }
+}
+
+const fn reconcile_kind(kind: ReconcileErrorKind) -> &'static str {
+    match kind {
+        ReconcileErrorKind::InvalidProject => "invalid_project",
+        ReconcileErrorKind::Repository => "repository_error",
+        ReconcileErrorKind::Cursor => "cursor_error",
+        ReconcileErrorKind::Diverged => "code_history_diverged",
+        ReconcileErrorKind::Store => "store_error",
     }
 }
 

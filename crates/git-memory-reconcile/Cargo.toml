@@ -1,6 +1,6 @@
 [package]
-name = "git-memory-mcp"
-description = "Public MCP stdio interface for Git Memory"
+name = "git-memory-reconcile"
+description = "Hookless code-history reconciliation for Git Memory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,15 +10,16 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+fs2.workspace = true
 git-memory-core = { path = "../git-memory-core" }
-git-memory-reconcile = { path = "../git-memory-reconcile" }
 git-memory-store = { path = "../git-memory-store" }
+git2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

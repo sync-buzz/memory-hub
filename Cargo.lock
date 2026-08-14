@@ -220,8 +220,11 @@ dependencies = [
  "clap",
  "git-memory-contract",
  "git-memory-mcp",
+ "git-memory-reconcile",
+ "git2",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -251,7 +254,22 @@ name = "git-memory-mcp"
 version = "0.1.0"
 dependencies = [
  "git-memory-core",
+ "git-memory-reconcile",
  "git-memory-store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "git-memory-reconcile"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "git-memory-core",
+ "git-memory-store",
+ "git2",
  "serde",
  "serde_json",
  "sha2",

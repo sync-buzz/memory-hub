@@ -52,6 +52,33 @@ fn init_empty_repository() -> TempDir {
     directory
 }
 
+fn commit_file(repository: &Path, content: &str) {
+    fs::write(repository.join("code.txt"), content).expect("fixture should write");
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["add", "code.txt"])
+        .output()
+        .expect("Git add should start");
+    assert_exit(&add, SUCCESS);
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            content,
+        ])
+        .output()
+        .expect("Git commit should start");
+    assert_exit(&commit, SUCCESS);
+}
+
 #[test]
 fn help_and_version_are_stable() {
     let help = run(&["--help"]);
@@ -134,6 +161,40 @@ fn doctor_json_has_a_versioned_machine_readable_shape() {
     assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(report["checks"][2]["id"], "git.repository");
     assert!(report["checks"][2]["data"]["git_dir"].is_string());
+}
+
+#[test]
+fn cli_calls_reconcile_code_history_without_hooks() {
+    let repository = init_empty_repository();
+    commit_file(repository.path(), "one");
+    let doctor = run(&[
+        "doctor",
+        "--project",
+        repository.path().to_str().expect("temporary path is UTF-8"),
+        "--output",
+        "json",
+    ]);
+    assert_exit(&doctor, SUCCESS);
+    let report: Value = serde_json::from_slice(&doctor.stdout).expect("valid JSON report");
+    assert_eq!(report["checks"][3]["id"], "memory.reconciliation");
+    assert!(
+        repository
+            .path()
+            .join(".git/git-memory/reconcile-cursor.json")
+            .is_file()
+    );
+
+    commit_file(repository.path(), "two");
+    let reconcile = run(&[
+        "reconcile",
+        "--project",
+        repository.path().to_str().expect("temporary path is UTF-8"),
+        "--output",
+        "json",
+    ]);
+    assert_exit(&reconcile, SUCCESS);
+    let report: Value = serde_json::from_slice(&reconcile.stdout).expect("valid JSON report");
+    assert_eq!(report["processed"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]

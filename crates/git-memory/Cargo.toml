@@ -16,11 +16,14 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 git-memory-mcp = { path = "../git-memory-mcp" }
+git-memory-reconcile = { path = "../git-memory-reconcile" }
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 git-memory-contract = { path = "../git-memory-contract" }
+git2.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 
 [lints]

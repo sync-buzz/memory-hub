@@ -5,10 +5,10 @@ named `git-memory`, so Git exposes it as `git memory` whenever it is available o
 `PATH`.
 
 The repository contains the bootstrap CLI, the product-neutral envelope and
-policy contract, the atomic Git object store, the public MCP stdio interface,
-and a reusable black-box behavioral contract harness. Index, search, remote
-exchange, and encryption implementations are intentionally capability-gated for
-later releases.
+policy contract, the atomic Git object store, hookless code-history
+reconciliation, the public MCP stdio interface, and a reusable black-box
+behavioral contract harness. Index, search, remote exchange, and encryption
+implementations are intentionally capability-gated for later releases.
 
 ## Build and verify
 
@@ -68,6 +68,15 @@ return structured same-record conflicts. It also owns checkpoints, history,
 diff, and deterministic import/export. See
 [`crates/git-memory-store/README.md`](crates/git-memory-store/README.md).
 
+## Code-history reconciliation
+
+`git-memory-reconcile` stores a worktree-local cursor and catches up every code
+commit on MCP initialization, CLI use, and before Memory mutations. Path diffs
+update generic record freshness and each processed commit receives a
+code-linked Memory checkpoint. Rebase/reset divergence is reported and requires
+an explicit full rebuild; hooks are never required for correctness. See
+[`crates/git-memory-reconcile/README.md`](crates/git-memory-reconcile/README.md).
+
 ## MCP interface
 
 Start the only public machine interface with an explicit repository:
@@ -94,6 +103,8 @@ git memory --version
 git memory --help
 git memory doctor --project /path/to/repository
 git memory doctor --project /path/to/repository --output json
+git memory reconcile --project /path/to/repository --output json
+git memory reconcile --project /path/to/repository --full-rebuild
 ```
 
 `doctor` accepts an empty Git repository; a commit is not required. JSON output

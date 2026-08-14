@@ -5,6 +5,7 @@ members = [
     "crates/git-memory-contract",
     "crates/git-memory-core",
     "crates/git-memory-mcp",
+    "crates/git-memory-reconcile",
     "crates/git-memory-store",
 ]
 
