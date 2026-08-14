@@ -4,9 +4,10 @@ Git Memory is a standalone, Git-backed project memory engine. The executable is
 named `git-memory`, so Git exposes it as `git memory` whenever it is available on
 `PATH`.
 
-The repository currently contains the bootstrap CLI and a reusable black-box
-behavioral contract harness. The canonical store, production MCP interface,
-index, search, and encryption are intentionally outside the current scope.
+The repository currently contains the bootstrap CLI, the product-neutral
+envelope and policy contract, and a reusable black-box behavioral contract
+harness. The canonical store, production MCP interface, index, search, and
+encryption implementation are intentionally outside the current scope.
 
 ## Build and verify
 
@@ -46,6 +47,16 @@ severed stdio session. Failures are asserted from structured `kind` and `data`,
 never from stderr text. See
 [`crates/git-memory-contract/README.md`](crates/git-memory-contract/README.md) for
 the process contract and reuse instructions.
+
+## Envelope and policy contract
+
+`git-memory-core` owns the versioned generic record envelope, the reserved
+opaque encrypted representation, and effective policy resolution. It has no
+store, MCP, index, or client-product dependency. Compatible future fields and
+unknown client profile metadata survive JSON round trips; incompatible envelope
+major versions fail during decode. See
+[`crates/git-memory-core/README.md`](crates/git-memory-core/README.md) for the
+interface guarantees.
 
 ## Bootstrap commands
 
