@@ -7,7 +7,7 @@ use crate::{CURRENT_ENVELOPE_VERSION, ContractError, Envelope, FormatVersion};
 
 /// Opaque identifier chosen by the encryption adapter. It is the only record
 /// identifier allowed in encrypted tree paths.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct OpaqueStorageId(String);
 

@@ -5,9 +5,10 @@ named `git-memory`, so Git exposes it as `git memory` whenever it is available o
 `PATH`.
 
 The repository currently contains the bootstrap CLI, the product-neutral
-envelope and policy contract, and a reusable black-box behavioral contract
-harness. The canonical store, production MCP interface, index, search, and
-encryption implementation are intentionally outside the current scope.
+envelope and policy contract, the atomic Git object store, and a reusable
+black-box behavioral contract harness. The production MCP interface, index,
+search, and encryption implementation are intentionally outside the current
+scope.
 
 ## Build and verify
 
@@ -57,6 +58,15 @@ unknown client profile metadata survive JSON round trips; incompatible envelope
 major versions fail during decode. See
 [`crates/git-memory-core/README.md`](crates/git-memory-core/README.md) for the
 interface guarantees.
+
+## Git object store
+
+`git-memory-store` keeps immutable snapshots under private Git refs without
+touching HEAD, code branches, the index, or worktree. Atomic transactions use
+libgit2 ref compare-and-swap, rebase concurrent different-record writes, and
+return structured same-record conflicts. It also owns checkpoints, history,
+diff, and deterministic import/export. See
+[`crates/git-memory-store/README.md`](crates/git-memory-store/README.md).
 
 ## Bootstrap commands
 
