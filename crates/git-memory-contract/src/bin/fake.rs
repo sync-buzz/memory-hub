@@ -354,7 +354,9 @@ fn get_record(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure
 
 fn operation_key(operation: &Value) -> Result<&str, ToolFailure> {
     match operation.get("op").and_then(Value::as_str) {
-        Some("put") => operation.pointer("/record/key").and_then(Value::as_str),
+        Some("put") => operation
+            .pointer("/record/envelope/key")
+            .and_then(Value::as_str),
         Some("delete") => operation.get("key").and_then(Value::as_str),
         _ => return Err(invalid_argument("op")),
     }

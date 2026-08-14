@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -66,6 +67,8 @@ pub struct RecordLink {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation: Option<String>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 /// Code paths required by standalone rebuild and reconciliation.
@@ -75,6 +78,8 @@ pub struct SourcePaths {
     pub scope: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed: Vec<String>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +88,8 @@ pub struct ArchiveState {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,7 +104,7 @@ pub enum FreshnessState {
 
 /// Canonical freshness inputs. `code_revision` is the code snapshot against
 /// which this record was last evaluated; timestamps are descriptive only.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Freshness {
     #[serde(default)]
     pub state: FreshnessState,
@@ -107,6 +114,8 @@ pub struct Freshness {
     pub validated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 /// Client-owned interpretation of `metadata`.
@@ -114,16 +123,18 @@ pub struct Freshness {
 /// Profile versioning is deliberately independent of envelope versioning.
 /// Memory retains metadata values but never gives them authority to replace
 /// reserved envelope fields.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct ClientProfile {
     pub name: String,
     pub version: FormatVersion,
     #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 /// Product-neutral canonical record.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Envelope {
     pub envelope_version: FormatVersion,
     pub key: String,
@@ -147,6 +158,54 @@ pub struct Envelope {
     /// Compatible fields introduced by future envelope minor versions.
     #[serde(flatten)]
     pub extensions: BTreeMap<String, Value>,
+}
+
+impl fmt::Debug for Freshness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Freshness")
+            .field("state", &self.state)
+            .field("code_revision", &self.code_revision)
+            .field("validated_at", &self.validated_at)
+            .field("reason", &self.reason.as_ref().map(|_| "<redacted>"))
+            .field("extension_count", &self.extensions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for ClientProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientProfile")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("metadata_count", &self.metadata.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for Envelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Envelope")
+            .field("envelope_version", &self.envelope_version)
+            .field("key", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("content", &"<redacted>")
+            .field("content_hash", &self.content_hash)
+            .field("tag_count", &self.tags.len())
+            .field("link_count", &self.links.len())
+            .field(
+                "source_path_count",
+                &(self.source_paths.scope.len() + self.source_paths.observed.len()),
+            )
+            .field("archived", &self.archive.archived)
+            .field("freshness_state", &self.freshness.state)
+            .field("has_profile", &self.profile.is_some())
+            .field("extension_count", &self.extensions.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]
@@ -232,7 +291,27 @@ impl Envelope {
         validate_paths("source_paths.observed", &self.source_paths.observed)?;
         for (index, link) in self.links.iter().enumerate() {
             require_non_empty(&format!("links[{index}].key"), &link.key)?;
+            validate_extensions(
+                &format!("links[{index}].extensions"),
+                &link.extensions,
+                &["key", "relation"],
+            )?;
         }
+        validate_extensions(
+            "source_paths.extensions",
+            &self.source_paths.extensions,
+            &["scope", "observed"],
+        )?;
+        validate_extensions(
+            "archive.extensions",
+            &self.archive.extensions,
+            &["archived", "archived_at"],
+        )?;
+        validate_extensions(
+            "freshness.extensions",
+            &self.freshness.extensions,
+            &["state", "code_revision", "validated_at", "reason"],
+        )?;
         if self.archive.archived_at.is_some() && !self.archive.archived {
             return Err(ContractError::invalid(
                 "archive.archived_at",
@@ -241,17 +320,13 @@ impl Envelope {
         }
         if let Some(profile) = &self.profile {
             require_non_empty("profile.name", &profile.name)?;
+            validate_extensions(
+                "profile.extensions",
+                &profile.extensions,
+                &["name", "version", "metadata"],
+            )?;
         }
-        if let Some(field) = self
-            .extensions
-            .keys()
-            .find(|field| RESERVED_FIELDS.contains(&field.as_str()))
-        {
-            return Err(ContractError::invalid(
-                format!("extensions.{field}"),
-                "extension collides with a reserved envelope field",
-            ));
-        }
+        validate_extensions("extensions", &self.extensions, RESERVED_FIELDS)?;
         Ok(())
     }
 }
@@ -290,6 +365,24 @@ fn require_non_empty(field: &str, value: &str) -> Result<(), ContractError> {
     }
 }
 
+fn validate_extensions(
+    field: &str,
+    extensions: &BTreeMap<String, Value>,
+    reserved: &[&str],
+) -> Result<(), ContractError> {
+    if let Some(name) = extensions
+        .keys()
+        .find(|name| reserved.contains(&name.as_str()))
+    {
+        Err(ContractError::invalid(
+            format!("{field}.{name}"),
+            "extension collides with a reserved field",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_unique_non_empty(field: &str, values: &[String]) -> Result<(), ContractError> {
     let mut seen = HashSet::new();
     for (index, value) in values.iter().enumerate() {
@@ -307,9 +400,18 @@ fn validate_unique_non_empty(field: &str, values: &[String]) -> Result<(), Contr
 fn validate_paths(field: &str, paths: &[String]) -> Result<(), ContractError> {
     validate_unique_non_empty(field, paths)?;
     for (index, path) in paths.iter().enumerate() {
+        let bytes = path.as_bytes();
+        let drive_absolute = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+        let without_directory_suffix = path.strip_suffix('/').unwrap_or(path);
         let invalid = path.starts_with('/')
+            || drive_absolute
             || path.contains('\\')
-            || path.split('/').any(|part| part == ".." || part == ".");
+            || path.bytes().any(|byte| byte.is_ascii_control())
+            || path.contains("//")
+            || without_directory_suffix.is_empty()
+            || without_directory_suffix
+                .split('/')
+                .any(|part| part == ".." || part == "." || part.is_empty());
         if invalid {
             return Err(ContractError::invalid(
                 format!("{field}[{index}]"),
@@ -323,6 +425,8 @@ fn validate_paths(field: &str, paths: &[String]) -> Result<(), ContractError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::{Value, json};
 
     use super::{ClientProfile, ContentHash, Envelope, FormatVersion};
@@ -336,14 +440,20 @@ mod tests {
             "key": "architecture/seam",
             "kind": "note",
             "content": content,
-            "source_paths": {"scope": ["crates/core/"], "observed": ["README.md"]},
-            "archive": {"archived": false},
-            "freshness": {"state": "fresh", "code_revision": "abc123"},
+            "links": [{"key": "architecture/root", "future_link_field": "kept"}],
+            "source_paths": {
+                "scope": ["crates/core/"],
+                "observed": ["README.md"],
+                "future_path_field": ["kept"]
+            },
+            "archive": {"archived": false, "future_archive_field": 1},
+            "freshness": {"state": "fresh", "code_revision": "abc123", "future_freshness_field": true},
             "content_hash": ContentHash::for_content(content),
             "profile": {
                 "name": "independent-client",
                 "version": {"major": 42, "minor": 3},
-                "metadata": {"future_entity_shape": {"answer": 42}}
+                "metadata": {"future_entity_shape": {"answer": 42}},
+                "future_profile_field": "kept"
             },
             "future_memory_field": {"kept": true}
         });
@@ -358,6 +468,11 @@ mod tests {
         );
         assert_eq!(output["envelope_version"]["minor"], 7);
         assert_eq!(output["profile"]["version"]["major"], 42);
+        assert_eq!(output["archive"]["future_archive_field"], 1);
+        assert_eq!(output["freshness"]["future_freshness_field"], true);
+        assert_eq!(output["links"][0]["future_link_field"], "kept");
+        assert_eq!(output["source_paths"]["future_path_field"][0], "kept");
+        assert_eq!(output["profile"]["future_profile_field"], "kept");
     }
 
     #[test]
@@ -369,6 +484,7 @@ mod tests {
             metadata: [("key".to_owned(), Value::String("client-key".into()))]
                 .into_iter()
                 .collect(),
+            extensions: BTreeMap::new(),
         });
 
         let wire = serde_json::to_value(&envelope).unwrap();
@@ -395,6 +511,17 @@ mod tests {
         assert_eq!(error.kind, ContractErrorKind::InvalidField);
         assert_eq!(error.field, "content_hash");
         envelope.refresh_content_hash();
+        envelope.validate().unwrap();
+    }
+
+    #[test]
+    fn paths_are_portable_repository_relative_values() {
+        let mut envelope = Envelope::new("one", "note", "body").unwrap();
+        for invalid in ["C:/absolute", "a//b", "./relative"] {
+            envelope.source_paths.observed = vec![invalid.into()];
+            assert!(envelope.validate().is_err(), "accepted {invalid}");
+        }
+        envelope.source_paths.observed = vec!["directory/".into()];
         envelope.validate().unwrap();
     }
 }

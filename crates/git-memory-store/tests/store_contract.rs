@@ -4,7 +4,8 @@ use std::thread;
 
 use git_memory_core::{Envelope, StoredRecord};
 use git_memory_store::{
-    ChangeKind, GitStore, MAIN_REF, Operation, RecordId, STAGED_REF, StoreErrorKind, Transaction,
+    ChangeKind, GitStore, MAIN_REF, Operation, RecordId, Revision, STAGED_REF, StoreErrorKind,
+    Transaction,
 };
 use git2::{Repository, Signature};
 
@@ -66,12 +67,45 @@ fn atomic_batch_preserves_old_snapshot_and_code_state() -> Result<(), Box<dyn st
         git.find_reference(STAGED_REF)?.target(),
         result.revision.as_str().parse().ok()
     );
-    let current_tree = git.find_tree(result.revision.as_str().parse()?)?;
+    let current_commit = git.find_commit(result.revision.as_str().parse()?)?;
     assert_eq!(
-        current_tree.get_name("previous").map(|entry| entry.id()),
-        Some(old.revision().as_str().parse()?)
+        current_commit.parent_id(0)?,
+        old.revision().as_str().parse()?
+    );
+    let unrelated_tree = git.treebuilder(None)?.write()?;
+    let unrelated: Revision =
+        serde_json::from_value(serde_json::json!(unrelated_tree.to_string()))?;
+    assert_eq!(
+        store.snapshot(&unrelated).err().map(|error| error.kind),
+        Some(StoreErrorKind::RevisionNotFound)
+    );
+    let signature = Signature::now("Test", "test@example.invalid")?;
+    let unrelated_tree_object = git.find_tree(unrelated_tree)?;
+    let unrelated_commit = git.commit(
+        None,
+        &signature,
+        &signature,
+        "ordinary code commit",
+        &unrelated_tree_object,
+        &[],
+    )?;
+    let unrelated: Revision =
+        serde_json::from_value(serde_json::json!(unrelated_commit.to_string()))?;
+    assert_eq!(
+        store.snapshot(&unrelated).err().map(|error| error.kind),
+        Some(StoreErrorKind::RevisionNotFound)
     );
     assert!(git.find_reference(MAIN_REF).is_err());
+    git.reference(
+        STAGED_REF,
+        unrelated_tree,
+        true,
+        "test: corrupt staged target",
+    )?;
+    assert_eq!(
+        store.current().err().map(|error| error.kind),
+        Some(StoreErrorKind::RevisionNotFound)
+    );
     Ok(())
 }
 
@@ -170,6 +204,31 @@ fn different_key_race_rebases_and_same_key_race_conflicts() -> Result<(), Box<dy
         conflict.data["conflicting_keys"],
         serde_json::json!(["shared"])
     );
+
+    let stable = store.apply(&transaction(
+        &store,
+        "aba-stable",
+        vec![Operation::put(record("aba", "A")?)],
+    )?)?;
+    let middle = store.apply(&Transaction {
+        id: "aba-middle".into(),
+        expected_revision: stable.revision.clone(),
+        operations: vec![Operation::put(record("aba", "B")?)],
+    })?;
+    store.apply(&Transaction {
+        id: "aba-back".into(),
+        expected_revision: middle.revision,
+        operations: vec![Operation::put(record("aba", "A")?)],
+    })?;
+    let stale_write = store.apply(&Transaction {
+        id: "aba-stale-writer".into(),
+        expected_revision: stable.revision,
+        operations: vec![Operation::put(record("aba", "stale")?)],
+    });
+    assert_eq!(
+        stale_write.err().map(|error| error.kind),
+        Some(StoreErrorKind::Conflict)
+    );
     Ok(())
 }
 
@@ -188,6 +247,23 @@ fn retry_is_idempotent_and_reuse_with_other_input_is_rejected()
     let first = store.apply(&request)?;
     let second = store.apply(&request)?;
     assert_eq!(first, second);
+
+    store.apply(&Transaction {
+        id: "intervening".into(),
+        expected_revision: store.current()?.revision().clone(),
+        operations: vec![Operation::put(record("other", "later")?)],
+    })?;
+    assert_eq!(store.apply(&request)?, first);
+
+    let no_op = store.apply(&Transaction {
+        id: "no-op".into(),
+        expected_revision: store.current()?.revision().clone(),
+        operations: vec![
+            Operation::put(record("a-first", "first")?),
+            Operation::delete(RecordId::plaintext("absent")),
+        ],
+    })?;
+    assert!(no_op.changed_keys.is_empty());
 
     let mut reused = request;
     reused.operations = vec![Operation::put(record("two", "other")?)];
@@ -239,6 +315,30 @@ fn checkpoint_history_diff_and_export_import_are_stable() -> Result<(), Box<dyn 
     let (other_directory, other) = repository()?;
     let imported = other.import("import", other.current()?.revision().clone(), &bytes)?;
     assert_eq!(other.export(&imported.revision)?, bytes);
+
+    let before_concurrent = other.current()?.revision().clone();
+    other.apply(&Transaction {
+        id: "concurrent-before-import".into(),
+        expected_revision: before_concurrent.clone(),
+        operations: vec![Operation::put(record("concurrent", "must conflict")?)],
+    })?;
+    assert_eq!(
+        other
+            .import("stale-import", before_concurrent, &bytes)
+            .err()
+            .map(|error| error.kind),
+        Some(StoreErrorKind::Conflict)
+    );
+
+    let (empty_directory, empty_store) = repository()?;
+    let empty_bytes = empty_store.export(empty_store.current()?.revision())?;
+    let empty_import = empty_store.import(
+        "empty-import",
+        empty_store.current()?.revision().clone(),
+        &empty_bytes,
+    )?;
+    assert!(empty_import.changed_keys.is_empty());
+    drop(empty_directory);
     drop(other_directory);
     Ok(())
 }

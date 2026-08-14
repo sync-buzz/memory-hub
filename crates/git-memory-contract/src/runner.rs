@@ -205,7 +205,9 @@ fn snapshot_consistency(target: &dyn ServerTarget, project: &Path) -> Result<(),
     let old_read = old_read?
         .ok_or_else(|| "old snapshot lost its record during concurrent write".to_owned())?;
     equal(
-        old_read.get("content").and_then(Value::as_str),
+        old_read
+            .pointer("/envelope/content")
+            .and_then(Value::as_str),
         Some("version one"),
         "concurrent old-snapshot read changed",
     )?;
@@ -294,7 +296,7 @@ fn same_key_conflict(target: &dyn ServerTarget, project: &Path) -> Result<(), St
     )?;
     let stored = get_record(target, project, "shared", &current)?
         .ok_or_else(|| "same-key winner was not persisted".to_owned())?;
-    let content = stored.get("content").and_then(Value::as_str);
+    let content = stored.pointer("/envelope/content").and_then(Value::as_str);
     if matches!(content, Some("first writer" | "second writer")) {
         Ok(())
     } else {
@@ -388,7 +390,7 @@ fn assert_record_content(
     let record = get_record(target, project, key, revision)?
         .ok_or_else(|| format!("record {key:?} is missing at {revision}"))?;
     equal(
-        record.get("content").and_then(Value::as_str),
+        record.pointer("/envelope/content").and_then(Value::as_str),
         Some(expected),
         &format!("record {key:?} has unexpected content"),
     )
@@ -409,7 +411,7 @@ fn assert_record_absent(
 
 fn record_has_content(record: Option<&Value>, expected: &str) -> bool {
     record
-        .and_then(|value| value.get("content"))
+        .and_then(|value| value.pointer("/envelope/content"))
         .and_then(Value::as_str)
         == Some(expected)
 }

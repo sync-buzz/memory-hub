@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use git_memory_core::{
     ArchiveState, ClientProfile, ContentHash, Envelope, FormatVersion, Freshness, FreshnessState,
     PolicyConfig, PolicyMode, PolicyResolver, PolicySource, RecordLink, SourcePaths,
@@ -13,10 +15,12 @@ fn independent_consumer_can_rebuild_from_the_public_envelope()
     envelope.links = vec![RecordLink {
         key: "decisions/mcp-only".into(),
         relation: Some("supports".into()),
+        extensions: BTreeMap::new(),
     }];
     envelope.source_paths = SourcePaths {
         scope: vec!["crates/git-memory-core/".into()],
         observed: vec!["README.md".into()],
+        extensions: BTreeMap::new(),
     };
     envelope.archive = ArchiveState::default();
     envelope.freshness = Freshness {
@@ -24,6 +28,7 @@ fn independent_consumer_can_rebuild_from_the_public_envelope()
         code_revision: Some("abc123".into()),
         validated_at: Some("2026-08-14T22:15:00Z".into()),
         reason: None,
+        extensions: BTreeMap::new(),
     };
     envelope.profile = Some(ClientProfile {
         name: "example-client".into(),
@@ -31,6 +36,7 @@ fn independent_consumer_can_rebuild_from_the_public_envelope()
         metadata: [("entity".into(), json!({"priority": "high"}))]
             .into_iter()
             .collect(),
+        extensions: BTreeMap::new(),
     });
     envelope
         .extensions
@@ -118,5 +124,31 @@ fn unknown_profile_values_are_preserved_as_opaque_json() -> Result<(), Box<dyn s
     let decoded: Envelope = serde_json::from_value(input.clone())?;
     let output = serde_json::to_value(decoded)?;
     assert_eq!(output["profile"]["metadata"], input["profile"]["metadata"]);
+    Ok(())
+}
+
+#[test]
+fn debug_output_redacts_record_payloads() -> Result<(), Box<dyn std::error::Error>> {
+    let envelope = Envelope::new("secret", "note", "do-not-log-plaintext")?;
+    let record = git_memory_core::StoredRecord::Plaintext {
+        envelope: Box::new(envelope),
+    };
+    let debug = format!("{record:?}");
+    assert!(!debug.contains("do-not-log-plaintext"));
+
+    let encrypted: git_memory_core::StoredRecord = serde_json::from_value(json!({
+        "representation": "encrypted",
+        "encrypted": {
+            "envelope_version": {"major": 1, "minor": 0},
+            "storage_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "key_epoch": 1,
+            "cipher_suite": "reserved-suite",
+            "nonce": "do-not-log-nonce",
+            "ciphertext": "do-not-log-ciphertext"
+        }
+    }))?;
+    let debug = format!("{encrypted:?}");
+    assert!(!debug.contains("do-not-log-nonce"));
+    assert!(!debug.contains("do-not-log-ciphertext"));
     Ok(())
 }

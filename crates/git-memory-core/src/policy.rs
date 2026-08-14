@@ -12,6 +12,7 @@ pub enum PolicyMode {
     Warn,
     Block,
     Repair,
+    RequireFullRebuild,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +54,7 @@ impl PolicyConfig {
     ) -> Result<Option<PolicyMode>, ContractError> {
         let event = event.into();
         validate_event(&event)?;
+        validate_mode(&event, mode)?;
         Ok(self.0.insert(event, mode))
     }
 
@@ -62,8 +64,9 @@ impl PolicyConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ContractError> {
-        for event in self.0.keys() {
+        for (event, mode) in &self.0 {
             validate_event(event)?;
+            validate_mode(event, *mode)?;
         }
         Ok(())
     }
@@ -96,7 +99,10 @@ impl PolicyResolver {
     pub fn git_memory_defaults() -> Self {
         let defaults = PolicyConfig(
             [
-                ("reconcile_divergence".into(), PolicyMode::Repair),
+                (
+                    "reconcile_divergence".into(),
+                    PolicyMode::RequireFullRebuild,
+                ),
                 ("memory_push_stale".into(), PolicyMode::Warn),
                 ("code_push_stale".into(), PolicyMode::Warn),
                 ("dangling_links".into(), PolicyMode::Block),
@@ -193,6 +199,28 @@ fn validate_event(event: &str) -> Result<(), ContractError> {
     }
 }
 
+fn validate_mode(event: &str, mode: PolicyMode) -> Result<(), ContractError> {
+    let supported = match event {
+        "reconcile_divergence" => matches!(mode, PolicyMode::RequireFullRebuild),
+        "memory_push_stale" | "code_push_stale" | "dangling_links" => {
+            matches!(mode, PolicyMode::Off | PolicyMode::Warn | PolicyMode::Block)
+        }
+        "index_lag" => matches!(
+            mode,
+            PolicyMode::Warn | PolicyMode::Repair | PolicyMode::Block
+        ),
+        _ => true,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(ContractError::invalid(
+            format!("policy.{event}"),
+            "mode is not supported for this policy event",
+        ))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -237,5 +265,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, ContractErrorKind::UnknownPolicy);
         assert_eq!(error.field, "policy.typo_event");
+    }
+
+    #[test]
+    fn builtin_events_reject_modes_their_behavior_cannot_honor() {
+        let mut project = PolicyConfig::new();
+        assert!(
+            project
+                .insert("dangling_links", PolicyMode::Repair)
+                .is_err()
+        );
+
+        let effective = PolicyResolver::git_memory_defaults()
+            .resolve("reconcile_divergence", None)
+            .unwrap();
+        assert_eq!(effective.mode, PolicyMode::RequireFullRebuild);
     }
 }

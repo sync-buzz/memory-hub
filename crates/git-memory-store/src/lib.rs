@@ -15,7 +15,7 @@ pub use types::{
     Snapshot, Transaction,
 };
 
-/// Mutable snapshot ref. It points directly to a Git tree.
+/// Mutable snapshot ref. It points to the tip of the transaction commit chain.
 pub const STAGED_REF: &str = "refs/memory/staged";
 
 /// Checkpoint history ref. It points to a chain of Git commits.

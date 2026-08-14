@@ -1,9 +1,19 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::{CURRENT_ENVELOPE_VERSION, ContractError, Envelope, FormatVersion};
+
+const RESERVED_FIELDS: &[&str] = &[
+    "envelope_version",
+    "storage_id",
+    "key_epoch",
+    "cipher_suite",
+    "nonce",
+    "ciphertext",
+];
 
 /// Opaque identifier chosen by the encryption adapter. It is the only record
 /// identifier allowed in encrypted tree paths.
@@ -58,7 +68,7 @@ impl<'de> Deserialize<'de> for OpaqueStorageId {
 
 /// Opaque payload reserved for a future encryption adapter. No semantic
 /// record key or kind exists outside `ciphertext`.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct EncryptedRecord {
     pub envelope_version: FormatVersion,
     pub storage_id: OpaqueStorageId,
@@ -68,6 +78,21 @@ pub struct EncryptedRecord {
     pub ciphertext: String,
     #[serde(flatten)]
     pub extensions: BTreeMap<String, Value>,
+}
+
+impl fmt::Debug for EncryptedRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptedRecord")
+            .field("envelope_version", &self.envelope_version)
+            .field("storage_id", &self.storage_id)
+            .field("key_epoch", &self.key_epoch)
+            .field("cipher_suite", &self.cipher_suite)
+            .field("nonce", &"<redacted>")
+            .field("ciphertext", &"<redacted>")
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -106,6 +131,16 @@ impl EncryptedRecord {
             if value.is_empty() {
                 return Err(ContractError::invalid(field, "value must not be empty"));
             }
+        }
+        if let Some(field) = self
+            .extensions
+            .keys()
+            .find(|field| RESERVED_FIELDS.contains(&field.as_str()))
+        {
+            return Err(ContractError::invalid(
+                format!("extensions.{field}"),
+                "extension collides with a reserved encrypted-record field",
+            ));
         }
         Ok(())
     }

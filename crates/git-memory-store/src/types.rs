@@ -122,7 +122,7 @@ pub struct ApplyResult {
     pub changed_keys: Vec<String>,
 }
 
-/// An immutable view identified only by repository location and tree oid.
+/// An immutable view identified by repository location and Memory commit oid.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub(crate) git_dir: PathBuf,
@@ -135,7 +135,7 @@ impl Snapshot {
         &self.revision
     }
 
-    /// Read one record from this immutable tree.
+    /// Read one record from this immutable snapshot.
     ///
     /// # Errors
     ///
@@ -144,7 +144,7 @@ impl Snapshot {
         GitStore::from_git_dir(self.git_dir.clone()).read_record(&self.revision, id)
     }
 
-    /// Read every record from this immutable tree in logical-id order.
+    /// Read every record from this immutable snapshot in logical-id order.
     ///
     /// # Errors
     ///
