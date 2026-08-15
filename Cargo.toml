@@ -4,6 +4,7 @@ members = [
     "crates/git-memory",
     "crates/git-memory-contract",
     "crates/git-memory-core",
+    "crates/git-memory-crypto",
     "crates/git-memory-embed",
     "crates/git-memory-mcp",
     "crates/git-memory-index",
@@ -33,10 +34,13 @@ dbg_macro = "warn"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 blake3 = "1"
+age = { version = "0.11", features = ["ssh"] }
 clap = { version = "4.5.46", features = ["derive"] }
 dirs = "5"
 fs2 = "0.4.3"
+getrandom = "0.3"
 arrow-array = "58.4"
 arrow-schema = "58.4"
 futures = "0.3.31"

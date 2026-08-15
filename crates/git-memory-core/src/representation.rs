@@ -113,7 +113,8 @@ impl EncryptedRecord {
     /// # Errors
     ///
     /// Returns [`ContractError`] for an incompatible envelope major, zero key
-    /// epoch, or an empty cipher suite, nonce, or ciphertext.
+    /// epoch, an empty cipher suite or ciphertext, or an empty nonce when the
+    /// cipher suite does not manage nonces internally (e.g. age).
     pub fn validate(&self) -> Result<(), ContractError> {
         self.envelope_version
             .require_major("envelope_version", CURRENT_ENVELOPE_VERSION.major)?;
@@ -123,14 +124,25 @@ impl EncryptedRecord {
                 "key epoch must be greater than zero",
             ));
         }
-        for (field, value) in [
-            ("cipher_suite", &self.cipher_suite),
-            ("nonce", &self.nonce),
-            ("ciphertext", &self.ciphertext),
-        ] {
-            if value.is_empty() {
-                return Err(ContractError::invalid(field, "value must not be empty"));
-            }
+        if self.cipher_suite.is_empty() {
+            return Err(ContractError::invalid(
+                "cipher_suite",
+                "value must not be empty",
+            ));
+        }
+        // age manages nonces internally — empty nonce is valid for age-v1.
+        let nonce_managed_internally = self.cipher_suite == "age-v1";
+        if !nonce_managed_internally && self.nonce.is_empty() {
+            return Err(ContractError::invalid(
+                "nonce",
+                "value must not be empty for this cipher suite",
+            ));
+        }
+        if self.ciphertext.is_empty() {
+            return Err(ContractError::invalid(
+                "ciphertext",
+                "value must not be empty",
+            ));
         }
         if let Some(field) = self
             .extensions
@@ -225,5 +237,39 @@ mod tests {
         );
         assert!(!path.contains("architecture"));
         record.validate().unwrap();
+    }
+
+    #[test]
+    fn age_v1_allows_empty_nonce() {
+        let record = EncryptedRecord {
+            envelope_version: CURRENT_ENVELOPE_VERSION,
+            storage_id: OpaqueStorageId::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            key_epoch: 1,
+            cipher_suite: "age-v1".into(),
+            nonce: String::new(),
+            ciphertext: "base64-encoded-age-ciphertext".into(),
+            extensions: BTreeMap::new(),
+        };
+        record.validate().unwrap();
+    }
+
+    #[test]
+    fn non_age_suite_rejects_empty_nonce() {
+        let record = EncryptedRecord {
+            envelope_version: CURRENT_ENVELOPE_VERSION,
+            storage_id: OpaqueStorageId::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            key_epoch: 1,
+            cipher_suite: "xchacha20-poly1305-v1".into(),
+            nonce: String::new(),
+            ciphertext: "ciphertext".into(),
+            extensions: BTreeMap::new(),
+        };
+        assert!(record.validate().is_err());
     }
 }

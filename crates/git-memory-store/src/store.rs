@@ -499,6 +499,19 @@ impl GitStore {
         Ok(Some(record))
     }
 
+    /// Public read path for a single record by id. Used by [`EncryptedStore`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the repository or record blob is corrupt.
+    pub fn read_record_pub(
+        &self,
+        revision: &Revision,
+        id: &RecordId,
+    ) -> Result<Option<StoredRecord>, StoreError> {
+        self.read_record(revision, id)
+    }
+
     pub(crate) fn read_records(
         &self,
         revision: &Revision,

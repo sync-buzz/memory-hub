@@ -4,10 +4,12 @@
 //! hashing, ref compare-and-swap, and concurrent rebase stay in its
 //! implementation. No transaction operation invokes the `git` executable.
 
+mod encrypted;
 mod error;
 mod store;
 mod types;
 
+pub use encrypted::{EncryptedStore, RecipientEntry};
 pub use error::{StoreError, StoreErrorKind};
 pub use store::GitStore;
 pub use types::{

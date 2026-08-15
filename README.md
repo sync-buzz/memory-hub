@@ -7,9 +7,8 @@ named `git-memory`, so Git exposes it as `git memory` whenever it is available o
 The repository contains the bootstrap CLI, the product-neutral envelope and
 policy contract, the atomic Git object store, hookless code-history
 reconciliation, a recoverable local LanceDB projection, the public MCP stdio
-interface, and a reusable black-box behavioral contract harness. Search,
-remote exchange, and encryption implementations remain capability-gated for
-later releases.
+interface, optional age-based encryption, and a reusable black-box behavioral
+contract harness.
 
 ## Build and verify
 
@@ -105,6 +104,73 @@ before Git Memory creates or moves a ref.
 See [`crates/git-memory-mcp/README.md`](crates/git-memory-mcp/README.md) for the
 resource and tool schemas, version handshake, errors, and revision subscription
 contract.
+
+## Encryption
+
+Git Memory supports optional encrypted mode using [age](https://age-encryption.org).
+When enabled, all record content and metadata are encrypted before reaching
+the Git tree. The `git-memory-crypto` crate is a thin wrapper around the
+`age` crate (with SSH key support), and `git-memory-store` provides an
+`EncryptedStore` that transparently encrypts and decrypts records.
+
+### How it works
+
+Encryption uses **age** with **SSH keys** as recipient identities. Most
+developers already have an SSH key on GitHub — Git Memory reuses it:
+
+- **Public key** (on GitHub) is used as an age recipient for encryption
+- **Private key** (`~/.ssh/id_ed25519`) is used as an age identity for decryption
+- Every record and the manifest are encrypted to all recipients in the list
+- Only people whose keys are in the recipients list can decrypt
+
+For users without SSH keys, Git Memory generates an age-native X25519
+keypair as a fallback. A backup X25519 keypair is always generated for
+recovery.
+
+### Access model
+
+Two independent gates, both required for access:
+
+- **Git access** — can clone/fetch the encrypted data from the repository
+- **Crypto access** — SSH/X25519 key is in the recipients list, can decrypt
+
+A collaborator with Git access but no crypto key sees encrypted blobs but
+cannot read them. The project owner controls the recipients list through
+`git memory encryption add/remove`.
+
+### What is encrypted
+
+In encrypted mode the Git tree contains no plaintext: record payloads,
+semantic keys, titles, kinds, tags, and links are all inside the encrypted
+manifest or encrypted record blobs. Only unavoidable Git metadata (refs,
+object counts, timestamps, commit graph) remains visible.
+
+### Key operations
+
+```
+# Owner: enable encryption
+git memory encryption init
+  → detects ~/.ssh/id_ed25519, generates backup key
+
+# Add a team member by GitHub username
+git memory encryption add --github-user bob
+  → fetches Bob's SSH key from GitHub API, re-encrypts all records
+
+# Remove a team member (rotation)
+git memory encryption remove --github-user bob
+  → re-encrypts without Bob's key; Bob can't read new data
+
+# Daily usage
+git memory unlock    # load SSH identity
+git memory lock      # drop identity from memory
+
+# Recovery
+git memory log       # view commit history
+git memory reset --to <commit>   # rollback to a point
+```
+
+See the [encryption architecture document](.sync/docs/encryption-architecture.md)
+for the full threat model, manifest structure, and recovery workflows.
 
 ## Bootstrap commands
 
