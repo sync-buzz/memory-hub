@@ -9,6 +9,7 @@ use std::thread;
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::ServerTarget;
 use crate::client::{CallError, call_tool, interrupt_transaction, read_resource};
@@ -23,6 +24,12 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ("same_key_conflict", same_key_conflict),
     ("interrupted_write_recovery", interrupted_write_recovery),
     ("history_diff_import_export", history_diff_import_export),
+    ("search_fts_and_filters", search_fts_and_filters),
+    ("search_pagination", search_pagination),
+    (
+        "backlinks_explicit_and_mentions",
+        backlinks_explicit_and_mentions,
+    ),
 ];
 
 #[derive(Debug, Serialize)]
@@ -740,4 +747,353 @@ fn equal<T: PartialEq + std::fmt::Debug>(
 
 fn display(error: CallError) -> String {
     error.to_string()
+}
+
+fn check(condition: bool, message: &str) -> Result<(), String> {
+    if condition {
+        Ok(())
+    } else {
+        Err(message.to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search and backlinks scenarios
+// ---------------------------------------------------------------------------
+
+fn search_record(
+    key: &str,
+    kind: &str,
+    content: &str,
+    title: Option<&str>,
+    tags: Vec<String>,
+    links: Vec<Value>,
+) -> Value {
+    let content_hash = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+    let mut envelope = json!({
+        "envelope_version": {"major": 1, "minor": 0},
+        "key": key,
+        "kind": kind,
+        "content": content,
+        "tags": tags,
+        "links": links,
+        "source_paths": {},
+        "archive": {"archived": false},
+        "freshness": {"state": "unverified"},
+        "content_hash": content_hash,
+    });
+    if let Some(t) = title {
+        envelope["title"] = json!(t);
+    }
+    json!({"representation": "plaintext", "envelope": envelope})
+}
+
+fn search_fts_and_filters(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
+    let base = current_revision(target, project)?;
+    let result = apply(
+        target,
+        project,
+        "search-seed",
+        &base,
+        vec![
+            put(search_record(
+                "alpha",
+                "decision",
+                "Use Rust for the core because memory safety matters",
+                Some("Language choice"),
+                vec!["architecture".into()],
+                vec![],
+            )),
+            put(search_record(
+                "beta",
+                "note",
+                "Rust async runtime requires careful thought",
+                Some("Async notes"),
+                vec!["async".into()],
+                vec![],
+            )),
+            put(search_record(
+                "gamma",
+                "decision",
+                "Use LanceDB for the projection layer",
+                Some("Index store"),
+                vec!["architecture".into(), "index".into()],
+                vec![],
+            )),
+        ],
+    )
+    .map_err(display)?;
+    let revision = string_field(&result, "revision")?;
+    search_fts_basic(target, project, &revision)?;
+    search_fts_kind_filter(target, project, &revision)?;
+    search_fts_tag_filter(target, project, &revision)?;
+    search_fts_degraded_flag(target, project, &revision)?;
+    Ok(())
+}
+
+fn search_fts_basic(
+    target: &dyn ServerTarget,
+    project: &Path,
+    revision: &str,
+) -> Result<(), String> {
+    let search_result = call_tool(
+        target,
+        project,
+        "memory_search",
+        json!({"query": "rust", "revision": revision}),
+    )
+    .map_err(display)?;
+    let hits = search_result
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("search returned no hits array: {search_result}"))?;
+    check(!hits.is_empty(), "FTS search for 'rust' should return hits")?;
+    let ids: Vec<&str> = hits
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+    check(ids.contains(&"alpha"), "search should find 'alpha'")?;
+    check(ids.contains(&"beta"), "search should find 'beta'")?;
+    Ok(())
+}
+
+fn search_fts_kind_filter(
+    target: &dyn ServerTarget,
+    project: &Path,
+    revision: &str,
+) -> Result<(), String> {
+    let filtered = call_tool(
+        target,
+        project,
+        "memory_search",
+        json!({"query": "rust", "revision": revision, "kind": "decision"}),
+    )
+    .map_err(display)?;
+    let filtered_hits = filtered
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("filtered search returned no hits: {filtered}"))?;
+    let filtered_ids: Vec<&str> = filtered_hits
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+    check(
+        filtered_ids.contains(&"alpha"),
+        "filtered search should find 'alpha'",
+    )?;
+    check(
+        !filtered_ids.contains(&"beta"),
+        "filtered search should exclude 'beta' (kind=note)",
+    )?;
+    Ok(())
+}
+
+fn search_fts_tag_filter(
+    target: &dyn ServerTarget,
+    project: &Path,
+    revision: &str,
+) -> Result<(), String> {
+    let tag_filtered = call_tool(
+        target,
+        project,
+        "memory_search",
+        json!({"query": "lancedb", "revision": revision, "tags": ["architecture"]}),
+    )
+    .map_err(display)?;
+    let tag_hits = tag_filtered
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("tag-filtered search returned no hits: {tag_filtered}"))?;
+    let tag_ids: Vec<&str> = tag_hits
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str))
+        .collect();
+    check(
+        tag_ids.contains(&"gamma"),
+        "tag-filtered search should find 'gamma'",
+    )?;
+    Ok(())
+}
+
+fn search_fts_degraded_flag(
+    target: &dyn ServerTarget,
+    project: &Path,
+    revision: &str,
+) -> Result<(), String> {
+    let search_result = call_tool(
+        target,
+        project,
+        "memory_search",
+        json!({"query": "rust", "revision": revision}),
+    )
+    .map_err(display)?;
+    let degraded = search_result
+        .get("degraded")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("search result has no 'degraded' field: {search_result}"))?;
+    check(
+        degraded,
+        "search should report degraded=true in FTS-only mode",
+    )?;
+    Ok(())
+}
+
+fn search_pagination(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
+    let base = current_revision(target, project)?;
+    let mut ops = Vec::new();
+    for i in 0..10 {
+        ops.push(put(search_record(
+            &format!("item-{i:02}"),
+            "note",
+            &format!("pagination test record number {i}"),
+            Some(&format!("Item {i}")),
+            vec![],
+            vec![],
+        )));
+    }
+    let result = apply(target, project, "pagination-seed", &base, ops).map_err(display)?;
+    let revision = string_field(&result, "revision")?;
+
+    let page1 = call_tool(
+        target,
+        project,
+        "memory_search",
+        json!({"query": "pagination", "revision": revision, "limit": 3, "offset": 0}),
+    )
+    .map_err(display)?;
+    let hits1 = page1
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("page1 has no hits: {page1}"))?;
+    equal(hits1.len(), 3, "page 1 should return 3 hits")?;
+    let has_more1 = page1
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("page1 has no has_more: {page1}"))?;
+    check(has_more1, "page 1 should indicate more results")?;
+
+    let page2 = call_tool(
+        target,
+        project,
+        "memory_search",
+        json!({"query": "pagination", "revision": revision, "limit": 3, "offset": 3}),
+    )
+    .map_err(display)?;
+    let hits2 = page2
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("page2 has no hits: {page2}"))?;
+    equal(hits2.len(), 3, "page 2 should return 3 hits")?;
+
+    let ids1: Vec<String> = hits1
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let ids2: Vec<String> = hits2
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for id in &ids2 {
+        check(!ids1.contains(id), "page 2 should not overlap page 1")?;
+    }
+
+    Ok(())
+}
+
+fn backlinks_explicit_and_mentions(
+    target: &dyn ServerTarget,
+    project: &Path,
+) -> Result<(), String> {
+    let base = current_revision(target, project)?;
+    let result = apply(
+        target,
+        project,
+        "backlinks-seed",
+        &base,
+        vec![
+            put(search_record(
+                "target",
+                "decision",
+                "The canonical decision record",
+                Some("Target"),
+                vec![],
+                vec![],
+            )),
+            put(search_record(
+                "explicit-linker",
+                "note",
+                "This note references the target decision",
+                Some("Linker"),
+                vec![],
+                vec![json!({"key": "target", "relation": "references"})],
+            )),
+            put(search_record(
+                "body-mentioner",
+                "observation",
+                "See target for the full rationale behind this choice",
+                Some("Mentioner"),
+                vec![],
+                vec![],
+            )),
+            put(search_record(
+                "unrelated",
+                "note",
+                "This record has nothing to do with anything",
+                Some("Unrelated"),
+                vec![],
+                vec![],
+            )),
+        ],
+    )
+    .map_err(display)?;
+    let revision = string_field(&result, "revision")?;
+
+    let bl_result = call_tool(
+        target,
+        project,
+        "memory_backlinks",
+        json!({"key": "target", "revision": revision}),
+    )
+    .map_err(display)?;
+    let backlinks = bl_result
+        .get("backlinks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("backlinks returned no array: {bl_result}"))?;
+    check(
+        backlinks.len() >= 2,
+        &format!(
+            "backlinks should find at least 2 entries (explicit + mention), got {}",
+            backlinks.len()
+        ),
+    )?;
+
+    let source_ids: Vec<&str> = backlinks
+        .iter()
+        .filter_map(|b| b.get("source_id").and_then(Value::as_str))
+        .collect();
+    check(
+        source_ids.contains(&"explicit-linker"),
+        "backlinks should include explicit-linker",
+    )?;
+    check(
+        source_ids.contains(&"body-mentioner"),
+        "backlinks should include body-mentioner",
+    )?;
+    check(
+        !source_ids.contains(&"unrelated"),
+        "backlinks should not include unrelated",
+    )?;
+
+    let has_explicit = backlinks.iter().any(|b| {
+        b.get("source_id").and_then(Value::as_str) == Some("explicit-linker")
+            && b.get("mention_type").and_then(Value::as_str) == Some("explicit_link")
+    });
+    let has_mention = backlinks.iter().any(|b| {
+        b.get("source_id").and_then(Value::as_str) == Some("body-mentioner")
+            && b.get("mention_type").and_then(Value::as_str) == Some("body_mention")
+    });
+    check(has_explicit, "backlinks should have an explicit_link entry")?;
+    check(has_mention, "backlinks should have a body_mention entry")?;
+
+    Ok(())
 }

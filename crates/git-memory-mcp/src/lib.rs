@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use git_memory_core::{CURRENT_ENVELOPE_VERSION, PolicyResolver, StoredRecord};
-use git_memory_index::{IndexError, Projection};
+use git_memory_index::{IndexError, Projection, SearchFilters, SearchRequest};
 use git_memory_reconcile::{DivergenceMode, ReconcileError, ReconcileErrorKind, Reconciler};
 use git_memory_store::{GitStore, Operation, RecordId, Revision, StoreError, Transaction};
 use serde::Deserialize;
@@ -252,7 +252,17 @@ impl Session {
                     "targetRevision": status.target_revision
                 })
             }
-            "memory://model/status" => unavailable_status("model", "GITMEMO-8"),
+            "memory://model/status" => json!({
+                "schemaVersion": 1,
+                "available": true,
+                "modelId": null,
+                "dimensions": null,
+                "runtime": "none",
+                "runtimeState": "missing",
+                "vectorSearch": false,
+                "ftsOnly": true,
+                "mode": "fts"
+            }),
             "memory://policy/effective" => policy_resource(),
             "memory://encryption/status" => json!({
                 "schemaVersion": 1,
@@ -365,9 +375,8 @@ impl Session {
             "memory_doctor" => self.doctor(),
             "memory_reconcile" => self.reconcile(arguments),
             "memory_reindex" => self.reindex(),
-            "memory_search" | "memory_backlinks" => {
-                Err(unavailable("search_index", "GITMEMO-7/GITMEMO-9"))
-            }
+            "memory_search" => self.search(arguments),
+            "memory_backlinks" => self.backlinks(arguments),
             "memory_transport_status" | "memory_fetch" | "memory_push" => {
                 Err(unavailable("remote_transport", "GITMEMO-10"))
             }
@@ -546,6 +555,86 @@ impl Session {
             .iter()
             .any(|commit| !commit.stale_keys.is_empty()))
     }
+
+    fn search(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let query = required_string(arguments, "query")?.to_owned();
+        let limit = usize::try_from(arguments.get("limit").and_then(Value::as_u64).unwrap_or(20))
+            .unwrap_or(20);
+        let offset = usize::try_from(arguments.get("offset").and_then(Value::as_u64).unwrap_or(0))
+            .unwrap_or(0);
+        let revision: Revision = if let Some(rev) = arguments.get("revision") {
+            serde_json::from_value(rev.clone())
+                .map_err(|_| RpcFailure::invalid_argument("revision"))?
+        } else {
+            self.store()?
+                .current()
+                .map_err(ToolFailure::store)?
+                .revision()
+                .clone()
+        };
+        let filters = SearchFilters {
+            kind: arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tags: arguments
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            archived: arguments.get("archived").and_then(Value::as_bool),
+            freshness: arguments
+                .get("freshness")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let request = SearchRequest {
+            query,
+            limit,
+            offset,
+            filters,
+            revision: revision.clone(),
+        };
+        let store = self.store()?;
+        // The index is already synchronized after each mutation (see call_tool),
+        // so we search directly. If the index is stale for the requested
+        // revision, search_store returns a structured error.
+        let result = Projection::search_store(&store, &request).map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!(result)))
+    }
+
+    fn backlinks(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let key = required_string(arguments, "key")?.to_owned();
+        let revision: Revision = if let Some(rev) = arguments.get("revision") {
+            serde_json::from_value(rev.clone())
+                .map_err(|_| RpcFailure::invalid_argument("revision"))?
+        } else {
+            self.store()?
+                .current()
+                .map_err(ToolFailure::store)?
+                .revision()
+                .clone()
+        };
+        let store = self.store()?;
+        let entries =
+            Projection::backlinks_store(&store, &revision, &key).map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!({
+            "key": key,
+            "revision": revision,
+            "backlinks": entries,
+        })))
+    }
 }
 
 #[derive(Deserialize)]
@@ -694,6 +783,43 @@ fn list_tools() -> Value {
             ),
         ),
         tool(
+            "memory_search",
+            "Full-text search the derived Memory index with filters and pagination",
+            object_schema(
+                &[
+                    ("query", string_schema()),
+                    (
+                        "limit",
+                        json!({"type":"integer","minimum":1,"maximum":200,"default":20}),
+                    ),
+                    ("offset", json!({"type":"integer","minimum":0,"default":0})),
+                    ("revision", string_schema()),
+                    ("kind", string_schema()),
+                    (
+                        "tags",
+                        json!({"type":"array","items":{"type":"string","minLength":1}}),
+                    ),
+                    ("archived", json!({"type":"boolean"})),
+                    (
+                        "freshness",
+                        json!({
+                            "type":"array",
+                            "items":{"type":"string","enum":["unverified","fresh","stale","invalid"]}
+                        }),
+                    ),
+                ],
+                &["query"],
+            ),
+        ),
+        tool(
+            "memory_backlinks",
+            "Find records that link to or mention a key (explicit links + body mentions)",
+            object_schema(
+                &[("key", string_schema()), ("revision", string_schema())],
+                &["key"],
+            ),
+        ),
+        tool(
             "memory_doctor",
             "Validate repository and canonical store access",
             object_schema(&[], &[]),
@@ -705,8 +831,6 @@ fn list_tools() -> Value {
         ),
     ];
     for (name, description) in [
-        ("memory_search", "Search the derived Memory index"),
-        ("memory_backlinks", "Find records linking to a record"),
         ("memory_reindex", "Rebuild the derived Memory index"),
         (
             "memory_transport_status",
@@ -751,10 +875,6 @@ fn policy_resource() -> Value {
         .filter_map(|event| resolver.resolve(event, None).ok())
         .collect::<Vec<_>>();
     json!({"schemaVersion": 1, "policies": policies})
-}
-
-fn unavailable_status(capability: &str, planned_spec: &str) -> Value {
-    json!({"schemaVersion": 1, "available": false, "capability": capability, "plannedSpec": planned_spec})
 }
 
 fn unavailable(capability: &'static str, planned_spec: &'static str) -> ToolCallFailure {

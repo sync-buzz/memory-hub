@@ -187,6 +187,8 @@ fn call_tool(
         "memory_diff" => diff(state_path, &arguments),
         "memory_export" => export(state_path, &arguments),
         "memory_import" => import(state_path, &arguments),
+        "memory_search" => search(state_path, &arguments),
+        "memory_backlinks" => backlinks(state_path, &arguments),
         _ => {
             return Err(RpcFailure {
                 code: -32_602,
@@ -249,7 +251,9 @@ fn list_tools() -> Value {
             {"name": "memory_history", "description": "History", "inputSchema": {"type": "object"}},
             {"name": "memory_diff", "description": "Diff", "inputSchema": {"type": "object"}},
             {"name": "memory_export", "description": "Export", "inputSchema": {"type": "object"}},
-            {"name": "memory_import", "description": "Import", "inputSchema": {"type": "object"}}
+            {"name": "memory_import", "description": "Import", "inputSchema": {"type": "object"}},
+            {"name": "memory_search", "description": "Search records", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+            {"name": "memory_backlinks", "description": "Backlinks", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}}
         ]
     })
 }
@@ -542,6 +546,190 @@ fn import(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
     Ok(json!(result))
 }
 
+fn search(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let query = required_string(arguments, "query")?;
+    let limit =
+        usize::try_from(arguments.get("limit").and_then(Value::as_u64).unwrap_or(20)).unwrap_or(20);
+    let offset =
+        usize::try_from(arguments.get("offset").and_then(Value::as_u64).unwrap_or(0)).unwrap_or(0);
+    let kind_filter = arguments.get("kind").and_then(Value::as_str);
+    let tag_filters: Vec<String> = arguments
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let state = load_state(state_path).map_err(state_failure)?;
+    let revision = if let Some(rev) = arguments.get("revision").and_then(Value::as_str) {
+        rev.to_owned()
+    } else {
+        state.current.clone()
+    };
+    let snapshot = state.snapshots.get(&revision).ok_or_else(|| ToolFailure {
+        kind: "snapshot_not_found",
+        data: json!({"revision": revision}),
+    })?;
+    let query_lower = query.to_lowercase();
+    let hits: Vec<Value> = snapshot
+        .records
+        .iter()
+        .filter_map(|(id, record)| search_hit(id, record, &query_lower, kind_filter, &tag_filters))
+        .collect();
+    let total = hits.len();
+    let has_more = total > limit + offset;
+    let page: Vec<Value> = hits.into_iter().skip(offset).take(limit).collect();
+    Ok(json!({
+        "hits": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "mode": "fts",
+        "degraded": true,
+        "revision": revision,
+    }))
+}
+
+fn search_hit(
+    id: &str,
+    record: &Value,
+    query_lower: &str,
+    kind_filter: Option<&str>,
+    tag_filters: &[String],
+) -> Option<Value> {
+    let envelope = record.pointer("/envelope")?;
+    let content = envelope
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let title = envelope
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = envelope.get("kind").and_then(Value::as_str)?;
+    if !content.to_lowercase().contains(query_lower)
+        && !title.to_lowercase().contains(query_lower)
+        && !kind.to_lowercase().contains(query_lower)
+    {
+        return None;
+    }
+    if let Some(kf) = kind_filter
+        && kind != kf
+    {
+        return None;
+    }
+    let tags: Vec<String> = envelope
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !tag_filters.iter().all(|tf| tags.contains(tf)) {
+        return None;
+    }
+    Some(json!({
+        "id": id,
+        "kind": kind,
+        "title": envelope.get("title"),
+        "content": envelope.get("content"),
+        "archived": envelope.pointer("/archive/archived").and_then(Value::as_bool).unwrap_or(false),
+        "freshness": envelope.pointer("/freshness/state").and_then(Value::as_str),
+        "tags": tags,
+        "fts_score": 1.0,
+        "vector_score": null,
+        "combined_rank": 1.0,
+    }))
+}
+
+fn backlinks(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let key = required_string(arguments, "key")?;
+    let state = load_state(state_path).map_err(state_failure)?;
+    let revision = if let Some(rev) = arguments.get("revision").and_then(Value::as_str) {
+        rev.to_owned()
+    } else {
+        state.current.clone()
+    };
+    let snapshot = state.snapshots.get(&revision).ok_or_else(|| ToolFailure {
+        kind: "snapshot_not_found",
+        data: json!({"revision": revision}),
+    })?;
+    let mut entries = Vec::new();
+    for (id, record) in &snapshot.records {
+        let Some(envelope) = record.pointer("/envelope") else {
+            continue;
+        };
+        let kind = envelope.get("kind").and_then(Value::as_str);
+        let title = envelope.get("title").and_then(Value::as_str);
+        if let Some(links) = envelope.get("links").and_then(Value::as_array) {
+            for link in links {
+                if link.get("key").and_then(Value::as_str) == Some(key) {
+                    entries.push(json!({
+                        "source_id": id,
+                        "source_kind": kind,
+                        "source_title": title,
+                        "relation": link.get("relation").and_then(Value::as_str),
+                        "mention_type": "explicit_link",
+                    }));
+                }
+            }
+        }
+        let content = envelope
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if contains_mention(content, key) {
+            entries.push(json!({
+                "source_id": id,
+                "source_kind": kind,
+                "source_title": title,
+                "relation": null,
+                "mention_type": "body_mention",
+            }));
+        }
+    }
+    entries.sort_by(|a, b| {
+        a["source_id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["source_id"].as_str().unwrap_or(""))
+    });
+    Ok(json!({"key": key, "revision": revision, "backlinks": entries}))
+}
+
+fn contains_mention(content: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = content[start..].find(key) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !content
+                .as_bytes()
+                .get(abs - 1)
+                .is_some_and(u8::is_ascii_alphanumeric);
+        let after = abs + key.len();
+        let after_ok = after >= content.len()
+            || !content
+                .as_bytes()
+                .get(after)
+                .is_some_and(u8::is_ascii_alphanumeric);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 fn operation_key(operation: &Value) -> Result<&str, ToolFailure> {
     match operation.get("op").and_then(Value::as_str) {
         Some("put") => operation
@@ -674,7 +862,9 @@ mod tests {
                 "memory_history",
                 "memory_diff",
                 "memory_export",
-                "memory_import"
+                "memory_import",
+                "memory_search",
+                "memory_backlinks"
             ]
         );
 

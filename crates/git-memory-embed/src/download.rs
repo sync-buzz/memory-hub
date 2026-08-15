@@ -18,6 +18,7 @@
 //! rejected on mismatch. When it is [`PLACEHOLDER_SHA256`] the computed digest
 //! is returned for the operator to paste back into the registry.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -388,4 +389,76 @@ async fn hash_file(path: &Path) -> Result<String, DownloadError> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Sync variant of [`hash_file`] using `std::fs`.
+fn hash_file_sync(path: &Path) -> Result<String, DownloadError> {
+    let mut f = std::fs::File::open(path).map_err(|source| DownloadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; HASH_READ_CHUNK];
+    loop {
+        let n = f.read(&mut buf).map_err(|source| DownloadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Result of a sync model presence check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelVerification {
+    /// Model file is on disk and its SHA-256 matches the registry pin.
+    Present {
+        path: PathBuf,
+        sha256: String,
+        verified: bool,
+    },
+    /// Model file is not on disk.
+    Missing,
+    /// Model file is on disk but its SHA-256 does not match the registry pin.
+    Broken {
+        path: PathBuf,
+        expected: String,
+        computed: String,
+    },
+}
+
+/// Synchronously check whether a model is on disk and its hash matches the
+/// registry pin. Does not touch the network.
+///
+/// # Errors
+///
+/// Returns [`DownloadError`] when the cache directory cannot be resolved or
+/// the file cannot be read.
+pub fn verify_model_sync(
+    spec: impl Into<DownloadSpec>,
+    opts: &DownloadOpts,
+) -> Result<ModelVerification, DownloadError> {
+    let entry = spec.into();
+    let path = model_path(entry, opts)?;
+    if !path.exists() {
+        return Ok(ModelVerification::Missing);
+    }
+    let computed = hash_file_sync(&path)?;
+    if entry.sha256 == PLACEHOLDER_SHA256 || entry.sha256.eq_ignore_ascii_case(&computed) {
+        Ok(ModelVerification::Present {
+            path,
+            sha256: computed,
+            verified: entry.sha256 != PLACEHOLDER_SHA256,
+        })
+    } else {
+        Ok(ModelVerification::Broken {
+            path,
+            expected: entry.sha256.to_string(),
+            computed,
+        })
+    }
 }

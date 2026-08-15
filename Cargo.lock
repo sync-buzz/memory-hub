@@ -2294,17 +2294,23 @@ dependencies = [
 name = "git-memory"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
+ "dirs 5.0.1",
  "git-memory-contract",
+ "git-memory-embed",
  "git-memory-index",
  "git-memory-mcp",
  "git-memory-reconcile",
  "git-memory-store",
  "git2",
+ "indicatif",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

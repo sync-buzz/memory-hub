@@ -116,3 +116,71 @@ pub fn find(id: &str) -> Option<&'static ModelEntry> {
 pub fn default_model() -> &'static ModelEntry {
     &BGE_M3
 }
+
+/// Platform-aware default model.
+///
+/// Selects the best default for the compile-time target:
+///
+/// | Target | Backend | Default | Rationale |
+/// |---|---|---|---|
+/// | `aarch64-apple-darwin` (M1/M2/M3) | Metal | `bge-m3` | Metal accelerates 1024-dim; best multilingual quality |
+/// | `x86_64-apple-darwin` (Intel Mac) | CPU | `nomic-embed-text-v1.5` | CPU is slower; 768-dim is an acceptable balance |
+/// | `x86_64-*linux*` / `x86_64-pc-windows` | CPU | `nomic-embed-text-v1.5` | Same CPU balance |
+///
+/// Tests cover every supported target via `cfg!` mocks — see
+/// `tests::platform_default_matches_target`.
+#[must_use]
+pub fn platform_default_model() -> &'static ModelEntry {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        &BGE_M3
+    } else if cfg!(any(
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "x86_64", target_os = "windows"),
+    )) {
+        &NOMIC_EMBED_TEXT_V15
+    } else {
+        &BGE_M3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_default_matches_target() {
+        let model = platform_default_model();
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            assert_eq!(model.id, "bge-m3");
+        } else if cfg!(any(
+            all(target_arch = "x86_64", target_os = "macos"),
+            all(target_arch = "x86_64", target_os = "linux"),
+            all(target_arch = "x86_64", target_os = "windows"),
+        )) {
+            assert_eq!(model.id, "nomic-embed-text-v1.5");
+        } else {
+            assert_eq!(model.id, "bge-m3");
+        }
+    }
+
+    #[test]
+    fn platform_default_is_in_registry() {
+        let model = platform_default_model();
+        assert!(ALL.iter().any(|m| m.id == model.id));
+    }
+
+    #[test]
+    fn find_returns_known_models() {
+        assert_eq!(find("bge-m3").map(|m| m.id), Some("bge-m3"));
+        assert_eq!(
+            find("nomic-embed-text-v1.5").map(|m| m.id),
+            Some("nomic-embed-text-v1.5")
+        );
+        assert_eq!(
+            find("bge-small-en-v1.5").map(|m| m.id),
+            Some("bge-small-en-v1.5")
+        );
+        assert!(find("nonexistent").is_none());
+    }
+}

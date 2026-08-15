@@ -1,6 +1,8 @@
 mod cli;
+mod config;
 mod doctor;
 mod exit;
+mod model;
 
 use std::process::ExitCode;
 

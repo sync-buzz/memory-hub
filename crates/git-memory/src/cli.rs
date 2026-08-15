@@ -8,6 +8,7 @@ use git_memory_store::GitStore;
 
 use crate::doctor;
 use crate::exit::Code;
+use crate::model;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,15 +58,57 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Output::Human)]
         output: Output,
     },
+
+    /// Manage embedding models: download, list, show, use, benchmark.
+    Model {
+        #[command(subcommand)]
+        subcommand: ModelCommand,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human, global = true)]
+        output: Output,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Download a GGUF model to the local cache with SHA-256 verification.
+    Download {
+        /// Model id (e.g. `bge-m3`, `nomic-embed-text-v1.5`).
+        id: String,
+    },
+
+    /// List all models in the registry with on-disk and active status.
+    List,
+
+    /// Show detailed metadata for a model.
+    Show {
+        /// Model id.
+        id: String,
+    },
+
+    /// Set the active model in config. Does not download — prints a hint if
+    /// the file is not on disk.
+    Use {
+        /// Model id.
+        id: String,
+    },
+
+    /// Benchmark model throughput across a batch × token-length grid.
+    Benchmark {
+        /// Model id. Requires the model to be on disk.
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum Output {
+pub(crate) enum Output {
     #[default]
     Human,
     Json,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run<I, T>(args: I) -> Code
 where
     I: IntoIterator<Item = T>,
@@ -168,6 +211,16 @@ where
                     eprintln!("git-memory: reconcile failed: {error}");
                     Code::DoctorFailed
                 }
+            }
+        }
+        Command::Model { subcommand, output } => {
+            let output = model::Output::from(output);
+            match subcommand {
+                ModelCommand::Download { id } => model::download(&id, output),
+                ModelCommand::List => model::list(output),
+                ModelCommand::Show { id } => model::show(&id, output),
+                ModelCommand::Use { id } => model::use_model(&id, output),
+                ModelCommand::Benchmark { id } => model::benchmark(&id, output),
             }
         }
     }

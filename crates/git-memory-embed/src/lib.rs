@@ -24,14 +24,17 @@ pub mod worker;
 
 pub use cache::content_hash_of;
 pub use download::{
-    DownloadError, DownloadOpts, DownloadSpec, EnsureOutcome, ProgressCallback, ensure_model,
-    model_path as cached_model_path,
+    DownloadError, DownloadOpts, DownloadSpec, EnsureOutcome, ModelVerification, ProgressCallback,
+    ensure_model, model_path as cached_model_path, verify_model_sync,
 };
 pub use fingerprint::{Fingerprint, FingerprintError};
 pub use llama_cpp::{LlamaCppProvider, backend_name};
 pub use mock::MockProvider;
 pub use provider::{EmbeddingProvider, Pooling};
-pub use registry::{ModelEntry, all_models, default_model, find as find_model};
+pub use registry::{
+    ModelEntry, PLACEHOLDER_SHA256, all_models, default_model, find as find_model,
+    platform_default_model,
+};
 pub use renderer::{RENDERER_VERSION, render_envelope};
 pub use status::{ModelRuntime, ModelStatus, ModelStatusBuilder};
 pub use worker::{

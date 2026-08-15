@@ -6,6 +6,8 @@ use std::process::Command;
 use git_memory_reconcile::{DivergenceMode, ReconcileErrorKind, Reconciler};
 use serde::Serialize;
 
+use crate::model;
+
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -41,6 +43,8 @@ struct CheckData {
     git_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
 }
 
 impl Report {
@@ -52,7 +56,7 @@ impl Report {
 pub(crate) fn inspect(project: Option<&Path>) -> Report {
     let requested_project = project.map_or_else(default_project, Path::to_path_buf);
     let display_project = requested_project.display().to_string();
-    let mut checks = Vec::with_capacity(4);
+    let mut checks = Vec::with_capacity(5);
 
     checks.push(project_check(&requested_project));
 
@@ -75,6 +79,8 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
             "reconciliation check was skipped because a prerequisite failed",
         ));
     }
+
+    checks.push(model_check());
 
     let status = if checks.iter().all(|check| check.status == Status::Ok) {
         Status::Ok
@@ -121,6 +127,27 @@ const fn reconcile_kind(kind: ReconcileErrorKind) -> &'static str {
     }
 }
 
+fn model_check() -> Check {
+    let check = model::doctor_check();
+    let data = CheckData {
+        git_dir: None,
+        git_version: None,
+        model_id: Some(check.model_id),
+    };
+    match check.status {
+        model::DoctorModelStatus::Ok => Check::ok("memory.model", check.message, Some(data)),
+        model::DoctorModelStatus::Missing | model::DoctorModelStatus::Broken => {
+            let kind = check.status.kind().unwrap_or("model_check_error");
+            Check::ok_with_kind("memory.model", kind, check.message, Some(data))
+        }
+        model::DoctorModelStatus::Error => Check::error(
+            "memory.model",
+            check.status.kind().unwrap_or("model_check_error"),
+            check.message,
+        ),
+    }
+}
+
 fn default_project() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -158,6 +185,7 @@ fn git_version_check() -> Check {
                 Some(CheckData {
                     git_dir: None,
                     git_version: Some(version),
+                    model_id: None,
                 }),
             )
         }
@@ -182,6 +210,7 @@ fn repository_check(project: &Path) -> Check {
             Some(CheckData {
                 git_dir: Some(git_dir),
                 git_version: None,
+                model_id: None,
             }),
         ),
         Err(message) => Check::error("git.repository", "not_a_git_repository", message),
@@ -234,6 +263,26 @@ impl Check {
             id,
             status: Status::Ok,
             kind: None,
+            message,
+            data,
+        }
+    }
+
+    /// Build a check that is overall `Ok` but carries a diagnostic `kind`.
+    ///
+    /// Used for model missing/broken: the system is still healthy (FTS-only
+    /// degradation), but we surface the issue as a warning kind so scripts
+    /// consuming the JSON can detect it.
+    fn ok_with_kind(
+        id: &'static str,
+        kind: &'static str,
+        message: String,
+        data: Option<CheckData>,
+    ) -> Self {
+        Self {
+            id,
+            status: Status::Ok,
+            kind: Some(kind),
             message,
             data,
         }

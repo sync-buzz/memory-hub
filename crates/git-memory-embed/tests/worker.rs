@@ -134,13 +134,19 @@ impl EmbeddingProvider for AlwaysFailingProvider {
 struct GatedProvider {
     inner: MockProvider,
     gate: Arc<AtomicBool>,
+    embed_entered: Arc<AtomicUsize>,
 }
 
 impl GatedProvider {
     fn new(dim: usize, gate: Arc<AtomicBool>) -> Self {
+        Self::new_with_signal(dim, gate, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn new_with_signal(dim: usize, gate: Arc<AtomicBool>, embed_entered: Arc<AtomicUsize>) -> Self {
         Self {
             inner: MockProvider::new(dim),
             gate,
+            embed_entered,
         }
     }
 }
@@ -169,6 +175,7 @@ impl EmbeddingProvider for GatedProvider {
         self.inner.doc_prefix()
     }
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_entered.fetch_add(1, Ordering::SeqCst);
         while !self.gate.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -354,7 +361,12 @@ async fn handle_clones_share_the_same_queue() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bounded_queue_applies_backpressure() {
     let gate = Arc::new(AtomicBool::new(false));
-    let provider = Arc::new(GatedProvider::new(DIM, gate.clone()));
+    let embed_entered = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(GatedProvider::new_with_signal(
+        DIM,
+        gate.clone(),
+        embed_entered.clone(),
+    ));
     let sink = Arc::new(InMemorySink::default());
     let capacity = 4;
     let handle = EmbedWorker::spawn(
@@ -367,8 +379,16 @@ async fn bounded_queue_applies_backpressure() {
         },
     );
 
-    // The worker is gated (stuck in embed), so the channel fills up.
-    for i in 0..capacity {
+    // Enqueue one job so the worker wakes, pulls it into a batch, and blocks
+    // in embed() on the gate. Once embed() is entered the worker stops
+    // consuming from the channel.
+    handle.enqueue(make_job(0)).await.unwrap();
+    while embed_entered.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // The worker is now blocked in embed(); fill the channel to capacity.
+    for i in 1..=capacity {
         handle.enqueue(make_job(i)).await.unwrap();
     }
 

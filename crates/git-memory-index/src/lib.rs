@@ -9,7 +9,9 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{
+    Array, BooleanArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fs2::FileExt;
 use futures::TryStreamExt;
@@ -17,12 +19,14 @@ use git_memory_core::StoredRecord;
 use git_memory_store::{ChangeKind, GitStore, RecordId, Revision, Snapshot};
 use lancedb::connection::Connection;
 use lancedb::index::Index as LanceIndex;
-use lancedb::index::scalar::FtsIndexBuilder;
-use lancedb::query::ExecutableQuery;
+use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 
 const TABLE: &str = "records";
-const META_SCHEMA: u32 = 1;
+const META_SCHEMA: u32 = 2;
+const TAGS_DELIMITER: char = '\n';
+const MAX_SEARCH_LIMIT: usize = 200;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +55,108 @@ pub struct ProjectedRecord {
     pub content: Option<String>,
     pub archived: bool,
     pub freshness: Option<String>,
+    pub tags: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/// Filter predicates applied alongside the FTS query.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// `Some(true)` → only archived, `Some(false)` → only live, `None` → both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    /// Empty vec → all freshness states.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub freshness: Vec<String>,
+}
+
+/// One search request. `revision` pins the snapshot the index must represent.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub filters: SearchFilters,
+    pub revision: Revision,
+}
+
+fn default_search_limit() -> usize {
+    20
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    Fts,
+    Hybrid,
+}
+
+/// One hit in a [`SearchResult`].
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchHit {
+    pub id: String,
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub archived: bool,
+    pub freshness: Option<String>,
+    pub tags: Vec<String>,
+    /// BM25 score from FTS (higher is better). `None` when FTS did not match.
+    pub fts_score: Option<f64>,
+    /// Semantic similarity score from vector search (higher is better).
+    /// `None` when vector search is unavailable or not run.
+    pub vector_score: Option<f64>,
+    /// Deterministic fusion of available channel scores (higher is better).
+    pub combined_rank: f64,
+}
+
+/// Result of [`Projection::search`].
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
+    pub mode: SearchMode,
+    /// `true` when vector search was requested but unavailable (FTS-only).
+    pub degraded: bool,
+    /// Revision the index represented when serving this search.
+    pub revision: Revision,
+}
+
+// ---------------------------------------------------------------------------
+// Backlinks
+// ---------------------------------------------------------------------------
+
+/// How a backlink was discovered.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionType {
+    /// The target key appears in the source record's `envelope.links` array.
+    ExplicitLink,
+    /// The target key appears as a word-boundary substring of `envelope.content`.
+    BodyMention,
+}
+
+/// One record that links to or mentions the target key.
+#[derive(Clone, Debug, Serialize)]
+pub struct BacklinkEntry {
+    pub source_id: String,
+    pub source_kind: Option<String>,
+    pub source_title: Option<String>,
+    pub relation: Option<String>,
+    pub mention_type: MentionType,
 }
 
 #[derive(Debug)]
@@ -114,6 +220,43 @@ impl Projection {
         let root = store.git_dir().join("git-memory/index");
         let _lock = lock_at(&root, false)?;
         read_status_at(&root)
+    }
+
+    /// Synchronous entry point for MCP: open the default per-repository
+    /// projection, run a search, and return the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, catalog, or search fails.
+    pub fn search_store(
+        store: &GitStore,
+        request: &SearchRequest,
+    ) -> Result<SearchResult, IndexError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| IndexError::new(format!("create search runtime: {error}")))?;
+        runtime.block_on(async {
+            let projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            projection.search(request).await
+        })
+    }
+
+    /// Compute backlinks from a canonical snapshot — no `LanceDB` required.
+    ///
+    /// Returns every record that links to or mentions `key` via explicit
+    /// `envelope.links` or body-mention scanning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot be read.
+    pub fn backlinks_store(
+        store: &GitStore,
+        revision: &Revision,
+        key: &str,
+    ) -> Result<Vec<BacklinkEntry>, IndexError> {
+        let snapshot = store.snapshot(revision).map_err(store_error)?;
+        compute_backlinks(&snapshot, key)
     }
 
     /// Open the disposable projection at an explicit local-state directory.
@@ -336,6 +479,100 @@ impl Projection {
         decode_batches(&batches)
     }
 
+    /// FTS (and future hybrid) search with filters and pagination.
+    ///
+    /// The projection must be `Fresh` for `request.revision`; a lagging index
+    /// is never silently served as current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index is stale, the FTS query fails, or the
+    /// table is missing.
+    pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult, IndexError> {
+        let _lock = self.read_lock_async().await?;
+        let status = self.read_status_unlocked()?;
+        if status.state != ProjectionState::Fresh
+            || status.canonical_revision.as_ref() != Some(&request.revision)
+        {
+            return Err(IndexError::new(
+                "projection is not fresh for the requested revision",
+            ));
+        }
+        let limit = request.limit.clamp(1, MAX_SEARCH_LIMIT);
+        let offset = request.offset;
+        // Guard against overflow: offset beyond a reasonable cap is meaningless
+        // and would panic on `fetch = limit + offset + 1`.
+        let max_offset = MAX_SEARCH_LIMIT * 100;
+        if offset > max_offset {
+            return Err(IndexError::new("search offset exceeds maximum"));
+        }
+        let table = self
+            .connection()?
+            .open_table(TABLE)
+            .execute()
+            .await
+            .map_err(lance_error)?;
+
+        // Build SQL predicate from filters.
+        let predicate = build_predicate(&request.filters);
+
+        // Over-fetch by one to detect `has_more`.
+        let fetch = limit + offset + 1;
+
+        let mut query = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new(request.query.clone()))
+            .limit(fetch);
+        if let Some(ref predicate) = predicate {
+            query = query.only_if(predicate);
+        }
+        let batches = query
+            .execute()
+            .await
+            .map_err(lance_error)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(lance_error)?;
+
+        let mut hits = decode_search_hits(&batches)?;
+        // Apply tag filter in Rust (tags are not indexed in LanceDB SQL).
+        // Post-filtering means `total` and `has_more` are lower bounds, not
+        // exact counts, when tag filters are active — LanceDB may have more
+        // matching rows beyond the over-fetch window that also pass the tag
+        // filter. Without tag filters the counts are exact.
+        if !request.filters.tags.is_empty() {
+            hits.retain(|hit| {
+                request
+                    .filters
+                    .tags
+                    .iter()
+                    .all(|tag| hit.tags.iter().any(|t| t == tag))
+            });
+        }
+        let filtered_total = hits.len();
+        let has_more = filtered_total > limit + offset;
+        let page: Vec<SearchHit> = hits
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|mut hit| {
+                // Normalise: combined_rank equals fts_score when no vector channel.
+                hit.combined_rank = hit.fts_score.unwrap_or(0.0);
+                hit
+            })
+            .collect();
+        Ok(SearchResult {
+            hits: page,
+            total: filtered_total,
+            limit,
+            offset,
+            has_more,
+            mode: SearchMode::Fts,
+            degraded: true,
+            revision: request.revision.clone(),
+        })
+    }
+
     /// Bring the projection to the current canonical revision. Interrupted or
     /// corrupt derived state is rebuilt automatically from Git.
     ///
@@ -504,6 +741,7 @@ fn schema() -> SchemaRef {
         Field::new("content", DataType::Utf8, true),
         Field::new("archived", DataType::Boolean, false),
         Field::new("freshness", DataType::Utf8, true),
+        Field::new("tags", DataType::Utf8, true),
         Field::new("record_json", DataType::Utf8, false),
     ]))
 }
@@ -515,20 +753,22 @@ struct ProjectionRow<'a> {
     content: Option<&'a str>,
     archived: bool,
     freshness: Option<String>,
+    tags: Option<String>,
     record_json: String,
 }
 
 impl<'a> ProjectionRow<'a> {
     fn from_record(id: &RecordId, record: &'a StoredRecord) -> Result<Self, IndexError> {
-        let (kind, title, content, archived, freshness) = match record {
+        let (kind, title, content, archived, freshness, tags) = match record {
             StoredRecord::Plaintext { envelope } => (
                 Some(envelope.kind.as_str()),
                 envelope.title.as_deref(),
                 Some(envelope.content.as_str()),
                 envelope.archive.archived,
                 Some(format!("{:?}", envelope.freshness.state).to_ascii_lowercase()),
+                Some(encode_tags(&envelope.tags)),
             ),
-            StoredRecord::Encrypted { .. } => (None, None, None, false, None),
+            StoredRecord::Encrypted { .. } => (None, None, None, false, None, None),
         };
         Ok(Self {
             id: id.display_value(),
@@ -537,6 +777,7 @@ impl<'a> ProjectionRow<'a> {
             content,
             archived,
             freshness,
+            tags,
             record_json: serde_json::to_string(record)
                 .map_err(|error| IndexError::new(format!("serialize projected record: {error}")))?,
         })
@@ -573,6 +814,11 @@ fn batch(records: &[(RecordId, StoredRecord)], _: &Revision) -> Result<RecordBat
                     .map(|row| row.freshness.as_deref())
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.tags.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|row| &row.record_json),
             )),
@@ -600,6 +846,9 @@ fn decode_batches(batches: &[RecordBatch]) -> Result<Vec<ProjectedRecord>, Index
         let titles = strings("title")?;
         let contents = strings("content")?;
         let freshness = strings("freshness")?;
+        let tags_col = batch
+            .column_by_name("tags")
+            .and_then(|value| value.as_any().downcast_ref::<StringArray>());
         let archived = batch
             .column_by_name("archived")
             .and_then(|value| value.as_any().downcast_ref::<BooleanArray>())
@@ -607,6 +856,9 @@ fn decode_batches(batches: &[RecordBatch]) -> Result<Vec<ProjectedRecord>, Index
         for row in 0..batch.num_rows() {
             let optional =
                 |array: &StringArray| (!array.is_null(row)).then(|| array.value(row).to_owned());
+            let tags = tags_col
+                .and_then(|array| (!array.is_null(row)).then(|| decode_tags(array.value(row))))
+                .unwrap_or_default();
             rows.push(ProjectedRecord {
                 id: ids.value(row).to_owned(),
                 kind: optional(kinds),
@@ -614,11 +866,75 @@ fn decode_batches(batches: &[RecordBatch]) -> Result<Vec<ProjectedRecord>, Index
                 content: optional(contents),
                 archived: archived.value(row),
                 freshness: optional(freshness),
+                tags,
             });
         }
     }
     rows.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(rows)
+}
+
+fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexError> {
+    let mut hits = Vec::new();
+    for batch in batches {
+        let strings = |name: &str| -> Result<&StringArray, IndexError> {
+            batch
+                .column_by_name(name)
+                .and_then(|value| value.as_any().downcast_ref())
+                .ok_or_else(|| IndexError::new(format!("search column `{name}` is corrupt")))
+        };
+        let ids = strings("id")?;
+        let kinds = strings("kind")?;
+        let titles = strings("title")?;
+        let contents = strings("content")?;
+        let freshness = strings("freshness")?;
+        let tags_col = batch
+            .column_by_name("tags")
+            .and_then(|value| value.as_any().downcast_ref::<StringArray>());
+        let archived = batch
+            .column_by_name("archived")
+            .and_then(|value| value.as_any().downcast_ref::<BooleanArray>())
+            .ok_or_else(|| IndexError::new("search column `archived` is corrupt"))?;
+        // LanceDB adds `_distance` for FTS results (Float32, negative BM25).
+        let distance = batch
+            .column_by_name("_distance")
+            .and_then(|value| value.as_any().downcast_ref::<Float32Array>());
+        for row in 0..batch.num_rows() {
+            let optional =
+                |array: &StringArray| (!array.is_null(row)).then(|| array.value(row).to_owned());
+            let tags = tags_col
+                .and_then(|array| (!array.is_null(row)).then(|| decode_tags(array.value(row))))
+                .unwrap_or_default();
+            let fts_score = distance.and_then(|array| {
+                (!array.is_null(row)).then(|| {
+                    // LanceDB stores BM25 as negative _distance; negate for rank.
+                    f64::from(-array.value(row))
+                })
+            });
+            hits.push(SearchHit {
+                id: ids.value(row).to_owned(),
+                kind: optional(kinds),
+                title: optional(titles),
+                content: optional(contents),
+                archived: archived.value(row),
+                freshness: optional(freshness),
+                tags,
+                fts_score,
+                vector_score: None,
+                combined_rank: 0.0,
+            });
+        }
+    }
+    // Sort by combined rank descending (highest score first), then by id for determinism.
+    hits.sort_by(|left, right| {
+        let left_score = left.fts_score.unwrap_or(0.0);
+        let right_score = right.fts_score.unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(hits)
 }
 
 fn lock_at(root: &Path, exclusive: bool) -> Result<File, IndexError> {
@@ -638,6 +954,153 @@ fn lock_at(root: &Path, exclusive: bool) -> Result<File, IndexError> {
 
 fn sql_escape(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// Encode tags into a delimited string for column storage.
+/// Tags are joined with `TAGS_DELIMITER` (newline). Tags containing the
+/// delimiter are sanitized by replacing it with a space, because the envelope
+/// validator does not forbid newlines in tag strings.
+fn encode_tags(tags: &[String]) -> String {
+    let mut encoded = String::new();
+    for tag in tags {
+        encoded.push(TAGS_DELIMITER);
+        encoded.push_str(&tag.replace(TAGS_DELIMITER, " "));
+    }
+    if !encoded.is_empty() {
+        encoded.push(TAGS_DELIMITER);
+    }
+    encoded
+}
+
+fn decode_tags(encoded: &str) -> Vec<String> {
+    encoded
+        .split(TAGS_DELIMITER)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn build_predicate(filters: &SearchFilters) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ref kind) = filters.kind {
+        parts.push(format!("kind = '{}'", sql_escape(kind)));
+    }
+    if let Some(archived) = filters.archived {
+        parts.push(format!("archived = {archived}"));
+    }
+    if !filters.freshness.is_empty() {
+        // Only allow known freshness states to prevent SQL injection through
+        // arbitrary string values from non-MCP callers.
+        const VALID_FRESHNESS: &[&str] = &["unverified", "fresh", "stale", "invalid"];
+        let values = filters
+            .freshness
+            .iter()
+            .filter(|f| VALID_FRESHNESS.contains(&f.as_str()))
+            .map(|f| format!("'{}'", sql_escape(f)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !values.is_empty() {
+            parts.push(format!("freshness IN ({values})"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
+    }
+}
+
+/// Compute backlinks from a canonical snapshot.
+///
+/// Scans every plaintext record for:
+/// - explicit `envelope.links` entries whose `key` matches `target_key`
+/// - body-mention: `target_key` appears as a word-boundary substring of `envelope.content`
+///
+/// Encrypted records are opaque and never produce backlinks.
+///
+/// # Errors
+///
+/// Returns an error when the snapshot cannot be read.
+pub fn compute_backlinks(
+    snapshot: &Snapshot,
+    target_key: &str,
+) -> Result<Vec<BacklinkEntry>, IndexError> {
+    let records = snapshot.records().map_err(store_error)?;
+    let mut entries = Vec::new();
+    for (id, record) in &records {
+        let StoredRecord::Plaintext { envelope } = record else {
+            continue;
+        };
+        // Explicit links.
+        for link in &envelope.links {
+            if link.key == target_key {
+                entries.push(BacklinkEntry {
+                    source_id: id.display_value(),
+                    source_kind: Some(envelope.kind.clone()),
+                    source_title: envelope.title.clone(),
+                    relation: link.relation.clone(),
+                    mention_type: MentionType::ExplicitLink,
+                });
+            }
+        }
+        // Body mentions.
+        if contains_key_mention(&envelope.content, target_key) {
+            entries.push(BacklinkEntry {
+                source_id: id.display_value(),
+                source_kind: Some(envelope.kind.clone()),
+                source_title: envelope.title.clone(),
+                relation: None,
+                mention_type: MentionType::BodyMention,
+            });
+        }
+    }
+    // Sort first so duplicates from the same source are adjacent.
+    entries.sort_by(|left, right| {
+        left.source_id
+            .cmp(&right.source_id)
+            .then_with(|| left.mention_type.cmp(&right.mention_type))
+    });
+    // Deduplicate: when the same source has both explicit link and body mention,
+    // drop the body mention (explicit link is more informative).
+    // ExplicitLink sorts before BodyMention (derived from enum order), so the
+    // first element of a consecutive pair is the explicit link — keep it.
+    entries.dedup_by(|left, right| left.source_id == right.source_id);
+    Ok(entries)
+}
+
+/// Check whether `content` contains `key` as a word-boundary mention.
+/// Word boundaries are non-alphanumeric characters (or string start/end).
+///
+/// Note: word-boundary checks use `u8::is_ascii_alphanumeric` on byte
+/// offsets. This means multi-byte UTF-8 continuation bytes are always treated
+/// as word boundaries, which is correct for keys consisting of ASCII
+/// characters (the common case for record keys). Keys containing non-ASCII
+/// characters may produce false-positive matches at byte boundaries that fall
+/// inside a multi-byte sequence.
+fn contains_key_mention(content: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = content[start..].find(key) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0
+            || !content
+                .as_bytes()
+                .get(abs_pos - 1)
+                .is_some_and(u8::is_ascii_alphanumeric);
+        let after_pos = abs_pos + key.len();
+        let after_ok = after_pos >= content.len()
+            || !content
+                .as_bytes()
+                .get(after_pos)
+                .is_some_and(u8::is_ascii_alphanumeric);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
 }
 fn lance_error(error: impl fmt::Display) -> IndexError {
     IndexError::new(format!("LanceDB projection operation failed: {error}"))

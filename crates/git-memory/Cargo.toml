@@ -14,13 +14,19 @@ name = "git-memory"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 clap.workspace = true
+dirs.workspace = true
+git-memory-embed = { path = "../git-memory-embed" }
 git-memory-mcp = { path = "../git-memory-mcp" }
 git-memory-index = { path = "../git-memory-index" }
 git-memory-reconcile = { path = "../git-memory-reconcile" }
 git-memory-store = { path = "../git-memory-store" }
+indicatif.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 git-memory-contract = { path = "../git-memory-contract" }
