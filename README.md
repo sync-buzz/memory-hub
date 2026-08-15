@@ -86,6 +86,17 @@ and `memory_reindex` synchronize it to the canonical Git Memory revision.
 Interrupted or corrupt projections rebuild exclusively from an immutable Git
 snapshot; readers refuse lagging generations.
 
+Search is hybrid: BM25 full-text search on title/content/kind is the primary
+channel. When BM25 finds fewer than 5 hits and an embedding model is attached,
+a vector kNN rescue channel fires. Hits below a 0.35 cosine similarity floor are
+discarded and the two channels are fused via Reciprocal Rank Fusion. The result
+reports `mode: "hybrid"` when the vector channel contributed, `"fts"` otherwise,
+and `degraded: true` only when no embedding model is available. The embedding
+runtime (model registry, download, llama.cpp backend, fingerprint) lives in
+`git-memory-embed`; a model fingerprint ties vectors to a specific model file
+and runtime, so a model swap forces a clean rebuild rather than silently mixing
+incompatible vectors.
+
 ## MCP interface
 
 Start the only public machine interface with an explicit repository:
@@ -145,28 +156,27 @@ semantic keys, titles, kinds, tags, and links are all inside the encrypted
 manifest or encrypted record blobs. Only unavoidable Git metadata (refs,
 object counts, timestamps, commit graph) remains visible.
 
-### Key operations
+### Ephemeral index
+
+For encrypted projects, the LanceDB index contains plaintext derived from
+decrypted records. To avoid persisting plaintext on disk, the index is
+**ephemeral**: it is rebuilt from decrypted records on `memory_unlock` and
+destroyed on `memory_lock`. If the MCP process crashes before `memory_lock`
+runs, the next session start wipes the stale index directory before serving any
+request — no plaintext survives a crash/restart cycle.
+
+### Key operations (via MCP)
+
+Encryption is managed through MCP tools, not CLI subcommands:
 
 ```
-# Owner: enable encryption
-git memory encryption init
-  → detects ~/.ssh/id_ed25519, generates backup key
-
-# Add a team member by GitHub username
-git memory encryption add --github-user bob
-  → fetches Bob's SSH key from GitHub API, re-encrypts all records
-
-# Remove a team member (rotation)
-git memory encryption remove --github-user bob
-  → re-encrypts without Bob's key; Bob can't read new data
-
-# Daily usage
-git memory unlock    # load SSH identity
-git memory lock      # drop identity from memory
-
-# Recovery
-git memory log       # view commit history
-git memory reset --to <commit>   # rollback to a point
+memory_init_encrypted   → initialize encrypted store with first recipient
+memory_unlock           → decrypt with SSH identity, rebuild ephemeral index
+memory_lock             → drop identity, destroy ephemeral index
+memory_add_recipient    → add team member, re-encrypt all records
+memory_remove_recipient → remove member, re-encrypt, rebuild index
+memory_list_recipients  → show recipients in the manifest
+memory_encryption_status → check current lock state
 ```
 
 See the [encryption architecture document](.sync/docs/encryption-architecture.md)
@@ -181,11 +191,45 @@ git memory doctor --project /path/to/repository
 git memory doctor --project /path/to/repository --output json
 git memory reconcile --project /path/to/repository --output json
 git memory reconcile --project /path/to/repository --full-rebuild
+git memory reconcile --project /path/to/repository --embed
 ```
 
 `doctor` accepts an empty Git repository; a commit is not required. JSON output
 is versioned with `schema_version` and reports failures using stable `kind`
-values.
+values. `reconcile --embed` rebuilds the index with embedding vectors when a
+model is downloaded; without `--embed` the index is FTS-only.
+
+## Model management
+
+```sh
+git memory model list                     # show registry, on-disk status, active model
+git memory model show bge-m3              # metadata, dimensions, backend
+git memory model download bge-m3          # download GGUF with SHA-256 verification
+git memory model use bge-m3               # set active model in config
+git memory model benchmark bge-m3         # measure throughput, warn if below floor
+```
+
+Platform-aware defaults: Apple Silicon uses Metal + BGE-M3; Intel/Linux/Windows
+uses CPU + nomic-embed-text-v1.5. `git memory doctor` reports missing or broken
+models and suggests `model download`.
+
+## Remote exchange
+
+Memory has its own remote, separate from the code `origin`. Ordinary
+`git clone`/`git push` never publish `refs/memory/*`; `git memory push` is an
+explicit action that applies the effective push policy first.
+
+```sh
+git memory remote add origin <url>        # configure memory remote
+git memory remote list                    # show configured remotes
+git memory fetch --project /path/to/repo  # pull and merge memory refs
+git memory push --project /path/to/repo   # publish memory refs (use --force to overwrite)
+git memory remote status --project /path  # check sync state
+```
+
+Merge is record-level: different keys merge automatically; the same key changed
+by both sides returns both versions as a conflict. Encrypted merge decrypts,
+merges, and re-encrypts in one step (requires `memory_unlock` first).
 
 ## Exit codes
 

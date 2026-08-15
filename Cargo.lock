@@ -2657,10 +2657,13 @@ dependencies = [
 name = "git-memory"
 version = "0.1.0"
 dependencies = [
+ "age",
  "anyhow",
  "clap",
  "dirs 5.0.1",
  "git-memory-contract",
+ "git-memory-core",
+ "git-memory-crypto",
  "git-memory-embed",
  "git-memory-index",
  "git-memory-mcp",
@@ -2746,6 +2749,7 @@ dependencies = [
  "fs2",
  "futures",
  "git-memory-core",
+ "git-memory-embed",
  "git-memory-store",
  "git2",
  "lancedb",
@@ -2760,6 +2764,8 @@ name = "git-memory-mcp"
 version = "0.1.0"
 dependencies = [
  "git-memory-core",
+ "git-memory-crypto",
+ "git-memory-embed",
  "git-memory-index",
  "git-memory-reconcile",
  "git-memory-store",

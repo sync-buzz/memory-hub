@@ -7,11 +7,18 @@
 mod encrypted;
 mod error;
 mod store;
+mod transport;
 mod types;
 
-pub use encrypted::{EncryptedStore, InitResult, RecipientEntry};
+pub use encrypted::{EncryptedStore, InitResult, RecipientEntry, is_encrypted_project};
 pub use error::{StoreError, StoreErrorKind};
 pub use store::{CommitSigner, GitStore};
+pub use transport::{
+    can_fast_forward, check_push_policy, cleanup_temp_ref_pub, fetch_and_merge,
+    fetch_remote_revision, fast_forward_to, push_to_remote, read_remote_config,
+    remove_remote_config, write_remote_config, ConflictEntry, FetchResult, MemoryRemote,
+    PushPolicyResult,
+};
 pub use types::{
     ApplyResult, ChangeKind, Checkpoint, ExportBundle, Operation, RecordChange, RecordId, Revision,
     Snapshot, Transaction,

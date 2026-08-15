@@ -578,6 +578,78 @@ impl GitStore {
         Ok(records)
     }
 
+    /// Public read path for all records in a snapshot. Used by the transport
+    /// merge module.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the repository or record blobs are corrupt.
+    pub fn read_records_pub(
+        &self,
+        revision: &Revision,
+    ) -> Result<Vec<(RecordId, StoredRecord)>, StoreError> {
+        self.read_records(revision)
+    }
+
+    /// Read a single record from a revision without requiring it to be in
+    /// the local staged history. Used by the transport merge module.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the repository or record blob is corrupt.
+    pub fn read_record_unchecked(
+        &self,
+        revision: &Revision,
+        id: &RecordId,
+    ) -> Result<Option<StoredRecord>, StoreError> {
+        let repository = self.repository()?;
+        let oid = revision.oid()?;
+        let commit = repository
+            .find_commit(oid)
+            .map_err(|error| StoreError::repository("find commit for unchecked read", error))?;
+        let tree = commit
+            .tree()
+            .map_err(|error| StoreError::repository("find tree for unchecked read", error))?;
+        let Some(entry) = tree.get_name(&id.tree_name()) else {
+            return Ok(None);
+        };
+        let record = decode_record(&repository, entry.id())?;
+        verify_record_location(id, &record, entry.name().ok())?;
+        Ok(Some(record))
+    }
+
+    /// Read all records from a revision without requiring it to be in the
+    /// local staged history. Used by the transport merge module to read
+    /// records from a fetched remote revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the repository or record blobs are corrupt.
+    pub fn read_records_unchecked(
+        &self,
+        revision: &Revision,
+    ) -> Result<Vec<(RecordId, StoredRecord)>, StoreError> {
+        let repository = self.repository()?;
+        let oid = revision.oid()?;
+        let commit = repository
+            .find_commit(oid)
+            .map_err(|error| StoreError::repository("find commit for unchecked read", error))?;
+        let tree = commit
+            .tree()
+            .map_err(|error| StoreError::repository("find tree for unchecked read", error))?;
+        let mut records = Vec::new();
+        for entry in &tree {
+            if entry.name().ok().is_some_and(|name| name.starts_with("r-")) {
+                let record = decode_record(&repository, entry.id())?;
+                let id = RecordId::from_record(&record);
+                verify_record_location(&id, &record, entry.name().ok())?;
+                records.push((id, record));
+            }
+        }
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(records)
+    }
+
     /// Check whether the snapshot contains at least one encrypted record.
     ///
     /// Stops at the first encrypted record — cheaper than [`Self::read_records`]

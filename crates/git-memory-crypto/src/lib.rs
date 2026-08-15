@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use age::{Decryptor, Encryptor};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use sha2::{Digest, Sha256};
 
 /// Cipher suite identifier stored in `EncryptedRecord`.
@@ -285,6 +285,74 @@ impl SshSigner {
             ));
         }
         Ok(signature)
+    }
+}
+
+/// Verify an SSH signature against a public key string using `ssh-keygen -Y
+/// verify -n git`.
+///
+/// `signature` must be the armored `-----BEGIN SSH SIGNATURE-----` block as
+/// stored in Git's `gpgsig` header. `public_key` must be a single-line
+/// OpenSSH public key (`ssh-ed25519 AAAA... user@host`).
+///
+/// The allowed signers file is written with identity `memory-recipient`
+/// prepended, as required by `ssh-keygen -Y verify -I`.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] if `ssh-keygen` is unavailable, fails, or the
+/// signature does not match.
+pub fn verify_ssh_signature(
+    data: &[u8],
+    signature: &str,
+    public_key: &str,
+) -> Result<(), CryptoError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let temp = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .map_err(|e| CryptoError::Io(e.to_string()))?;
+    let data_path = temp.path().join("commit-data");
+    let sig_path = temp.path().join("commit-data.sig");
+    let allowed = temp.path().join("allowed");
+
+    {
+        let mut file = std::fs::File::create(&data_path)
+            .map_err(|e| CryptoError::Io(format!("create temp file: {e}")))?;
+        file.write_all(data)
+            .map_err(|e| CryptoError::Io(format!("write temp file: {e}")))?;
+    }
+    std::fs::write(&sig_path, signature.trim())
+        .map_err(|e| CryptoError::Io(format!("write signature file: {e}")))?;
+    // Allowed signers format: <identity> <key-type> <base64-key> [<comment>]
+    // ssh-keygen -Y verify -I looks up the identity in this file.
+    std::fs::write(&allowed, format!("memory-recipient {public_key}\n"))
+        .map_err(|e| CryptoError::Io(format!("write allowed signers: {e}")))?;
+
+    let output = Command::new("ssh-keygen")
+        .args(["-Y", "verify", "-n", "git"])
+        .args(["-f", &data_path.to_string_lossy()])
+        .args(["-I", "memory-recipient"])
+        .args(["-s", &sig_path.to_string_lossy()])
+        .arg("-O")
+        .arg(format!(
+            "allowed_signers_file={}",
+            allowed.to_string_lossy()
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| CryptoError::Key(format!("spawn ssh-keygen verify: {e}")))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(CryptoError::Key(format!(
+            "signature verification failed: {stderr}"
+        )))
     }
 }
 

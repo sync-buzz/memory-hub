@@ -7,6 +7,9 @@ pub(crate) enum Code {
     Success = 0,
     Usage = 2,
     DoctorFailed = 10,
+    TransportFailed = 12,
+    NonFastForward = 13,
+    AuthFailed = 14,
     Internal = 70,
 }
 
@@ -25,6 +28,9 @@ mod tests {
         assert_eq!(Code::Success as u8, 0);
         assert_eq!(Code::Usage as u8, 2);
         assert_eq!(Code::DoctorFailed as u8, 10);
+        assert_eq!(Code::TransportFailed as u8, 12);
+        assert_eq!(Code::NonFastForward as u8, 13);
+        assert_eq!(Code::AuthFailed as u8, 14);
         assert_eq!(Code::Internal as u8, 70);
     }
 }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use git_memory_reconcile::{DivergenceMode, ReconcileErrorKind, Reconciler};
-use git_memory_store::GitStore;
+use git_memory_store::{read_remote_config, GitStore};
 use serde::Serialize;
 
 use crate::model;
@@ -69,6 +69,7 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
         checks.push(repository_check(&requested_project));
         checks.push(reconciliation_check(&requested_project));
         checks.push(encryption_check(&requested_project));
+        checks.push(remote_privacy_check(&requested_project));
     } else {
         checks.push(Check::error(
             "git.repository",
@@ -84,6 +85,11 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
             "memory.encryption",
             "encryption_check_skipped",
             "encryption check was skipped because a prerequisite failed",
+        ));
+        checks.push(Check::error(
+            "memory.remote_privacy",
+            "remote_privacy_check_skipped",
+            "remote privacy check was skipped because a prerequisite failed",
         ));
     }
 
@@ -188,6 +194,58 @@ fn encryption_check(project: &Path) -> Check {
             None,
         )
     }
+}
+
+fn remote_privacy_check(project: &Path) -> Check {
+    let git_dir = match GitStore::discover_git_dir(project) {
+        Ok(dir) => dir,
+        Err(error) => {
+            return Check::ok_with_kind(
+                "memory.remote_privacy",
+                "git_dir_unavailable",
+                format!("remote privacy check skipped: {error}"),
+                None,
+            );
+        }
+    };
+    let remote = match read_remote_config(&git_dir) {
+        Ok(Some(remote)) => remote,
+        Ok(None) => {
+            return Check::ok_with_kind(
+                "memory.remote_privacy",
+                "no_remote_configured",
+                "no memory remote configured — refs/memory/* are local-only. \
+                 Note: `git push --mirror` or `git push --all` will NOT publish \
+                 memory refs unless an explicit refspec is used."
+                    .to_string(),
+                None,
+            );
+        }
+        Err(error) => {
+            return Check::ok_with_kind(
+                "memory.remote_privacy",
+                "config_unavailable",
+                format!("remote privacy check skipped: {error}"),
+                None,
+            );
+        }
+    };
+
+    Check::ok_with_kind(
+        "memory.remote_privacy",
+        "remote_configured",
+        format!(
+            "memory remote is configured: {}. \
+             Caveats: (1) `git push --mirror` will publish refs/memory/* to \
+             every remote — avoid it or exclude memory refs. (2) GitHub does \
+             not protect custom refs (refs/memory/*); cryptographic integrity \
+             via SSH commit signing is the only protection. (3) Recipient \
+             rotation re-encrypts future snapshots only — former recipients \
+             can still read old Git history and any downloaded plaintext.",
+            remote.url
+        ),
+        None,
+    )
 }
 
 fn model_check() -> Check {
@@ -395,7 +453,7 @@ pub(crate) fn render_json(report: &Report) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SCHEMA_VERSION, Status, command_failure, inspect, normalized_output};
+    use super::{command_failure, inspect, normalized_output, Status, SCHEMA_VERSION};
 
     #[test]
     fn trims_command_output() {

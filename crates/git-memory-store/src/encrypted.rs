@@ -14,6 +14,40 @@ use crate::{
     ApplyResult, CommitSigner, GitStore, Operation, RecordId, Revision, StoreError, Transaction,
 };
 
+/// Check whether a Git repository is an encrypted Memory project.
+///
+/// A project is encrypted when a manifest blob (at the deterministic
+/// `manifest_storage_id`) exists in the current staged snapshot. Plaintext
+/// projects never produce this blob.
+///
+/// This is a read-only check: it does not create `refs/memory/staged` if it
+/// does not exist, so it is safe to call before `initialize`.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if the repository cannot be opened.
+pub fn is_encrypted_project(project: impl AsRef<std::path::Path>) -> Result<bool, StoreError> {
+    let project = project.as_ref();
+    if !project.is_absolute() {
+        return Err(StoreError::new(
+            crate::StoreErrorKind::InvalidArgument,
+            "project must be an absolute repository root or Git directory",
+            serde_json::json!({"field": "project"}),
+        ));
+    }
+    let git_dir = GitStore::discover_git_dir(project)?;
+    let repository = git2::Repository::open(&git_dir)
+        .map_err(|error| StoreError::repository("open for encrypted detection", error))?;
+    // Read the staged ref without creating it.
+    let revision = match repository.refname_to_id("refs/memory/staged") {
+        Ok(oid) => Revision::from_oid(oid),
+        Err(_) => return Ok(false),
+    };
+    let id = RecordId::opaque(manifest_storage_id());
+    let store = GitStore::from_git_dir(git_dir);
+    Ok(store.read_record_pub(&revision, &id)?.is_some())
+}
+
 /// Deterministic storage id for the encrypted manifest blob.
 #[allow(clippy::expect_used)]
 fn manifest_storage_id() -> OpaqueStorageId {
@@ -132,6 +166,12 @@ impl EncryptedStore {
     pub fn with_signer(mut self, signer: std::sync::Arc<dyn CommitSigner>) -> Self {
         self.store = self.store.with_signer(signer);
         self
+    }
+
+    /// Return the git directory path (for config/transport operations).
+    #[must_use]
+    pub fn git_dir(&self) -> &std::path::Path {
+        self.store.git_dir()
     }
 
     /// Check whether a manifest already exists in the current snapshot.
@@ -474,6 +514,187 @@ impl EncryptedStore {
         Ok(manifest.recipients)
     }
 
+    /// Fetch from the configured memory remote and perform an encrypted
+    /// record-level merge.
+    ///
+    /// Decrypts both local and remote records, merges at the envelope level
+    /// (different keys auto-merge, same-key conflicts returned), re-encrypts
+    /// to the union of both recipients lists, and writes the merged
+    /// transaction.
+    ///
+    /// When the remote is a fast-forward, the staged ref is updated directly
+    /// without re-encryption.
+    ///
+    /// SSH signature verification is automatic: the local manifest's
+    /// recipients' public keys are used as the allowed signers list. If
+    /// `allowed_signers` is non-empty, it is merged with the manifest
+    /// recipients (caller-supplied override for first-fetch before manifest
+    /// exists).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for transport failures, signature issues, or
+    /// encryption errors.
+    #[allow(clippy::too_many_lines)]
+    pub fn fetch_and_merge(
+        &self,
+        remote: &crate::MemoryRemote,
+        allowed_signers: &[String],
+    ) -> Result<crate::FetchResult, StoreError> {
+        let identity = self.require_unlocked()?;
+
+        // Build the effective signers list: caller-supplied keys + manifest
+        // recipients' public keys (for SSH-type keys only — x25519 backup
+        // keys can't sign Git commits).
+        let local_revision_for_signers = self.current_revision()?;
+        let mut signers: Vec<String> = allowed_signers.to_vec();
+        if let Ok(manifest) = self.read_manifest(identity, &local_revision_for_signers) {
+            for entry in &manifest.recipients {
+                if entry.key_type == "ssh" && !signers.contains(&entry.public_key) {
+                    signers.push(entry.public_key.clone());
+                }
+            }
+        }
+
+        // Step 1: Fetch remote to temp ref and get revisions.
+        let (local_revision, remote_revision) =
+            crate::fetch_remote_revision(&self.store, remote, &signers)?;
+
+        // Step 2: Check if fast-forward is possible.
+        if crate::can_fast_forward(&self.store, &local_revision, &remote_revision)? {
+            crate::fast_forward_to(self.store.git_dir(), &remote_revision)?;
+            crate::cleanup_temp_ref_pub(self.store.git_dir())?;
+            return Ok(crate::FetchResult {
+                local_revision_before: local_revision.clone(),
+                local_revision_after: remote_revision.clone(),
+                remote_revision,
+                fast_forward: true,
+                merged: false,
+                conflicts: Vec::new(),
+            });
+        }
+
+        // Step 3: Read both manifests (decrypting).
+        let mut local_manifest = self.read_manifest(identity, &local_revision)?;
+        let remote_manifest = self.read_manifest_unchecked(identity, &remote_revision)?;
+
+        // Step 4: Take union of recipients.
+        let union_recipients = union_recipient_lists(&local_manifest.recipients, &remote_manifest.recipients);
+        local_manifest.recipients = union_recipients;
+        let parsed_recipients = parse_recipients(&local_manifest.recipients)?;
+
+        // Step 5: Merge records at the envelope level.
+        let mut conflicts = Vec::new();
+        let mut puts: Vec<(&str, Envelope)> = Vec::new();
+
+        for (key, remote_entry) in &remote_manifest.records {
+            if let Some(local_entry) = local_manifest.records.get(key) {
+                // Same key — check if content differs.
+                if local_entry.content_hash != remote_entry.content_hash {
+                    // Conflict: same key, different content.
+                    conflicts.push(crate::ConflictEntry {
+                        key: key.clone(),
+                        local_content_hash: local_entry.content_hash.clone(),
+                        remote_content_hash: remote_entry.content_hash.clone(),
+                    });
+                }
+            } else {
+                // Key only in remote — decrypt and add to local.
+                let storage_id = parse_storage_id(&remote_entry.storage_id)?;
+                let id = RecordId::opaque(storage_id);
+                let Some(stored) = self.store.read_record_unchecked(&remote_revision, &id)?
+                else {
+                    continue;
+                };
+                let ciphertext_b64 = match stored {
+                    StoredRecord::Encrypted { encrypted } => encrypted.ciphertext.clone(),
+                    StoredRecord::Plaintext { .. } => continue,
+                };
+                let content = decrypt_b64(&ciphertext_b64, std::slice::from_ref(identity))
+                    .map_err(crypto_to_store_error)?;
+                let envelope = reconstruct_envelope(key, remote_entry, content)?;
+                puts.push((key.as_str(), envelope));
+            }
+        }
+
+        if !conflicts.is_empty() {
+            crate::cleanup_temp_ref_pub(self.store.git_dir())?;
+            return Ok(crate::FetchResult {
+                local_revision_before: local_revision.clone(),
+                local_revision_after: local_revision,
+                remote_revision,
+                fast_forward: false,
+                merged: false,
+                conflicts,
+            });
+        }
+
+        // Step 6: Apply merged puts and re-encrypt ALL records to the union
+        // recipients. We first persist the union recipients to the manifest
+        // via a manifest-only transaction, then apply the new puts, then
+        // run reencrypt_all to re-encrypt existing records.
+        if !puts.is_empty() {
+            // First, write the union manifest (recipients only, no record changes).
+            // This ensures subsequent apply() calls use the union recipients.
+            self.store.apply(&Transaction {
+                id: format!("merge-recipients-{}", random_suffix()),
+                expected_revision: local_revision.clone(),
+                operations: vec![Operation::Put {
+                    record: StoredRecord::Encrypted {
+                        encrypted: Self::encrypt_manifest(&local_manifest, &parsed_recipients)?,
+                    },
+                }],
+            })?;
+        }
+
+        // Now get the updated revision after manifest write (or original if no puts).
+        let manifest_revision = if puts.is_empty() {
+            local_revision.clone()
+        } else {
+            self.current_revision()?
+        };
+
+        // Re-encrypt existing records to the union recipients.
+        self.reencrypt_all(
+            &mut local_manifest,
+            identity,
+            &parsed_recipients,
+            &manifest_revision,
+        )?;
+
+        // If we have new puts from the remote, apply them now (after
+        // reencrypt_all, so they're encrypted to the union recipients).
+        if !puts.is_empty() {
+            let after_reencrypt = self.current_revision()?;
+            let puts_owned: Vec<(String, Envelope)> = puts
+                .iter()
+                .map(|(k, e)| ((*k).to_owned(), e.clone()))
+                .collect();
+            let puts_refs: Vec<(&str, Envelope)> = puts_owned
+                .iter()
+                .map(|(k, e)| (k.as_str(), e.clone()))
+                .collect();
+            self.apply(
+                &format!("merge-puts-{}", random_suffix()),
+                after_reencrypt,
+                &puts_refs,
+                &[],
+            )?;
+        }
+
+        let after_revision = self.current_revision()?;
+        crate::cleanup_temp_ref_pub(self.store.git_dir())?;
+
+        Ok(crate::FetchResult {
+            local_revision_before: local_revision,
+            local_revision_after: after_revision,
+            remote_revision,
+            fast_forward: false,
+            merged: true,
+            conflicts: Vec::new(),
+        })
+    }
+
     fn require_unlocked(&self) -> Result<&Identity, StoreError> {
         match &self.state {
             LockState::Unlocked { identity } => Ok(identity),
@@ -490,8 +711,32 @@ impl EncryptedStore {
         identity: &Identity,
         revision: &Revision,
     ) -> Result<Manifest, StoreError> {
+        self.read_manifest_inner(identity, revision, false)
+    }
+
+    /// Read manifest from a revision that may not be in the local staged
+    /// history (e.g. a fetched remote revision).
+    fn read_manifest_unchecked(
+        &self,
+        identity: &Identity,
+        revision: &Revision,
+    ) -> Result<Manifest, StoreError> {
+        self.read_manifest_inner(identity, revision, true)
+    }
+
+    fn read_manifest_inner(
+        &self,
+        identity: &Identity,
+        revision: &Revision,
+        unchecked: bool,
+    ) -> Result<Manifest, StoreError> {
         let id = RecordId::opaque(manifest_storage_id());
-        let Some(stored) = self.store.read_record_pub(revision, &id)? else {
+        let stored = if unchecked {
+            self.store.read_record_unchecked(revision, &id)?
+        } else {
+            self.store.read_record_pub(revision, &id)?
+        };
+        let Some(stored) = stored else {
             return Err(StoreError::new(
                 crate::StoreErrorKind::InvalidRecord,
                 "manifest not found in snapshot — run init first",
@@ -639,6 +884,23 @@ fn parse_storage_id(s: &str) -> Result<OpaqueStorageId, StoreError> {
     })
 }
 
+/// Take the union of two recipient lists, preserving order (local first, then
+/// remote-only). Deduplicates by `public_key`.
+fn union_recipient_lists(
+    local: &[RecipientEntry],
+    remote: &[RecipientEntry],
+) -> Vec<RecipientEntry> {
+    let mut result = local.to_vec();
+    let local_keys: std::collections::HashSet<&str> =
+        local.iter().map(|r| r.public_key.as_str()).collect();
+    for entry in remote {
+        if !local_keys.contains(entry.public_key.as_str()) {
+            result.push(entry.clone());
+        }
+    }
+    result
+}
+
 /// Extract ciphertext from a `StoredRecord`.
 fn extract_ciphertext(stored: &StoredRecord, key: &str) -> Result<String, StoreError> {
     match stored {
@@ -725,4 +987,51 @@ fn crypto_to_store_error(error: CryptoError) -> StoreError {
         "cryptographic operation failed",
         serde_json::json!({"detail": error.to_string()}),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{RecipientEntry, union_recipient_lists};
+
+    fn entry(key: &str, key_type: &str) -> RecipientEntry {
+        RecipientEntry {
+            public_key: key.to_owned(),
+            key_type: key_type.to_owned(),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn union_recipients_deduplicates_by_public_key() {
+        let local = vec![
+            entry("ssh-ed25519 AAAA alice", "ssh"),
+            entry("ssh-ed25519 BBBB bob", "ssh"),
+        ];
+        let remote = vec![
+            entry("ssh-ed25519 BBBB bob", "ssh"), // duplicate
+            entry("ssh-ed25519 CCCC carol", "ssh"),
+        ];
+        let union = union_recipient_lists(&local, &remote);
+        assert_eq!(union.len(), 3);
+        assert_eq!(union[0].public_key, "ssh-ed25519 AAAA alice");
+        assert_eq!(union[1].public_key, "ssh-ed25519 BBBB bob");
+        assert_eq!(union[2].public_key, "ssh-ed25519 CCCC carol");
+    }
+
+    #[test]
+    fn union_recipients_empty_local() {
+        let local = vec![];
+        let remote = vec![entry("ssh-ed25519 AAAA alice", "ssh")];
+        let union = union_recipient_lists(&local, &remote);
+        assert_eq!(union.len(), 1);
+    }
+
+    #[test]
+    fn union_recipients_empty_remote() {
+        let local = vec![entry("ssh-ed25519 AAAA alice", "ssh")];
+        let remote = vec![];
+        let union = union_recipient_lists(&local, &remote);
+        assert_eq!(union.len(), 1);
+    }
 }

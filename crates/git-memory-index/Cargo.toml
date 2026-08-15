@@ -15,6 +15,7 @@ arrow-schema.workspace = true
 fs2.workspace = true
 futures.workspace = true
 git-memory-core = { path = "../git-memory-core" }
+git-memory-embed = { path = "../git-memory-embed" }
 git-memory-store = { path = "../git-memory-store" }
 lancedb.workspace = true
 serde.workspace = true

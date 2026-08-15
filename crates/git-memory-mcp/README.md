@@ -39,11 +39,15 @@ All resource bodies are UTF-8 JSON with `mimeType: application/json`.
 | --- | --- |
 | `memory://project` | handshake fields above plus `gitDir` |
 | `memory://revision/current` | `{schemaVersion: 1, revision: string}` |
-| `memory://records/{key}` | `{schemaVersion: 1, revision: string, record: StoredRecord|null}` |
-| `memory://index/status` | `{schemaVersion: 1, available: true, state, canonicalRevision, targetRevision}` |
-| `memory://model/status` | `{schemaVersion: 1, available: bool, capability, plannedSpec}` |
+| `memory://records/{key}` | `{revision, record: StoredRecord\|null}` |
+| `memory://records/summary` | `{revision, total, by_kind, by_freshness, archived, live}` |
+| `memory://index/status` | `{schemaVersion, available, state, canonicalRevision, targetRevision, fingerprint}` |
+| `memory://model/status` | `{schemaVersion, available, model_id, dimensions, runtime_state, vector_search}` |
 | `memory://policy/effective` | `{schemaVersion: 1, policies: EffectivePolicy[]}` |
-| `memory://encryption/status` | `{schemaVersion: 1, mode, available, encryptedStoreAvailable, encryptedIndexAvailable}` |
+| `memory://encryption/status` | `{mode, available, encryptedStoreAvailable, encryptedIndexAvailable, ephemeralIndex}` |
+
+`memory://records/summary` returns aggregate counts (total, by_kind, by_freshness,
+archived/live) over the full live corpus without pagination — for dashboard use.
 
 Subscribe with MCP `resources/subscribe` to
 `memory://revision/current`. After a successful transaction/import the server
@@ -52,23 +56,67 @@ the client must reread the resource and treat its revision as authoritative.
 
 ## Tools
 
-`tools/list` is the canonical JSON Schema catalogue. The implemented v1 store
-surface is:
+`tools/list` is the canonical JSON Schema catalogue. The implemented surface
+spans store, read, search, transport, model, and encryption operations:
+
+### Store and history
 
 | Tool | Required input | Result |
 | --- | --- | --- |
 | `memory_apply_transaction` | `transaction_id`, `expected_revision`, non-empty `operations[]` | `{revision, changed_keys}` |
-| `memory_get_record` | `key`, `revision` | `{revision, record}` |
-| `memory_list_records` | optional `revision` | `{revision, records}` |
 | `memory_checkpoint` | `message` | `Checkpoint` |
 | `memory_history` | optional `limit` | `{checkpoints}` |
 | `memory_diff` | `from_revision`, `to_revision` | `{fromRevision, toRevision, changes}` |
 | `memory_export` | `revision` | `{revision, bundle}` |
 | `memory_import` | `transaction_id`, `expected_revision`, `bundle` | `{revision, changed_keys}` |
-| `memory_reconcile` | optional `divergence: report\|full_rebuild` | `ReconcileReport` |
-| `memory_reindex` | none | current durable projection status |
 | `memory_doctor` | none | repository/store health |
+| `memory_reindex` | none | current durable projection status |
+
+### Read and search
+
+| Tool | Required input | Result |
+| --- | --- | --- |
+| `memory_get_record` | `key`, `revision` | `{revision, record}` |
+| `memory_list_records` | none (all params optional) | `{revision, records, total, limit, offset, has_more, counts}` |
+| `memory_search` | `query` | `{hits, total, limit, offset, has_more, mode, degraded, revision}` |
+| `memory_backlinks` | `key` (optional `revision`) | `{entries}` |
+
+`memory_list_records` accepts `limit` (max 200), `offset`, `kind`, `tags` (AND),
+`archived`, `freshness`, `sort` (`key`/`kind`/`title`/`freshness`/`archived`),
+`sort_order` (`asc`/`desc`), and `metadata_only`. The response always includes
+`counts` (total, by_kind, by_freshness, archived/live) over the full filtered
+corpus — even on page 2 — so a UI can render facet tabs without a second call.
+
+`memory_search` runs BM25 full-text search across title/content/kind with the
+same filters as `memory_list_records`. When an embedding model is attached and
+BM25 returns fewer than 5 hits, a vector kNN rescue channel fires: hits below a
+0.35 cosine floor are discarded and the two channels are fused via Reciprocal
+Rank Fusion (`combined_rank = 1/(60+bm25_rank) + 1/(60+vec_rank)`). The result
+reports `mode` (`fts` or `hybrid`) and `degraded` (`true` only when no embedding
+model is available). Each hit carries `fts_score`, `vector_score`, and
+`combined_rank`; sort is by `combined_rank` descending.
+
+### Reconcile and transport
+
+| Tool | Required input | Result |
+| --- | --- | --- |
+| `memory_reconcile` | optional `divergence: report\|full_rebuild` | `ReconcileReport` |
+| `memory_transport_status` | none | remote config and sync status |
+| `memory_fetch` | none | fetch result and merged keys |
+| `memory_push` | optional `force` | push result |
+
+### Model and encryption
+
+| Tool | Required input | Result |
+| --- | --- | --- |
+| `memory_model_status` | none | embedding model status |
 | `memory_encryption_status` | none | current plaintext/encryption availability |
+| `memory_unlock` | `identity_path` | `{unlocked, revision, indexRebuilt}` |
+| `memory_lock` | none | `{locked, indexDestroyed}` |
+| `memory_init_encrypted` | `identity_path`, `recipient_public_key` | `{backup_identity}` |
+| `memory_list_recipients` | none | `{recipients}` |
+| `memory_add_recipient` | `public_key` | re-encryption result |
+| `memory_remove_recipient` | `public_key` | re-encryption + index rebuild result |
 
 A transaction operation is either `{"op":"put","record":StoredRecord}` or
 `{"op":"delete","key":"..."}` (opaque callers may supply `id` instead of
@@ -79,18 +127,12 @@ Initialization and every mutating tool reconcile code history first. Divergence
 returns `kind: diverged` until the client explicitly calls `memory_reconcile`
 with `divergence: full_rebuild`.
 
-The stable future-facing catalogue also declares search/backlinks, remote
-transport, and model operations. Until their owning roadmap
-specs land, calls fail explicitly with `kind: capability_unavailable`, the
-planned spec, and an upgrade recovery action; the server never pretends that a
-degraded implementation completed the operation.
-
 ## Errors
 
 Domain failures use an MCP tool result with `isError: true` and
 `structuredContent.error = {kind, message, data}`. Callers branch on `kind` and
 `data`, not stderr text. Examples include `invalid_argument`, `invalid_record`,
-`conflict`, `revision_not_found`, `transaction_reused`, and
-`capability_unavailable`. Protocol lifecycle, unknown method/resource/tool, and
-incompatible initialization failures use JSON-RPC errors with the same stable
-machine-readable `data.kind` convention.
+`conflict`, `revision_not_found`, `transaction_reused`, `locked`,
+`identity_load_failed`, `push_blocked`, and `capability_unavailable`. Protocol
+lifecycle, unknown method/resource/tool, and incompatible initialization failures
+use JSON-RPC errors with the same stable machine-readable `data.kind` convention.

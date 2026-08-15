@@ -22,6 +22,8 @@ const CONFIG_FILE: &str = "config.json";
 pub(crate) struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub embedding_enabled: bool,
 }
 
 /// Resolve the config directory according to the precedence in the module doc.
@@ -115,6 +117,13 @@ pub(crate) fn configured_model_id() -> Option<String> {
     load().active_model
 }
 
+/// Whether embedding is enabled in config (default: `false`).
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn embedding_enabled() -> bool {
+    load().embedding_enabled
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -130,9 +139,11 @@ mod tests {
     fn config_round_trips_through_serde() {
         let config = Config {
             active_model: Some("bge-m3".to_owned()),
+            embedding_enabled: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.active_model.as_deref(), Some("bge-m3"));
+        assert!(restored.embedding_enabled);
     }
 }

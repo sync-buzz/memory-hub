@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use git_memory_index::Projection;
 use git_memory_reconcile::{DivergenceMode, Reconciler};
-use git_memory_store::GitStore;
+use git_memory_store::{
+    check_push_policy, fetch_and_merge, push_to_remote, read_remote_config, remove_remote_config,
+    write_remote_config, GitStore, MemoryRemote, StoreErrorKind,
+};
 
 use crate::doctor;
 use crate::exit::Code;
@@ -54,6 +57,11 @@ enum Command {
         #[arg(long)]
         full_rebuild: bool,
 
+        /// Embed records with the configured model for vector-rescue search.
+        /// Degrades to FTS-only with a warning when no model is downloaded.
+        #[arg(long)]
+        embed: bool,
+
         /// Select human-readable or stable JSON output.
         #[arg(long, value_enum, default_value_t = Output::Human)]
         output: Output,
@@ -66,6 +74,46 @@ enum Command {
 
         /// Select human-readable or stable JSON output.
         #[arg(long, value_enum, default_value_t = Output::Human, global = true)]
+        output: Output,
+    },
+
+    /// Manage the memory remote (separate from code origin).
+    Remote {
+        #[command(subcommand)]
+        subcommand: RemoteCommand,
+
+        /// Repository or Git directory. Defaults to the current directory.
+        #[arg(long, value_name = "PATH", global = true)]
+        project: Option<PathBuf>,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human, global = true)]
+        output: Output,
+    },
+
+    /// Fetch from the configured memory remote and merge.
+    Fetch {
+        /// Repository or Git directory. Defaults to the current directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human)]
+        output: Output,
+    },
+
+    /// Push memory refs to the configured remote.
+    Push {
+        /// Repository or Git directory. Defaults to the current directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+
+        /// Force-push (overwrite remote history). Use with caution.
+        #[arg(long)]
+        force: bool,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human)]
         output: Output,
     },
 }
@@ -99,6 +147,25 @@ enum ModelCommand {
         /// Model id. Requires the model to be on disk.
         id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteCommand {
+    /// Add or replace the memory remote URL.
+    Add {
+        /// Remote URL (SSH, HTTPS, or local path).
+        url: String,
+
+        /// Optional custom refspec.
+        #[arg(long)]
+        refspec: Option<String>,
+    },
+
+    /// Show the configured memory remote.
+    List,
+
+    /// Remove the memory remote configuration.
+    Remove,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -166,6 +233,7 @@ where
         Command::Reconcile {
             project,
             full_rebuild,
+            embed,
             output,
         } => {
             let Some(project) = absolute_project(project) else {
@@ -179,10 +247,15 @@ where
             };
             match Reconciler::open(&project).and_then(|reconciler| reconciler.reconcile(mode)) {
                 Ok(report) => {
+                    let provider = if embed {
+                        resolve_embed_provider()
+                    } else {
+                        None
+                    };
                     let index_result = GitStore::open(&project)
                         .map_err(|error| error.to_string())
                         .and_then(|store| {
-                            Projection::synchronize_store(&store)
+                            Projection::synchronize_store_with(&store, provider)
                                 .map(|_| ())
                                 .map_err(|error| error.to_string())
                         });
@@ -223,6 +296,244 @@ where
                 ModelCommand::Benchmark { id } => model::benchmark(&id, output),
             }
         }
+        Command::Remote {
+            subcommand,
+            project,
+            output,
+        } => {
+            let Some(project) = absolute_project(project) else {
+                eprintln!("git-memory: unable to resolve current directory");
+                return Code::Internal;
+            };
+            let git_dir = match GitStore::discover_git_dir(&project) {
+                Ok(git_dir) => git_dir,
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            match subcommand {
+                RemoteCommand::Add { url, refspec } => {
+                    let remote = MemoryRemote { url, refspec };
+                    if let Err(error) = write_remote_config(&git_dir, &remote) {
+                        eprintln!("git-memory: {error}");
+                        return Code::Internal;
+                    }
+                    match output {
+                        Output::Json => println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "url": remote.url,
+                                "refspec": remote.refspec
+                            }))
+                            .unwrap_or_else(|_| "{}".into())
+                        ),
+                        Output::Human => println!("Memory remote set to {}", remote.url),
+                    }
+                    Code::Success
+                }
+                RemoteCommand::List => match read_remote_config(&git_dir) {
+                    Ok(Some(remote)) => {
+                        match output {
+                            Output::Json => println!(
+                                "{}",
+                                serde_json::to_string(&remote).unwrap_or_else(|_| "{}".into())
+                            ),
+                            Output::Human => {
+                                println!("url: {}", remote.url);
+                                if let Some(refspec) = &remote.refspec {
+                                    println!("refspec: {refspec}");
+                                }
+                            }
+                        }
+                        Code::Success
+                    }
+                    Ok(None) => {
+                        match output {
+                            Output::Json => println!("{{}}"),
+                            Output::Human => println!("No memory remote configured."),
+                        }
+                        Code::Success
+                    }
+                    Err(error) => {
+                        eprintln!("git-memory: {error}");
+                        Code::Internal
+                    }
+                },
+                RemoteCommand::Remove => {
+                    if let Err(error) = remove_remote_config(&git_dir) {
+                        eprintln!("git-memory: {error}");
+                        return Code::Internal;
+                    }
+                    match output {
+                        Output::Json => println!("{}", serde_json::json!({"removed": true})),
+                        Output::Human => println!("Memory remote removed."),
+                    }
+                    Code::Success
+                }
+            }
+        }
+        Command::Fetch { project, output } => {
+            let Some(project) = absolute_project(project) else {
+                eprintln!("git-memory: unable to resolve current directory");
+                return Code::Internal;
+            };
+            let store = match GitStore::open(&project) {
+                Ok(store) => store,
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            let git_dir = store.git_dir().to_path_buf();
+            let remote = match read_remote_config(&git_dir) {
+                Ok(Some(remote)) => remote,
+                Ok(None) => {
+                    eprintln!("git-memory: no memory remote configured — run `git memory remote add <url>`");
+                    return Code::Usage;
+                }
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            match fetch_and_merge(&store, &remote, &[]) {
+                Ok(result) => {
+                    match output {
+                        Output::Json => println!(
+                            "{}",
+                            serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())
+                        ),
+                        Output::Human => {
+                            if result.fast_forward && result.merged {
+                                println!("Already up to date.");
+                            } else if result.fast_forward {
+                                println!(
+                                    "Fast-forwarded {} → {}",
+                                    result.local_revision_before.as_str(),
+                                    result.local_revision_after.as_str()
+                                );
+                            } else if result.merged {
+                                println!(
+                                    "Merged remote {} into local {}",
+                                    result.remote_revision.as_str(),
+                                    result.local_revision_after.as_str()
+                                );
+                            } else if !result.conflicts.is_empty() {
+                                println!("Merge conflicts on {} key(s):", result.conflicts.len());
+                                for conflict in &result.conflicts {
+                                    println!(
+                                        "  {} (local: {}, remote: {})",
+                                        conflict.key,
+                                        conflict.local_content_hash,
+                                        conflict.remote_content_hash
+                                    );
+                                }
+                                println!("Resolve conflicts and retry.");
+                            }
+                        }
+                    }
+                    if result.conflicts.is_empty() {
+                        Code::Success
+                    } else {
+                        Code::NonFastForward
+                    }
+                }
+                Err(error) => {
+                    let code = store_error_to_code(error.kind);
+                    eprintln!("git-memory: {error}");
+                    code
+                }
+            }
+        }
+        Command::Push {
+            project,
+            force,
+            output,
+        } => {
+            let Some(project) = absolute_project(project) else {
+                eprintln!("git-memory: unable to resolve current directory");
+                return Code::Internal;
+            };
+            let git_dir = match GitStore::discover_git_dir(&project) {
+                Ok(git_dir) => git_dir,
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            let remote = match read_remote_config(&git_dir) {
+                Ok(Some(remote)) => remote,
+                Ok(None) => {
+                    eprintln!("git-memory: no memory remote configured — run `git memory remote add <url>`");
+                    return Code::Usage;
+                }
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            // Apply push policy: check for stale records before network mutation.
+            let store = match GitStore::open(&project) {
+                Ok(store) => store,
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            let policy_result = match check_push_policy(&store) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("git-memory: {error}");
+                    return Code::Internal;
+                }
+            };
+            for warning in &policy_result.warnings {
+                eprintln!("git-memory: warning: {warning}");
+            }
+            if !policy_result.allowed {
+                eprintln!(
+                    "git-memory: push blocked by memory_push_stale policy ({} stale records)",
+                    policy_result.stale_count
+                );
+                return Code::NonFastForward;
+            }
+            match push_to_remote(&git_dir, &remote, force) {
+                Ok(()) => {
+                    match output {
+                        Output::Json => {
+                            println!("{}", serde_json::json!({"pushed": true, "force": force}));
+                        }
+                        Output::Human => {
+                            if force {
+                                println!("Force-pushed memory refs to {}", remote.url);
+                            } else {
+                                println!("Pushed memory refs to {}", remote.url);
+                            }
+                        }
+                    }
+                    Code::Success
+                }
+                Err(error) => {
+                    let code = store_error_to_code(error.kind);
+                    eprintln!("git-memory: {error}");
+                    code
+                }
+            }
+        }
+    }
+}
+
+fn store_error_to_code(kind: StoreErrorKind) -> Code {
+    match kind {
+        StoreErrorKind::TransportFailed
+        | StoreErrorKind::SignatureInvalid
+        | StoreErrorKind::NamespaceRejected => Code::TransportFailed,
+        StoreErrorKind::FastForwardRequired
+        | StoreErrorKind::Diverged
+        | StoreErrorKind::MergeConflict => Code::NonFastForward,
+        StoreErrorKind::AuthenticationFailed => Code::AuthFailed,
+        _ => Code::Internal,
     }
 }
 
@@ -231,6 +542,27 @@ fn absolute_project(project: Option<PathBuf>) -> Option<PathBuf> {
         Some(project) if project.is_absolute() => Some(project),
         Some(project) => std::env::current_dir().ok().map(|cwd| cwd.join(project)),
         None => std::env::current_dir().ok(),
+    }
+}
+/// Resolve an embedding provider from configuration when `--embed` is passed.
+/// Returns `None` and prints a warning when no model is available — the
+/// projection then degrades to FTS-only.
+fn resolve_embed_provider() -> Option<std::sync::Arc<dyn git_memory_embed::EmbeddingProvider>> {
+    use std::sync::Arc;
+    let entry = crate::config::resolve_active_model();
+    let opts = git_memory_embed::DownloadOpts::default();
+    match git_memory_embed::verify_model_sync(entry, &opts) {
+        Ok(git_memory_embed::ModelVerification::Present { path, .. }) => Some(Arc::new(
+            git_memory_embed::LlamaCppProvider::new(entry, path),
+        )),
+        _ => {
+            eprintln!(
+                "git-memory: warning: embedding model `{}` is not available — \
+                 vector search will degrade to FTS-only",
+                entry.id
+            );
+            None
+        }
     }
 }
 

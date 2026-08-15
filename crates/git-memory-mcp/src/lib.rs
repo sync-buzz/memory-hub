@@ -10,11 +10,17 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use git_memory_core::{CURRENT_ENVELOPE_VERSION, PolicyResolver, StoredRecord};
+use git_memory_core::{CURRENT_ENVELOPE_VERSION, Envelope, PolicyResolver, StoredRecord};
+use git_memory_crypto::load_ssh_identity;
+use git_memory_embed::{EmbeddingProvider, ModelRuntime, ModelStatusBuilder};
 use git_memory_index::{IndexError, Projection, SearchFilters, SearchRequest};
 use git_memory_reconcile::{DivergenceMode, ReconcileError, ReconcileErrorKind, Reconciler};
-use git_memory_store::{GitStore, Operation, RecordId, Revision, StoreError, Transaction};
+use git_memory_store::{
+    EncryptedStore, GitStore, Operation, RecordId, Revision, StoreError, Transaction,
+    is_encrypted_project,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -73,16 +79,58 @@ struct Session {
     initialized: bool,
     revision_subscribed: bool,
     reconciliation: Value,
+    encrypted_store: Option<EncryptedStore>,
+    embed_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl Session {
     fn new(project: PathBuf) -> Self {
+        let encrypted_store = is_encrypted_project(&project)
+            .unwrap_or(false)
+            .then(|| EncryptedStore::open_locked(&project).ok())
+            .flatten();
+        // Encrypted projects use an ephemeral index: it exists only while
+        // unlocked in a live session. If a previous process was killed before
+        // `memory_lock` could destroy the index, plaintext LanceDB/WAL/temp
+        // files may remain on disk. Wipe them on every start so no plaintext
+        // survives a crash/restart cycle — the index is rebuilt on `unlock`.
+        if encrypted_store.is_some() {
+            if let Ok(git_store) = GitStore::open(&project) {
+                let _ = Projection::destroy_store_silent(&git_store);
+            }
+        }
         Self {
             project,
             initialized: false,
             revision_subscribed: false,
             reconciliation: json!({"status": "pending"}),
+            encrypted_store,
+            embed_provider: None,
         }
+    }
+
+    /// Resolve the embedding provider from configuration. Returns `None` when
+    /// embedding is not enabled or no model is available — the projection
+    /// then operates in FTS-only degraded mode.
+    fn resolve_provider(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        None
+    }
+
+    /// Return the active embedding provider, resolving it lazily on first use.
+    fn provider(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        self.embed_provider
+            .clone()
+            .or_else(|| self.resolve_provider())
+    }
+
+    fn is_encrypted(&self) -> bool {
+        self.encrypted_store.is_some()
+    }
+
+    fn is_unlocked(&self) -> bool {
+        self.encrypted_store
+            .as_ref()
+            .is_some_and(EncryptedStore::is_unlocked)
     }
 
     fn dispatch(&mut self, request: &Value, output: &mut impl Write) -> io::Result<Option<Value>> {
@@ -123,7 +171,7 @@ impl Session {
         };
         Ok(Some(match result {
             Ok(result) => rpc_result(id, result),
-            Err(error) => rpc_error(id, error.code, error.message, error.data),
+            Err(error) => rpc_error_owned(id, error.code, &error.message, error.data),
         }))
     }
 
@@ -164,7 +212,14 @@ impl Session {
             Err(error) => return Err(RpcFailure::reconcile(error)),
         };
         let store = self.store()?;
-        Projection::synchronize_store(&store).map_err(RpcFailure::index)?;
+        // Encrypted projects use an ephemeral index rebuilt only on `unlock`.
+        // When locked, there is no plaintext to index — skip synchronization so
+        // we don't recreate an empty LanceDB directory that `Session::new`
+        // just wiped as part of crash recovery.
+        if !self.is_encrypted() || self.is_unlocked() {
+            Projection::synchronize_store_with(&store, self.provider())
+                .map_err(RpcFailure::index)?;
+        }
         let handshake = self.handshake();
         self.initialized = true;
         Ok(json!({
@@ -175,7 +230,7 @@ impl Session {
                 "experimental": {"gitMemory": handshake}
             },
             "serverInfo": {"name": "git-memory", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Read memory://revision/current after each resource update notification.",
+            "instructions": builtin_instructions(if self.is_encrypted() { "encrypted" } else { "plaintext" }),
             "_meta": {"gitMemory": handshake}
         }))
     }
@@ -197,8 +252,10 @@ impl Session {
             "storeVersion": version(1, 1),
             "envelopeVersion": CURRENT_ENVELOPE_VERSION,
             "indexVersion": version(1, 0),
-            "modelFingerprint": null,
-            "encryptionMode": "plaintext",
+            "modelFingerprint": self.embed_provider.as_ref().map(|p| {
+                git_memory_embed::Fingerprint::from_provider(&**p, p.model_id()).digest()
+            }),
+            "encryptionMode": if self.is_encrypted() { "encrypted" } else { "plaintext" },
             "installationId": installation_id,
             "projectId": project_id,
             "projectPath": canonical,
@@ -209,6 +266,56 @@ impl Session {
 
     fn store(&self) -> Result<GitStore, RpcFailure> {
         GitStore::open(&self.project).map_err(RpcFailure::store)
+    }
+
+    /// Return the encrypted store, or a `locked` error if the project is not
+    /// encrypted or has not been unlocked.
+    fn require_unlocked_encrypted(&self) -> Result<&EncryptedStore, ToolFailure> {
+        let store = self.encrypted_store.as_ref().ok_or_else(|| ToolFailure {
+            kind: "not_encrypted".to_owned(),
+            message: "project is not encrypted".to_owned(),
+            data: json!({}),
+        })?;
+        if store.is_unlocked() {
+            Ok(store)
+        } else {
+            Err(ToolFailure {
+                kind: "locked".to_owned(),
+                message: "encrypted store is locked — call memory_unlock first".to_owned(),
+                data: json!({"recovery_action": "unlock_with_identity"}),
+            })
+        }
+    }
+
+    /// Synchronize the ephemeral index from decrypted records for encrypted
+    /// projects, or from the Git snapshot for plaintext projects.
+    fn sync_index(&self) -> Result<(), IndexError> {
+        let provider = self.provider();
+        if let Some(store) = self.encrypted_store.as_ref()
+            && store.is_unlocked()
+        {
+            let records = store.list().map_err(|e| {
+                IndexError::new(format!("decrypt records for index rebuild: {e}"))
+            })?;
+            let revision = store.current_revision().map_err(|e| {
+                IndexError::new(format!("read current revision for index: {e}"))
+            })?;
+            let git_store = GitStore::open(&self.project).map_err(|e| {
+                IndexError::new(format!("open store for index rebuild: {e}"))
+            })?;
+            Projection::rebuild_from_envelopes_store_with(
+                &git_store,
+                &records,
+                &revision,
+                provider,
+            )?;
+        } else {
+            let store = GitStore::open(&self.project).map_err(|e| {
+                IndexError::new(format!("open store for index sync: {e}"))
+            })?;
+            Projection::synchronize_store_with(&store, provider)?;
+        }
+        Ok(())
     }
 
     fn subscribe(&mut self, params: &Value) -> Result<Value, RpcFailure> {
@@ -252,27 +359,15 @@ impl Session {
                     "targetRevision": status.target_revision
                 })
             }
-            "memory://model/status" => json!({
-                "schemaVersion": 1,
-                "available": true,
-                "modelId": null,
-                "dimensions": null,
-                "runtime": "none",
-                "runtimeState": "missing",
-                "vectorSearch": false,
-                "ftsOnly": true,
-                "mode": "fts"
-            }),
+            "memory://model/status" => self.build_model_status(),
             "memory://policy/effective" => policy_resource(),
-            "memory://encryption/status" => json!({
-                "schemaVersion": 1,
-                "mode": "plaintext",
-                "available": true,
-                "encryptedStoreAvailable": false,
-                "encryptedIndexAvailable": false
-            }),
+            "memory://encryption/status" => self.encryption_status(),
+            "memory://records/summary" => self.records_summary()?,
             _ => {
                 if let Some(key) = uri.strip_prefix("memory://records/") {
+                    if key == "summary" {
+                        return Err(resource_not_found(uri));
+                    }
                     let snapshot = self.store()?.current().map_err(RpcFailure::store)?;
                     let record = snapshot
                         .get(&RecordId::plaintext(key))
@@ -298,7 +393,7 @@ impl Session {
     ) -> io::Result<Value> {
         let name = match required_string(params, "name") {
             Ok(name) => name,
-            Err(error) => return Ok(rpc_error(id, error.code, error.message, error.data)),
+            Err(error) => return Ok(rpc_error_owned(id, error.code, &error.message, error.data)),
         };
         let arguments = params
             .get("arguments")
@@ -332,11 +427,8 @@ impl Session {
                 revision_changed,
             }) => {
                 if revision_changed || reconciliation_changed {
-                    let index_result = self.store().and_then(|store| {
-                        Projection::synchronize_store(&store).map_err(RpcFailure::index)
-                    });
-                    if let Err(error) = index_result {
-                        return Ok(rpc_result(id, tool_error(error.into_tool_failure())));
+                    if let Err(error) = self.sync_index() {
+                        return Ok(rpc_result(id, tool_error(ToolFailure::index(error))));
                     }
                 }
                 if (revision_changed || reconciliation_changed) && self.revision_subscribed {
@@ -353,7 +445,7 @@ impl Session {
             }
             Err(ToolCallFailure::Rpc(error)) => {
                 if error.data.get("kind").and_then(Value::as_str) == Some("tool_not_found") {
-                    Ok(rpc_error(id, error.code, error.message, error.data))
+                    Ok(rpc_error_owned(id, error.code, &error.message, error.data))
                 } else {
                     Ok(rpc_result(id, tool_error(error.into_tool_failure())))
                 }
@@ -362,7 +454,7 @@ impl Session {
         }
     }
 
-    fn execute_tool(&self, name: &str, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+    fn execute_tool(&mut self, name: &str, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         match name {
             "memory_apply_transaction" => self.apply_transaction(arguments),
             "memory_get_record" => self.get_record(arguments),
@@ -377,14 +469,17 @@ impl Session {
             "memory_reindex" => self.reindex(),
             "memory_search" => self.search(arguments),
             "memory_backlinks" => self.backlinks(arguments),
-            "memory_transport_status" | "memory_fetch" | "memory_push" => {
-                Err(unavailable("remote_transport", "GITMEMO-10"))
-            }
-            "memory_model_status" => Err(unavailable("embedding_model", "GITMEMO-8")),
-            "memory_encryption_status" => Ok(ToolOutcome::read(json!({
-                "mode": "plaintext", "encryptedStoreAvailable": false,
-                "encryptedIndexAvailable": false
-            }))),
+            "memory_transport_status" => self.transport_status(),
+            "memory_fetch" => self.fetch(arguments),
+            "memory_push" => self.push(arguments),
+            "memory_model_status" => self.model_status(),
+            "memory_encryption_status" => Ok(ToolOutcome::read(self.encryption_status())),
+            "memory_unlock" => self.unlock_store(arguments),
+            "memory_lock" => self.lock_store(),
+            "memory_init_encrypted" => self.init_encrypted(arguments),
+            "memory_list_recipients" => self.list_recipients(),
+            "memory_add_recipient" => self.add_recipient(arguments),
+            "memory_remove_recipient" => self.remove_recipient(arguments),
             _ => Err(ToolCallFailure::Rpc(RpcFailure::new(
                 -32_602,
                 "tool not found",
@@ -393,9 +488,80 @@ impl Session {
         }
     }
 
+    fn encryption_status(&self) -> Value {
+        let encrypted = self.is_encrypted();
+        let unlocked = self.is_unlocked();
+        let mode = if encrypted { "encrypted" } else { "plaintext" };
+        let state = if !encrypted {
+            "plaintext"
+        } else if unlocked {
+            "unlocked"
+        } else {
+            "locked"
+        };
+        json!({
+            "schemaVersion": 1,
+            "mode": mode,
+            "state": state,
+            "available": true,
+            "encryptedStoreAvailable": encrypted,
+            "encryptedIndexAvailable": encrypted && unlocked,
+            "ephemeralIndex": encrypted
+        })
+    }
+
+    fn records_summary(&self) -> Result<Value, RpcFailure> {
+        let (revision, envelopes): (Revision, Vec<(String, Envelope)>) = if self.is_encrypted() {
+            let store = self.require_unlocked_encrypted().map_err(|e| RpcFailure::new(
+                -32_602,
+                e.message,
+                e.data,
+            ))?;
+            let records = store.list().map_err(RpcFailure::store)?;
+            let rev = store.current_revision().map_err(RpcFailure::store)?;
+            (rev, records)
+        } else {
+            let store = self.store()?;
+            let snapshot = store.current().map_err(RpcFailure::store)?;
+            let rev = snapshot.revision().clone();
+            let records = snapshot.records().map_err(RpcFailure::store)?;
+            let envelopes = records
+                .into_iter()
+                .filter_map(|(id, record)| match record {
+                    StoredRecord::Plaintext { envelope } => {
+                        Some((id.display_value(), *envelope))
+                    }
+                    StoredRecord::Encrypted { .. } => None,
+                })
+                .collect();
+            (rev, envelopes)
+        };
+        let total = envelopes.len();
+        let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_freshness: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut archived = 0usize;
+        for (_, env) in &envelopes {
+            *by_kind.entry(env.kind.clone()).or_default() += 1;
+            let state = freshness_str(env.freshness.state).to_owned();
+            *by_freshness.entry(state).or_default() += 1;
+            if env.archive.archived {
+                archived += 1;
+            }
+        }
+        Ok(json!({
+            "schemaVersion": 1,
+            "revision": revision,
+            "total": total,
+            "by_kind": by_kind,
+            "by_freshness": by_freshness,
+            "archived": archived,
+            "live": total - archived,
+        }))
+    }
+
     fn apply_transaction(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         let transaction_id = required_string(arguments, "transaction_id")?.to_owned();
-        let expected_revision = parse_field(arguments, "expected_revision")?;
+        let expected_revision: Revision = parse_field(arguments, "expected_revision")?;
         let raw = arguments
             .get("operations")
             .and_then(Value::as_array)
@@ -407,46 +573,271 @@ impl Session {
             .iter()
             .map(parse_operation)
             .collect::<Result<Vec<_>, _>>()?;
-        let result = self
-            .store()?
-            .apply(&Transaction {
-                id: transaction_id,
-                expected_revision,
-                operations,
-            })
-            .map_err(ToolFailure::store)?;
-        Ok(ToolOutcome::mutation(json!(result)))
+        if self.is_encrypted() {
+            let store = self.require_unlocked_encrypted()?;
+            let mut puts: Vec<(String, Envelope)> = Vec::new();
+            let mut deletes: Vec<String> = Vec::new();
+            for op in &operations {
+                match op {
+                    Operation::Put { record } => match record {
+                        StoredRecord::Plaintext { envelope } => {
+                            puts.push((envelope.key.clone(), (**envelope).clone()));
+                        }
+                        StoredRecord::Encrypted { .. } => {
+                            return Err(ToolFailure {
+                                kind: "invalid_argument".to_owned(),
+                                message: "encrypted projects accept plaintext envelopes only — the store encrypts them".to_owned(),
+                                data: json!({}),
+                            }.into());
+                        }
+                    },
+                    Operation::Delete { id } => match id {
+                        RecordId::Plaintext(key) => deletes.push(key.clone()),
+                        RecordId::Opaque(_) => {
+                            return Err(ToolFailure {
+                                kind: "invalid_argument".to_owned(),
+                                message: "encrypted projects delete by semantic key, not opaque id".to_owned(),
+                                data: json!({}),
+                            }.into());
+                        }
+                    },
+                }
+            }
+            let puts_refs: Vec<(&str, Envelope)> = puts
+                .iter()
+                .map(|(k, e)| (k.as_str(), e.clone()))
+                .collect();
+            let deletes_refs: Vec<&str> = deletes.iter().map(String::as_str).collect();
+            let result = store
+                .apply(&transaction_id, expected_revision, &puts_refs, &deletes_refs)
+                .map_err(ToolFailure::store)?;
+            Ok(ToolOutcome::mutation(json!(result)))
+        } else {
+            let result = self
+                .store()?
+                .apply(&Transaction {
+                    id: transaction_id,
+                    expected_revision,
+                    operations,
+                })
+                .map_err(ToolFailure::store)?;
+            Ok(ToolOutcome::mutation(json!(result)))
+        }
     }
 
     fn get_record(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         let key = required_string(arguments, "key")?;
-        let revision: Revision = parse_field(arguments, "revision")?;
-        let snapshot = self
-            .store()?
-            .snapshot(&revision)
-            .map_err(ToolFailure::store)?;
-        let record = snapshot
-            .get(&RecordId::plaintext(key))
-            .map_err(ToolFailure::store)?;
-        Ok(ToolOutcome::read(
-            json!({"revision": revision, "record": record}),
-        ))
+        if self.is_encrypted() {
+            let store = self.require_unlocked_encrypted()?;
+            let envelope = store.get(key).map_err(ToolFailure::store)?;
+            let revision = store.current_revision().map_err(ToolFailure::store)?;
+            Ok(ToolOutcome::read(
+                json!({"revision": revision, "record": envelope}),
+            ))
+        } else {
+            let revision: Revision = parse_field(arguments, "revision")?;
+            let snapshot = self
+                .store()?
+                .snapshot(&revision)
+                .map_err(ToolFailure::store)?;
+            let record = snapshot
+                .get(&RecordId::plaintext(key))
+                .map_err(ToolFailure::store)?;
+            Ok(ToolOutcome::read(
+                json!({"revision": revision, "record": record}),
+            ))
+        }
     }
 
     fn list_records(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let store = self.store()?;
-        let snapshot = match arguments.get("revision") {
-            Some(value) => store.snapshot(
-                &serde_json::from_value(value.clone())
-                    .map_err(|_| RpcFailure::invalid_argument("revision"))?,
-            ),
-            None => store.current(),
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(50)
+            .min(200) as usize;
+        let offset = arguments
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let kind_filter = arguments
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let tag_filters: Vec<String> = arguments
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let archived_filter = arguments.get("archived").and_then(Value::as_bool);
+        let freshness_filters: Vec<String> = arguments
+            .get("freshness")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sort_field = arguments
+            .get("sort")
+            .and_then(Value::as_str)
+            .unwrap_or("key");
+        let sort_order = arguments
+            .get("sort_order")
+            .and_then(Value::as_str)
+            .unwrap_or("asc");
+        let metadata_only = arguments
+            .get("metadata_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // Collect records from the appropriate source.
+        let (revision, envelopes): (Revision, Vec<(String, Envelope)>) = if self.is_encrypted() {
+            let store = self.require_unlocked_encrypted()?;
+            let records = store.list().map_err(ToolFailure::store)?;
+            let rev = store.current_revision().map_err(ToolFailure::store)?;
+            (rev, records)
+        } else {
+            let store = self.store()?;
+            let snapshot = match arguments.get("revision") {
+                Some(value) => store.snapshot(
+                    &serde_json::from_value(value.clone())
+                        .map_err(|_| RpcFailure::invalid_argument("revision"))?,
+                ),
+                None => store.current(),
+            }
+            .map_err(ToolFailure::store)?;
+            let rev = snapshot.revision().clone();
+            let records = snapshot.records().map_err(ToolFailure::store)?;
+            let envelopes = records
+                .into_iter()
+                .filter_map(|(id, record)| match record {
+                    StoredRecord::Plaintext { envelope } => {
+                        Some((id.display_value(), *envelope))
+                    }
+                    StoredRecord::Encrypted { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            (rev, envelopes)
+        };
+
+        // Apply filters in-memory.
+        let filtered: Vec<&(String, Envelope)> = envelopes
+            .iter()
+            .filter(|(_, env)| {
+                if let Some(ref kind) = kind_filter
+                    && &env.kind != kind
+                {
+                    return false;
+                }
+                if !tag_filters.is_empty()
+                    && !tag_filters.iter().all(|tag| env.tags.iter().any(|t| t == tag))
+                {
+                    return false;
+                }
+                if let Some(archived_only) = archived_filter
+                    && env.archive.archived != archived_only
+                {
+                    return false;
+                }
+                if !freshness_filters.is_empty() {
+                    let state = freshness_str(env.freshness.state);
+                    if !freshness_filters.iter().any(|f| f == &state) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        // Compute counts over the full filtered set.
+        let total = filtered.len();
+        let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_freshness: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut archived_count = 0usize;
+        for (_, env) in &filtered {
+            *by_kind.entry(env.kind.clone()).or_default() += 1;
+            let state = freshness_str(env.freshness.state).to_owned();
+            *by_freshness.entry(state).or_default() += 1;
+            if env.archive.archived {
+                archived_count += 1;
+            }
         }
-        .map_err(ToolFailure::store)?;
-        let records = snapshot.records().map_err(ToolFailure::store)?;
-        Ok(ToolOutcome::read(
-            json!({"revision": snapshot.revision(), "records": records}),
-        ))
+        let counts = json!({
+            "total": total,
+            "by_kind": by_kind,
+            "by_freshness": by_freshness,
+            "archived": archived_count,
+            "live": total - archived_count,
+        });
+
+        // Sort.
+        let mut sorted: Vec<&(String, Envelope)> = filtered;
+        let descending = sort_order == "desc";
+        sorted.sort_by(|a, b| {
+            let cmp = match sort_field {
+                "kind" => a.1.kind.cmp(&b.1.kind),
+                "title" => a.1.title.as_deref().unwrap_or("").cmp(b.1.title.as_deref().unwrap_or("")),
+                "freshness" => {
+                    let fa = freshness_str(a.1.freshness.state);
+                    let fb = freshness_str(b.1.freshness.state);
+                    fa.cmp(fb)
+                }
+                "archived" => a.1.archive.archived.cmp(&b.1.archive.archived),
+                _ => a.0.cmp(&b.0), // "key" default
+            };
+            if descending { cmp.reverse() } else { cmp }
+        });
+
+        // Paginate.
+        let has_more = sorted.len().saturating_sub(offset) > limit;
+        let page: Vec<Value> = sorted
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(key, env)| {
+                if metadata_only {
+                    json!({
+                        "key": key,
+                        "kind": env.kind,
+                        "title": env.title,
+                        "tags": env.tags,
+                        "archived": env.archive.archived,
+                        "freshness": freshness_str(env.freshness.state),
+                        "content_hash": env.content_hash.as_str(),
+                    })
+                } else {
+                    json!({
+                        "key": key,
+                        "kind": env.kind,
+                        "title": env.title,
+                        "content": env.content,
+                        "tags": env.tags,
+                        "links": env.links,
+                        "source_paths": env.source_paths,
+                        "archive": env.archive,
+                        "freshness": env.freshness,
+                        "content_hash": env.content_hash.as_str(),
+                    })
+                }
+            })
+            .collect();
+
+        Ok(ToolOutcome::read(json!({
+            "revision": revision,
+            "records": page,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+            "counts": counts,
+        })))
     }
 
     fn checkpoint(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
@@ -522,9 +913,67 @@ impl Session {
     }
 
     fn reindex(&self) -> Result<ToolOutcome, ToolCallFailure> {
-        let store = self.store()?;
-        let status = Projection::synchronize_store(&store).map_err(ToolFailure::index)?;
-        Ok(ToolOutcome::read(json!(status)))
+        let provider = self.provider();
+        if self.is_encrypted() {
+            let store = self.require_unlocked_encrypted()?;
+            let records = store.list().map_err(ToolFailure::store)?;
+            let revision = store.current_revision().map_err(ToolFailure::store)?;
+            let git_store = GitStore::open(&self.project).map_err(|e| ToolFailure {
+                kind: "repository".to_owned(),
+                message: e.message,
+                data: e.data,
+            })?;
+            let status = Projection::rebuild_from_envelopes_store_with(
+                &git_store,
+                &records,
+                &revision,
+                provider,
+            )
+            .map_err(ToolFailure::index)?;
+            Ok(ToolOutcome::read(json!(status)))
+        } else {
+            let store = self.store()?;
+            let status =
+                Projection::synchronize_store_with(&store, provider).map_err(ToolFailure::index)?;
+            Ok(ToolOutcome::read(json!(status)))
+        }
+    }
+
+    fn model_status(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        Ok(ToolOutcome::read(json!(self.build_model_status())))
+    }
+
+    fn build_model_status(&self) -> Value {
+        match &self.embed_provider {
+            Some(provider) => {
+                let status = ModelStatusBuilder::default()
+                    .model_id(provider.model_id())
+                    .display_name(provider.name())
+                    .dimensions(provider.dimensions())
+                    .runtime_state(ModelRuntime::Active)
+                    .build();
+                json!({
+                    "schemaVersion": 1,
+                    "modelId": status.model_id,
+                    "dimensions": status.dimensions,
+                    "runtime": status.runtime,
+                    "runtimeState": status.runtime_state,
+                    "vectorSearch": status.vector_search,
+                    "ftsOnly": status.fts_only(),
+                    "mode": "hybrid",
+                })
+            }
+            None => json!({
+                "schemaVersion": 1,
+                "modelId": null,
+                "dimensions": null,
+                "runtime": "none",
+                "runtimeState": "missing",
+                "vectorSearch": false,
+                "ftsOnly": true,
+                "mode": "fts",
+            }),
+        }
     }
 
     fn reconcile(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
@@ -610,7 +1059,8 @@ impl Session {
         // The index is already synchronized after each mutation (see call_tool),
         // so we search directly. If the index is stale for the requested
         // revision, search_store returns a structured error.
-        let result = Projection::search_store(&store, &request).map_err(ToolFailure::index)?;
+        let result =
+            Projection::search_store_with(&store, &request, self.provider()).map_err(ToolFailure::index)?;
         Ok(ToolOutcome::read(json!(result)))
     }
 
@@ -633,6 +1083,219 @@ impl Session {
             "key": key,
             "revision": revision,
             "backlinks": entries,
+        })))
+    }
+
+    fn transport_status(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        let store = self.store()?;
+        let git_dir = store.git_dir();
+        let remote = git_memory_store::read_remote_config(git_dir)
+            .map_err(ToolFailure::store)?;
+        let has_remote = remote.is_some();
+        Ok(ToolOutcome::read(json!({
+            "remoteConfigured": has_remote,
+            "remoteUrl": remote.as_ref().map(|r| r.url.clone()),
+            "refspec": remote.as_ref().and_then(|r| r.refspec.clone()),
+        })))
+    }
+
+    fn fetch(&self, _arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let store = self.store()?;
+        let git_dir = store.git_dir().to_path_buf();
+        let remote = git_memory_store::read_remote_config(&git_dir)
+            .map_err(ToolFailure::store)?
+            .ok_or_else(|| ToolFailure {
+                kind: "no_remote_configured".to_owned(),
+                message: "no memory remote configured".to_owned(),
+                data: json!({"recovery_action": "configure_remote_first"}),
+            })?;
+        let result = git_memory_store::fetch_and_merge(&store, &remote, &[])
+            .map_err(ToolFailure::store)?;
+        let changed = result.local_revision_before != result.local_revision_after;
+        Ok(ToolOutcome {
+            content: json!({
+                "localRevisionBefore": result.local_revision_before,
+                "localRevisionAfter": result.local_revision_after,
+                "remoteRevision": result.remote_revision,
+                "fastForward": result.fast_forward,
+                "merged": result.merged,
+                "conflicts": result.conflicts,
+            }),
+            revision_changed: changed,
+        })
+    }
+
+    fn push(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let force = arguments
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let store = self.store()?;
+
+        // Apply push policy before network mutation.
+        let policy_result =
+            git_memory_store::check_push_policy(&store).map_err(ToolFailure::store)?;
+        if !policy_result.allowed {
+            return Err(ToolCallFailure::Tool(ToolFailure {
+                kind: "push_blocked".to_owned(),
+                message: "push blocked by memory_push_stale policy".to_owned(),
+                data: json!({
+                    "stale_count": policy_result.stale_count,
+                    "warnings": policy_result.warnings,
+                    "recovery_action": "refresh_stale_records_or_override_policy",
+                }),
+            }));
+        }
+
+        let git_dir = store.git_dir().to_path_buf();
+        let remote = git_memory_store::read_remote_config(&git_dir)
+            .map_err(ToolFailure::store)?
+            .ok_or_else(|| ToolFailure {
+                kind: "no_remote_configured".to_owned(),
+                message: "no memory remote configured".to_owned(),
+                data: json!({"recovery_action": "configure_remote_first"}),
+            })?;
+        git_memory_store::push_to_remote(&git_dir, &remote, force)
+            .map_err(ToolFailure::store)?;
+        Ok(ToolOutcome::read(json!({
+            "pushed": true,
+            "force": force,
+            "remote": remote.url,
+            "warnings": policy_result.warnings,
+            "staleCount": policy_result.stale_count,
+        })))
+    }
+
+    fn unlock_store(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let identity_path = required_string(arguments, "identity_path")?;
+        let path = std::path::PathBuf::from(identity_path);
+        let identity = load_ssh_identity(&path).map_err(|e| ToolFailure {
+            kind: "identity_load_failed".to_owned(),
+            message: format!("failed to load SSH identity: {e}"),
+            data: json!({"path": identity_path}),
+        })?;
+        let store = self.encrypted_store.as_mut().ok_or_else(|| ToolFailure {
+            kind: "not_encrypted".to_owned(),
+            message: "project is not encrypted — nothing to unlock".to_owned(),
+            data: json!({}),
+        })?;
+        store.unlock(identity).map_err(ToolFailure::store)?;
+        let revision = store.current_revision().map_err(ToolFailure::store)?;
+        // Rebuild the ephemeral index from decrypted records.
+        self.sync_index().map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!({
+            "unlocked": true,
+            "revision": revision,
+            "indexRebuilt": true,
+        })))
+    }
+
+    fn lock_store(&mut self) -> Result<ToolOutcome, ToolCallFailure> {
+        let store = self.encrypted_store.as_mut().ok_or_else(|| ToolFailure {
+            kind: "not_encrypted".to_owned(),
+            message: "project is not encrypted — nothing to lock".to_owned(),
+            data: json!({}),
+        })?;
+        store.lock();
+        // Destroy the ephemeral index so no plaintext persists on disk.
+        let git_store = GitStore::open(&self.project).map_err(|e| ToolFailure {
+            kind: "repository".to_owned(),
+            message: e.message,
+            data: e.data,
+        })?;
+        Projection::destroy_store(&git_store).map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!({
+            "locked": true,
+            "indexDestroyed": true,
+        })))
+    }
+
+    fn init_encrypted(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let identity_path = required_string(arguments, "identity_path")?;
+        let public_key = required_string(arguments, "recipient_public_key")?.to_owned();
+        let key_type = arguments
+            .get("key_type")
+            .and_then(Value::as_str)
+            .unwrap_or("ssh")
+            .to_owned();
+        let label = arguments
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let recipient = git_memory_store::RecipientEntry {
+            public_key,
+            key_type,
+            label,
+        };
+        // Unlock first (handles both fresh project without manifest
+        // and existing project — unlock verifies identity if manifest exists).
+        let path = std::path::PathBuf::from(identity_path);
+        let identity = load_ssh_identity(&path).map_err(|e| ToolFailure {
+            kind: "identity_load_failed".to_owned(),
+            message: format!("failed to load SSH identity: {e}"),
+            data: json!({"path": identity_path}),
+        })?;
+        let store = self.encrypted_store.as_mut().ok_or_else(|| ToolFailure {
+            kind: "not_encrypted".to_owned(),
+            message: "project is not encrypted — nothing to init".to_owned(),
+            data: json!({}),
+        })?;
+        store.unlock(identity).map_err(ToolFailure::store)?;
+        let result = store
+            .init(vec![recipient])
+            .map_err(ToolFailure::store)?;
+        Ok(ToolOutcome::read(json!({
+            "initialized": true,
+            "backupIdentity": result.backup_identity,
+            "warning": "persist the backup identity in a safe location outside the repository — it is the recovery path if you lose your SSH key",
+        })))
+    }
+
+    fn list_recipients(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        let store = self.require_unlocked_encrypted()?;
+        let recipients = store.list_recipients().map_err(ToolFailure::store)?;
+        Ok(ToolOutcome::read(json!({
+            "recipients": recipients,
+        })))
+    }
+
+    fn add_recipient(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let public_key = required_string(arguments, "public_key")?.to_owned();
+        let key_type = arguments
+            .get("key_type")
+            .and_then(Value::as_str)
+            .unwrap_or("ssh")
+            .to_owned();
+        let label = arguments
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let recipient = git_memory_store::RecipientEntry {
+            public_key,
+            key_type,
+            label,
+        };
+        let store = self.require_unlocked_encrypted()?;
+        store.add_recipient(recipient).map_err(ToolFailure::store)?;
+        // Re-encryption changed the canonical revision — rebuild the index.
+        self.sync_index().map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!({
+            "added": true,
+            "indexRebuilt": true,
+        })))
+    }
+
+    fn remove_recipient(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let public_key = required_string(arguments, "public_key")?;
+        let store = self.require_unlocked_encrypted()?;
+        store
+            .remove_recipient(public_key)
+            .map_err(ToolFailure::store)?;
+        // Recipients changed — old vectors are invalid. Full rebuild.
+        self.sync_index().map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!({
+            "removed": true,
+            "indexRebuilt": true,
         })))
     }
 }
@@ -680,6 +1343,7 @@ fn list_resources() -> Value {
         ("Model status", "memory://model/status"),
         ("Effective policy", "memory://policy/effective"),
         ("Encryption status", "memory://encryption/status"),
+        ("Records summary", "memory://records/summary"),
     ]
     .into_iter()
     .map(|(name, uri)| json!({"name": name, "uri": uri, "mimeType": "application/json"}))
@@ -696,12 +1360,140 @@ fn list_resource_templates() -> Value {
     }]})
 }
 
+/// Built-in agent instructions — describes the storage layer tools, the
+/// revision model, and the encryption lifecycle. Updated with each Git
+/// Memory version. Composed with project-specific schema instructions (from
+/// `__type__` records) when schema is implemented.
+fn builtin_instructions(encryption_mode: &str) -> String {
+    let mut s = String::new();
+    s.push_str("# Git Memory — Persistent Knowledge Store\n\n");
+    s.push_str("You are connected to a Git Memory store. Records persist in Git objects ");
+    s.push_str("under `.git/refs/memory/` and are portable with the repository. ");
+    s.push_str("Each record is a generic Envelope: key, kind, content, title, tags, links, ");
+    s.push_str("source_paths, archive state, freshness state, and extensions.\n\n");
+
+    // ── Document model ──
+    s.push_str("## Document Model\n\n");
+    s.push_str("Records are identified by a `key` (stable string) and grouped by `kind` ");
+    s.push_str("(free-form string, e.g. \"decision\", \"constraint\", \"spec\"). ");
+    s.push_str("The `content` field holds the main text. `title` is a short summary. ");
+    s.push_str("`tags` are free-form labels. `links` are typed relations to other records ");
+    s.push_str("(by key). `extensions` is a JSON object for semantic fields ");
+    s.push_str("(e.g. status, priority) — typed fields beyond the standard Envelope.\n\n");
+
+    // ── Revision model ──
+    s.push_str("## Revision Model\n\n");
+    s.push_str("Memory uses a two-revision model:\n");
+    s.push_str("- **Staged** (`refs/memory/staged`): pending changes, not yet permanent.\n");
+    s.push_str("- **Canonical** (`refs/memory/main`): committed snapshots.\n\n");
+    s.push_str("`apply_transaction` writes to staged. `checkpoint` promotes staged to ");
+    s.push_str("canonical. Read operations (`get_record`, `list_records`, `search`) ");
+    s.push_str("always read from canonical (current revision).\n\n");
+    s.push_str("Every mutation returns the new staged revision. After mutations, ");
+    s.push_str("the index is synchronised automatically — no manual reindex needed ");
+    s.push_str("for normal operations.\n\n");
+
+    // ── Tools guide ──
+    s.push_str("## Tools\n\n");
+
+    s.push_str("### Reading\n\n");
+    s.push_str("- **memory_get_record** (`key`): Fetch one record by its key. ");
+    s.push_str("Returns the full Envelope including content, links, extensions.\n");
+    s.push_str("- **memory_list_records**: List records with pagination (`limit`, `offset`), ");
+    s.push_str("filters (`kind`, `tags`, `archived`, `freshness`), sorting (`sort`, ");
+    s.push_str("`sort_order`), and `metadata_only` mode (omits content — use for UI lists). ");
+    s.push_str("Response includes `counts` (total, by_kind, by_freshness, archived/live) ");
+    s.push_str("over the full filtered set.\n");
+    s.push_str("- **memory_search** (`query`): Full-text search with the same filters. ");
+    s.push_str("Use when you need to find records by content, not by key. ");
+    s.push_str("Returns ranked hits with snippets.\n");
+    s.push_str("- **memory_backlinks** (`key`): Find records that link TO or mention a key. ");
+    s.push_str("Combines explicit `links` and body-mention detection.\n");
+
+    s.push_str("\n### Writing\n\n");
+    s.push_str("- **memory_apply_transaction**: Create, update, or delete records. ");
+    s.push_str("Provide `transaction_id`, `expected_revision` (from last read), and ");
+    s.push_str("`operations` array. Each Put needs: key, kind, content, title, tags, links. ");
+    s.push_str("If schema is active, the record is validated before write — ");
+    s.push_str("invalid records are rejected with a `validation_error` containing ");
+    s.push_str("`kind`, `field`, and `reason`.\n");
+    s.push_str("- **memory_checkpoint** (`message`): Promote staged to canonical. ");
+    s.push_str("Creates a permanent Git commit with a message.\n");
+
+    s.push_str("\n### History & Reconciliation\n\n");
+    s.push_str("- **memory_history**: List checkpoints (canonical commits).\n");
+    s.push_str("- **memory_diff**: Compare two revisions.\n");
+    s.push_str("- **memory_reconcile**: Sync Memory with code history. ");
+    s.push_str("Code commits since the last Memory checkpoint are processed; ");
+    s.push_str("freshness of records is updated based on path overlap.\n");
+
+    s.push_str("\n### Search Index\n\n");
+    s.push_str("- **memory_reindex**: Rebuild the LanceDB index from canonical records. ");
+    s.push_str("Use after corruption or manual Git operations.\n");
+    s.push_str("- **memory_doctor**: Validate repository and index health.\n");
+
+    s.push_str("\n### Transport\n\n");
+    s.push_str("- **memory_transport_status**: Check remote configuration.\n");
+    s.push_str("- **memory_fetch**: Pull memory refs from remote and merge.\n");
+    s.push_str("- **memory_push**: Push memory refs to remote. ");
+    s.push_str("Blocked if stale records exist (override with `force`).\n");
+
+    s.push_str("\n### Export / Import\n\n");
+    s.push_str("- **memory_export** (`revision`): Export a deterministic record bundle.\n");
+    s.push_str("- **memory_import** (`bundle`): Import records from a bundle in one transaction.\n");
+
+    // ── Encryption ──
+    if encryption_mode == "encrypted" {
+        s.push_str("\n## Encryption\n\n");
+        s.push_str("This project uses encrypted storage. Records are encrypted with age ");
+        s.push_str("(SSH keys) before writing to Git. The search index is ephemeral: ");
+        s.push_str("it exists only in memory while unlocked.\n\n");
+        s.push_str("- **memory_unlock** (`identity_path`): Decrypt the store with an SSH key. ");
+        s.push_str("Rebuilds the search index from decrypted records. ");
+        s.push_str("Required before any read/write/search operation.\n");
+        s.push_str("- **memory_lock**: Lock the store and destroy the index. ");
+        s.push_str("No plaintext persists on disk while locked.\n");
+        s.push_str("- **memory_encryption_status**: Check current lock state.\n");
+        s.push_str("- **memory_list_recipients** / **memory_add_recipient** / ");
+        s.push_str("**memory_remove_recipient**: Manage who can decrypt. ");
+        s.push_str("Adding/removing a recipient re-encrypts all records.\n");
+        s.push_str("\nWhile locked, read/write/search operations return a `locked` error. ");
+        s.push_str("Call `memory_unlock` first.\n");
+    }
+
+    // ── Resources ──
+    s.push_str("\n## Resources\n\n");
+    s.push_str("- `memory://project`: Project handshake (versions, gitDir, reconciliation).\n");
+    s.push_str("- `memory://revision/current`: Current canonical revision.\n");
+    s.push_str("- `memory://index/status`: LanceDB index state.\n");
+    s.push_str("- `memory://model/status`: Embedding model status.\n");
+    s.push_str("- `memory://policy/effective`: Effective transport policy.\n");
+    s.push_str("- `memory://encryption/status`: Encryption mode and lock state.\n");
+    s.push_str("- `memory://records/summary`: Record counts by kind, freshness, archived.\n");
+    s.push_str("- `memory://records/{key}`: Full record by key.\n\n");
+
+    // ── Guidelines ──
+    s.push_str("## Working with Memory\n\n");
+    s.push_str("1. **Read before write**: Always `memory_get_record` or `memory_list_records` ");
+    s.push_str("to get the current `expected_revision` before `apply_transaction`.\n");
+    s.push_str("2. **One transaction, one logical change**: Batch related puts/deletes ");
+    s.push_str("in a single transaction for atomicity.\n");
+    s.push_str("3. **Checkpoint after significant changes**: Use `memory_checkpoint` ");
+    s.push_str("with a descriptive message after a logical group of transactions.\n");
+    s.push_str("4. **Use metadata_only for lists**: When listing records for display, ");
+    s.push_str("set `metadata_only: true` to avoid transferring full content.\n");
+    s.push_str("5. **After resource update notifications**: Re-read ");
+    s.push_str("`memory://revision/current` to stay in sync.\n");
+
+    s
+}
+
 #[allow(clippy::too_many_lines)]
 fn list_tools() -> Value {
     let mut tools = vec![
         tool(
             "memory_apply_transaction",
-            "Atomically apply one bulk put/delete transaction",
+            "Create, update, or delete records atomically. Pass expected_revision from last read.",
             object_schema(
                 &[
                     ("transaction_id", string_schema()),
@@ -716,7 +1508,7 @@ fn list_tools() -> Value {
         ),
         tool(
             "memory_get_record",
-            "Read one record from an immutable revision",
+            "Fetch one record by key — returns full Envelope (content, links, extensions). Use when you know the exact key.",
             object_schema(
                 &[("key", string_schema()), ("revision", string_schema())],
                 &["key", "revision"],
@@ -724,8 +1516,22 @@ fn list_tools() -> Value {
         ),
         tool(
             "memory_list_records",
-            "List records from an immutable revision",
-            object_schema(&[("revision", string_schema())], &[]),
+            "List records with pagination, filters (kind/tags/archived/freshness), sorting and metadata-only mode. Response includes counts by kind/freshness/archived. Use metadata_only=true for UI lists.",
+            object_schema(
+                &[
+                    ("revision", string_schema()),
+                    ("limit", json!({"type":"integer","minimum":1,"maximum":200,"default":50})),
+                    ("offset", json!({"type":"integer","minimum":0,"default":0})),
+                    ("kind", string_schema()),
+                    ("tags", json!({"type":"array","items":{"type":"string"}})),
+                    ("archived", json!({"type":"boolean"})),
+                    ("freshness", json!({"type":"array","items":{"type":"string","enum":["fresh","stale","unverified","invalid"]}})),
+                    ("sort", json!({"type":"string","enum":["key","kind","title","freshness","archived"],"default":"key"})),
+                    ("sort_order", json!({"type":"string","enum":["asc","desc"],"default":"asc"})),
+                    ("metadata_only", json!({"type":"boolean","default":false})),
+                ],
+                &[],
+            ),
         ),
         tool(
             "memory_checkpoint",
@@ -784,7 +1590,7 @@ fn list_tools() -> Value {
         ),
         tool(
             "memory_search",
-            "Full-text search the derived Memory index with filters and pagination",
+            "Full-text search across all records with filters. Use when you need to find records by content, not by key. Returns ranked hits.",
             object_schema(
                 &[
                     ("query", string_schema()),
@@ -830,18 +1636,60 @@ fn list_tools() -> Value {
             object_schema(&[], &[]),
         ),
     ];
-    for (name, description) in [
-        ("memory_reindex", "Rebuild the derived Memory index"),
-        (
-            "memory_transport_status",
-            "Report Memory remote exchange status",
+    tools.push(tool("memory_reindex", "Rebuild the LanceDB search index from canonical records. Use after corruption or manual Git operations.", object_schema(&[], &[])));
+    tools.push(tool("memory_transport_status", "Check if a memory remote is configured and report sync status.", object_schema(&[], &[])));
+    tools.push(tool("memory_fetch", "Pull memory refs from the configured remote and merge records into local store.", object_schema(&[], &[])));
+    tools.push(tool(
+        "memory_push",
+        "Push memory refs to the configured remote",
+        object_schema(&[("force", json!({"type": "boolean", "default": false}))], &[]),
+    ));
+    tools.push(tool("memory_model_status", "Report embedding model status", object_schema(&[], &[])));
+    tools.push(tool(
+        "memory_unlock",
+        "Unlock the encrypted store with an SSH identity and rebuild the ephemeral index",
+        object_schema(&[("identity_path", string_schema())], &["identity_path"]),
+    ));
+    tools.push(tool(
+        "memory_lock",
+        "Lock the encrypted store and destroy the ephemeral index (no plaintext persists on disk)",
+        object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_init_encrypted",
+        "Initialize the encrypted store with the first recipient. Pass both your SSH private key path (to unlock) and your public key (as recipient). Creates a backup identity — persist it outside the repo.",
+        object_schema(
+            &[
+                ("identity_path", string_schema()),
+                ("recipient_public_key", string_schema()),
+                ("key_type", json!({"type":"string","enum":["ssh","x25519"],"default":"ssh"})),
+                ("label", string_schema()),
+            ],
+            &["identity_path", "recipient_public_key"],
         ),
-        ("memory_fetch", "Fetch from the configured Memory remote"),
-        ("memory_push", "Push to the configured Memory remote"),
-        ("memory_model_status", "Report embedding model status"),
-    ] {
-        tools.push(tool(name, description, object_schema(&[], &[])));
-    }
+    ));
+    tools.push(tool(
+        "memory_list_recipients",
+        "List all recipients in the encrypted manifest",
+        object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_add_recipient",
+        "Add a recipient and re-encrypt all records (requires unlock)",
+        object_schema(
+            &[
+                ("public_key", string_schema()),
+                ("key_type", json!({"type":"string","enum":["ssh","x25519"],"default":"ssh"})),
+                ("label", string_schema()),
+            ],
+            &["public_key"],
+        ),
+    ));
+    tools.push(tool(
+        "memory_remove_recipient",
+        "Remove a recipient, re-encrypt all records, and rebuild the index",
+        object_schema(&[("public_key", string_schema())], &["public_key"]),
+    ));
     json!({"tools": tools})
 }
 
@@ -877,6 +1725,7 @@ fn policy_resource() -> Value {
     json!({"schemaVersion": 1, "policies": policies})
 }
 
+#[allow(dead_code)]
 fn unavailable(capability: &'static str, planned_spec: &'static str) -> ToolCallFailure {
     ToolFailure {
         kind: "capability_unavailable".to_owned(),
@@ -932,6 +1781,16 @@ fn parse_field<T: serde::de::DeserializeOwned>(
     serde_json::from_value(raw).map_err(|_| RpcFailure::invalid_argument(field))
 }
 
+fn freshness_str(state: git_memory_core::FreshnessState) -> &'static str {
+    use git_memory_core::FreshnessState;
+    match state {
+        FreshnessState::Fresh => "fresh",
+        FreshnessState::Stale => "stale",
+        FreshnessState::Unverified => "unverified",
+        FreshnessState::Invalid => "invalid",
+    }
+}
+
 fn resource_not_found(uri: &str) -> RpcFailure {
     RpcFailure::new(
         -32_602,
@@ -945,6 +1804,10 @@ fn rpc_result(id: Value, result: Value) -> Value {
 }
 
 fn rpc_error(id: Value, code: i64, message: &str, data: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
+}
+
+fn rpc_error_owned(id: Value, code: i64, message: &String, data: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
 }
 
@@ -987,15 +1850,15 @@ impl ToolOutcome {
 #[derive(Debug)]
 struct RpcFailure {
     code: i64,
-    message: &'static str,
+    message: String,
     data: Value,
 }
 
 impl RpcFailure {
-    const fn new(code: i64, message: &'static str, data: Value) -> Self {
+    fn new(code: i64, message: impl Into<String>, data: Value) -> Self {
         Self {
             code,
-            message,
+            message: message.into(),
             data,
         }
     }
@@ -1043,7 +1906,7 @@ impl RpcFailure {
             .data
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or(self.message)
+            .unwrap_or(&self.message)
             .to_owned();
         let data = self.data.get("data").cloned().unwrap_or_else(|| {
             let mut data = self.data.as_object().cloned().unwrap_or_default();
@@ -1113,6 +1976,13 @@ fn snake_store_kind(kind: git_memory_store::StoreErrorKind) -> &'static str {
         StoreErrorKind::TransactionReused => "transaction_reused",
         StoreErrorKind::Repository => "repository",
         StoreErrorKind::RetryExhausted => "retry_exhausted",
+        StoreErrorKind::FastForwardRequired => "fast_forward_required",
+        StoreErrorKind::Diverged => "diverged",
+        StoreErrorKind::AuthenticationFailed => "authentication_failed",
+        StoreErrorKind::NamespaceRejected => "namespace_rejected",
+        StoreErrorKind::TransportFailed => "transport_failed",
+        StoreErrorKind::SignatureInvalid => "signature_invalid",
+        StoreErrorKind::MergeConflict => "merge_conflict",
     }
 }
 

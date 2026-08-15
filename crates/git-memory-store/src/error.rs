@@ -17,6 +17,13 @@ pub enum StoreErrorKind {
     TransactionReused,
     Repository,
     RetryExhausted,
+    FastForwardRequired,
+    Diverged,
+    AuthenticationFailed,
+    NamespaceRejected,
+    TransportFailed,
+    SignatureInvalid,
+    MergeConflict,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

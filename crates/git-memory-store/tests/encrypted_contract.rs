@@ -5,7 +5,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use git_memory_crypto::{Identity, generate_backup_identity};
+use git_memory_crypto::{generate_backup_identity, Identity};
 use git_memory_store::{EncryptedStore, RecipientEntry};
 use tempfile::TempDir;
 
@@ -34,14 +34,23 @@ fn recipient_entry(recipient: &age::x25519::Recipient, label: &str) -> Recipient
 /// Set up a store: init repo, open, init with owner recipient, unlock.
 fn setup_store(
     dir: &TempDir,
-    owner: &(age::x25519::Identity, age::x25519::Recipient),
+    identity: &age::x25519::Identity,
+    recipient: &age::x25519::Recipient,
 ) -> EncryptedStore {
     let mut store = EncryptedStore::open_locked(dir.path()).expect("open");
-    store.unlock(box_identity(&owner.0)).expect("unlock");
+    store.unlock(box_identity(identity)).expect("unlock");
     let _init_result = store
-        .init(vec![recipient_entry(&owner.1, "owner")])
+        .init(vec![recipient_entry(recipient, "owner")])
         .expect("init");
     store
+}
+
+/// Back-compat wrapper for existing tests that pass `&(identity, recipient)`.
+fn setup_store_owner(
+    dir: &TempDir,
+    owner: &(age::x25519::Identity, age::x25519::Recipient),
+) -> EncryptedStore {
+    setup_store(dir, &owner.0, &owner.1)
 }
 
 fn make_envelope(key: &str, content: &str) -> git_memory_core::Envelope {
@@ -52,7 +61,7 @@ fn make_envelope(key: &str, content: &str) -> git_memory_core::Envelope {
 fn full_round_trip() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     store
@@ -88,7 +97,7 @@ fn locked_store_rejects_reads_and_writes() {
 fn unlock_with_wrong_identity_fails_when_manifest_exists() {
     let dir = init_repo();
     let owner = make_identity();
-    let _store = setup_store(&dir, &owner);
+    let _store = setup_store_owner(&dir, &owner);
 
     // Reopen and try to unlock with wrong identity.
     let mut store2 = EncryptedStore::open_locked(dir.path()).expect("open");
@@ -114,7 +123,7 @@ fn unlock_succeeds_when_no_manifest_exists() {
 fn list_returns_all_records() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     store
@@ -141,7 +150,7 @@ fn list_returns_all_records() {
 fn delete_removes_record() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     store
@@ -163,7 +172,7 @@ fn delete_removes_record() {
 fn update_record_replaces_old_content() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     store
@@ -196,7 +205,7 @@ fn update_record_replaces_old_content() {
 fn lock_blocks_access_then_unlock_restores() {
     let dir = init_repo();
     let owner = make_identity();
-    let mut store = setup_store(&dir, &owner);
+    let mut store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     store
@@ -221,7 +230,7 @@ fn lock_blocks_access_then_unlock_restores() {
 fn add_recipient_grants_access() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     store
@@ -251,7 +260,7 @@ fn remove_recipient_blocks_new_data() {
     let dir = init_repo();
     let owner = make_identity();
     let bob = make_identity();
-    let store = setup_store_with_recipients(&dir, &owner, &[&bob]);
+    let store = setup_store_pair_with_recipients(&dir, &owner, &[&bob]);
 
     // Both can read.
     let rev = store.current_revision().expect("revision");
@@ -297,7 +306,7 @@ fn remove_recipient_blocks_new_data() {
 fn init_rejects_duplicate() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     // Second init must fail.
     let result = store.init(vec![recipient_entry(&owner.1, "owner")]);
@@ -379,7 +388,7 @@ fn init_generates_backup_identity_for_recovery() {
 fn remove_last_recipient_fails() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     // After init there are 2 recipients: owner + auto-generated backup.
     // Remove the backup first — the owner is still a recipient and can
@@ -405,7 +414,7 @@ fn list_recipients_shows_all() {
     let dir = init_repo();
     let owner = make_identity();
     let bob = make_identity();
-    let store = setup_store_with_recipients(&dir, &owner, &[&bob]);
+    let store = setup_store_pair_with_recipients(&dir, &owner, &[&bob]);
 
     // owner + bob + auto-generated backup = 3 recipients.
     let recipients = store.list_recipients().expect("list recipients");
@@ -418,7 +427,7 @@ fn git_tree_contains_no_plaintext() {
 
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     let env = make_envelope("secret-key", "this is sensitive content");
@@ -444,7 +453,7 @@ fn git_tree_contains_no_plaintext() {
 fn apply_with_empty_puts_and_deletes_is_noop() {
     let dir = init_repo();
     let owner = make_identity();
-    let store = setup_store(&dir, &owner);
+    let store = setup_store_owner(&dir, &owner);
 
     let rev = store.current_revision().expect("revision");
     let result = store.apply("tx-empty", rev, &[], &[]);
@@ -452,7 +461,7 @@ fn apply_with_empty_puts_and_deletes_is_noop() {
 }
 
 /// Helper: set up a store with multiple recipients.
-fn setup_store_with_recipients(
+fn setup_store_pair_with_recipients(
     dir: &TempDir,
     owner: &(age::x25519::Identity, age::x25519::Recipient),
     others: &[&(age::x25519::Identity, age::x25519::Recipient)],
@@ -583,4 +592,282 @@ fn ssh_commit_signing_produces_gpgsig_header() {
 
     // Also verify the specific signed commit we found.
     let _ = signed_commit_hash;
+}
+
+mod encrypted_transport {
+    use super::*;
+    use git_memory_store::{write_remote_config, MemoryRemote};
+    use std::process::Command;
+
+    fn bare_remote() -> TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(dir.path())
+            .output()
+            .expect("git init --bare");
+        dir
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENC_PUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn put_encrypted(store: &EncryptedStore, key: &str, content: &str) {
+        let seq = ENC_PUT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let rev = store.current_revision().expect("current revision");
+        store
+            .apply(
+                &format!("put-{key}-{seq}"),
+                rev,
+                &[(key, make_envelope(key, content))],
+                &[],
+            )
+            .expect("apply put");
+    }
+
+    #[test]
+    fn encrypted_fetch_fast_forward_from_empty() {
+        let (alice_id, alice_recip) = make_identity();
+        let alice_dir = init_repo();
+        let alice_store = setup_store(&alice_dir, &alice_id, &alice_recip);
+
+        // Alice writes a record and pushes.
+        put_encrypted(&alice_store, "decision/auth", "Use OAuth2");
+
+        let remote_dir = bare_remote();
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        write_remote_config(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+        )
+        .expect("write remote config");
+        git_memory_store::push_to_remote(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+            false,
+        )
+        .expect("push");
+
+        // Bob creates a new store and fetches.
+        let bob_dir = init_repo();
+        let mut bob_store = EncryptedStore::open_locked(bob_dir.path()).expect("open");
+        bob_store.unlock(box_identity(&alice_id)).expect("unlock");
+        // Bob needs a manifest to read — init with same recipient.
+        let _ = bob_store
+            .init(vec![recipient_entry(&alice_recip, "owner")])
+            .expect("init");
+
+        write_remote_config(
+            bob_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+        )
+        .expect("write remote config");
+
+        let result = bob_store
+            .fetch_and_merge(
+                &MemoryRemote {
+                    url: remote_url,
+                    refspec: None,
+                },
+                &[],
+            )
+            .expect("fetch and merge");
+
+        assert!(result.fast_forward || result.merged);
+        assert!(result.conflicts.is_empty());
+
+        // Bob should be able to read the fetched record.
+        let envelope = bob_store
+            .get("decision/auth")
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(envelope.content, "Use OAuth2");
+    }
+
+    #[test]
+    fn encrypted_fetch_merges_different_keys() {
+        let (alice_id, alice_recip) = make_identity();
+        let alice_dir = init_repo();
+        let alice_store = setup_store(&alice_dir, &alice_id, &alice_recip);
+
+        // Alice writes alpha and pushes.
+        put_encrypted(&alice_store, "alpha", "alice alpha");
+
+        let remote_dir = bare_remote();
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        write_remote_config(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+        )
+        .expect("write remote config");
+        git_memory_store::push_to_remote(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+            false,
+        )
+        .expect("push");
+
+        // Bob sets up and fetches alpha.
+        let bob_dir = init_repo();
+        let mut bob_store = EncryptedStore::open_locked(bob_dir.path()).expect("open");
+        bob_store.unlock(box_identity(&alice_id)).expect("unlock");
+        let _ = bob_store
+            .init(vec![recipient_entry(&alice_recip, "owner")])
+            .expect("init");
+
+        write_remote_config(
+            bob_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+        )
+        .expect("write remote config");
+        bob_store
+            .fetch_and_merge(
+                &MemoryRemote {
+                    url: remote_url.clone(),
+                    refspec: None,
+                },
+                &[],
+            )
+            .expect("fetch");
+
+        // Bob writes beta locally.
+        put_encrypted(&bob_store, "beta", "bob beta");
+
+        // Alice writes gamma and pushes.
+        put_encrypted(&alice_store, "gamma", "alice gamma");
+        git_memory_store::push_to_remote(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+            false,
+        )
+        .expect("push");
+
+        // Bob fetches — should merge gamma.
+        let result = bob_store
+            .fetch_and_merge(
+                &MemoryRemote {
+                    url: remote_url,
+                    refspec: None,
+                },
+                &[],
+            )
+            .expect("fetch and merge");
+
+        assert!(result.merged || result.fast_forward);
+        assert!(result.conflicts.is_empty());
+
+        // Bob should have all three records.
+        let alpha = bob_store.get("alpha").expect("get").expect("alpha exists");
+        assert_eq!(alpha.content, "alice alpha");
+        let beta = bob_store.get("beta").expect("get").expect("beta exists");
+        assert_eq!(beta.content, "bob beta");
+        let gamma = bob_store.get("gamma").expect("get").expect("gamma exists");
+        assert_eq!(gamma.content, "alice gamma");
+    }
+
+    #[test]
+    fn encrypted_fetch_same_key_conflict() {
+        let (alice_id, alice_recip) = make_identity();
+        let alice_dir = init_repo();
+        let alice_store = setup_store(&alice_dir, &alice_id, &alice_recip);
+
+        // Alice writes shared and pushes.
+        put_encrypted(&alice_store, "shared", "alice version");
+
+        let remote_dir = bare_remote();
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        write_remote_config(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+        )
+        .expect("write remote config");
+        git_memory_store::push_to_remote(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+            false,
+        )
+        .expect("push");
+
+        // Bob fetches.
+        let bob_dir = init_repo();
+        let mut bob_store = EncryptedStore::open_locked(bob_dir.path()).expect("open");
+        bob_store.unlock(box_identity(&alice_id)).expect("unlock");
+        let _ = bob_store
+            .init(vec![recipient_entry(&alice_recip, "owner")])
+            .expect("init");
+        write_remote_config(
+            bob_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+        )
+        .expect("write remote config");
+        bob_store
+            .fetch_and_merge(
+                &MemoryRemote {
+                    url: remote_url.clone(),
+                    refspec: None,
+                },
+                &[],
+            )
+            .expect("fetch");
+
+        // Both modify same key.
+        put_encrypted(&alice_store, "shared", "alice updated");
+        git_memory_store::push_to_remote(
+            alice_store.git_dir(),
+            &MemoryRemote {
+                url: remote_url.clone(),
+                refspec: None,
+            },
+            false,
+        )
+        .expect("push");
+        put_encrypted(&bob_store, "shared", "bob updated");
+
+        // Bob fetches — conflict expected.
+        let result = bob_store
+            .fetch_and_merge(
+                &MemoryRemote {
+                    url: remote_url,
+                    refspec: None,
+                },
+                &[],
+            )
+            .expect("fetch and merge");
+
+        assert!(!result.conflicts.is_empty());
+        let conflict = &result.conflicts[0];
+        assert_eq!(conflict.key, "shared");
+        assert_ne!(conflict.local_content_hash, conflict.remote_content_hash);
+    }
 }

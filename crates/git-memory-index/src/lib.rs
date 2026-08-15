@@ -10,23 +10,38 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use arrow_array::{
-    Array, BooleanArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    Array, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+    StringArray, builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fs2::FileExt;
 use futures::TryStreamExt;
-use git_memory_core::StoredRecord;
+use git_memory_core::{Envelope, StoredRecord};
+use git_memory_embed::{
+    EmbeddingProvider, Fingerprint, content_hash_of, render_envelope, renderer::render_envelope_inner,
+};
 use git_memory_store::{ChangeKind, GitStore, RecordId, Revision, Snapshot};
 use lancedb::connection::Connection;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::DistanceType;
 use serde::{Deserialize, Serialize};
 
 const TABLE: &str = "records";
 const META_SCHEMA: u32 = 2;
 const TAGS_DELIMITER: char = '\n';
 const MAX_SEARCH_LIMIT: usize = 200;
+/// BM25 hits below this count trigger the vector rescue channel.
+const RESCUE_THRESHOLD: usize = 5;
+/// Minimum cosine similarity for a vector hit to survive the rescue floor.
+const VECTOR_RESCUE_FLOOR: f64 = 0.35;
+/// RRF fusion constant: `combined = 1/(K+rank_a) + 1/(K+rank_b)`.
+const RRF_K: usize = 60;
+/// Maximum vector candidates fetched before the rescue floor filter.
+const VECTOR_FETCH: usize = 20;
+/// Batch size for embedding during a full rebuild.
+const EMBED_BATCH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +60,8 @@ pub struct ProjectionStatus {
     pub canonical_revision: Option<Revision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_revision: Option<Revision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +182,7 @@ pub struct IndexError {
 }
 
 impl IndexError {
-    fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -190,6 +207,7 @@ impl From<std::io::Error> for IndexError {
 pub struct Projection {
     root: PathBuf,
     connection: Arc<RwLock<Connection>>,
+    embed_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl Projection {
@@ -200,12 +218,27 @@ impl Projection {
     ///
     /// Returns an error when the runtime, catalog, or synchronization fails.
     pub fn synchronize_store(store: &GitStore) -> Result<ProjectionStatus, IndexError> {
+        Self::synchronize_store_with(store, None)
+    }
+
+    /// Synchronous entry point with an optional embedding provider attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, catalog, or synchronization fails.
+    pub fn synchronize_store_with(
+        store: &GitStore,
+        provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Result<ProjectionStatus, IndexError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| IndexError::new(format!("create projection runtime: {error}")))?;
         runtime.block_on(async {
-            let projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            let mut projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            if let Some(provider) = provider {
+                projection = projection.with_embed_provider(provider);
+            }
             projection.synchronize(store).await
         })
     }
@@ -232,12 +265,30 @@ impl Projection {
         store: &GitStore,
         request: &SearchRequest,
     ) -> Result<SearchResult, IndexError> {
+        Self::search_store_with(store, request, None)
+    }
+
+    /// Synchronous entry point for MCP: open the default per-repository
+    /// projection, run a search with an optional embedding provider, and return
+    /// the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, catalog, or search fails.
+    pub fn search_store_with(
+        store: &GitStore,
+        request: &SearchRequest,
+        provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Result<SearchResult, IndexError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| IndexError::new(format!("create search runtime: {error}")))?;
         runtime.block_on(async {
-            let projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            let mut projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            if let Some(provider) = provider {
+                projection = projection.with_embed_provider(provider);
+            }
             projection.search(request).await
         })
     }
@@ -280,7 +331,16 @@ impl Projection {
         Ok(Self {
             root: root.to_path_buf(),
             connection: Arc::new(RwLock::new(connection)),
+            embed_provider: None,
         })
+    }
+
+    /// Attach an embedding provider to enable vector-rescue hybrid search.
+    /// The provider's fingerprint is derived lazily during rebuild/search.
+    #[must_use]
+    pub fn with_embed_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embed_provider = Some(provider);
+        self
     }
 
     /// Report the durable projection state. Missing metadata means lagging,
@@ -314,9 +374,11 @@ impl Projection {
                 .ok()
                 .and_then(|s| s.canonical_revision),
             target_revision: Some(target.clone()),
+            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
         })?;
         let records = snapshot.records().map_err(store_error)?;
-        let batch = batch(&records, &target)?;
+        let (batch, vector_dim) = build_batch_from_records(&records, self.embed_provider.as_ref())
+            .await?;
         let connection = self.connection()?;
         let names = connection
             .table_names()
@@ -329,9 +391,13 @@ impl Projection {
                 .await
                 .map_err(lance_error)?;
         }
+        let schema = match vector_dim {
+            Some(dim) => schema_with_vector(dim),
+            None => schema(),
+        };
         if batch.num_rows() == 0 {
             connection
-                .create_empty_table(TABLE, schema())
+                .create_empty_table(TABLE, schema)
                 .execute()
                 .await
                 .map_err(lance_error)?;
@@ -364,6 +430,7 @@ impl Projection {
             state: ProjectionState::Fresh,
             canonical_revision: Some(target),
             target_revision: None,
+            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
         };
         self.write_status(&status)?;
         Ok(status)
@@ -396,6 +463,7 @@ impl Projection {
             state: ProjectionState::Lagging,
             canonical_revision: Some(from.clone()),
             target_revision: Some(to.clone()),
+            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
         })?;
         let table = self
             .connection()?
@@ -428,20 +496,24 @@ impl Projection {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !updated_records.is_empty() {
+            let (batch, vector_dim) =
+                build_batch_from_records(&updated_records, self.embed_provider.as_ref()).await?;
             let mut merge = table.merge_insert(&["id"]);
             merge
                 .when_matched_update_all(None)
                 .when_not_matched_insert_all();
             merge
-                .execute(reader(batch(&updated_records, to)?))
+                .execute(reader(batch))
                 .await
                 .map_err(lance_error)?;
+            let _ = vector_dim; // schema dimension; merge_insert infers from the batch.
         }
         let status = ProjectionStatus {
             schema_version: META_SCHEMA,
             state: ProjectionState::Fresh,
             canonical_revision: Some(to.clone()),
             target_revision: None,
+            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
         };
         self.write_status(&status)?;
         Ok(status)
@@ -500,8 +572,6 @@ impl Projection {
         }
         let limit = request.limit.clamp(1, MAX_SEARCH_LIMIT);
         let offset = request.offset;
-        // Guard against overflow: offset beyond a reasonable cap is meaningless
-        // and would panic on `fetch = limit + offset + 1`.
         let max_offset = MAX_SEARCH_LIMIT * 100;
         if offset > max_offset {
             return Err(IndexError::new("search offset exceeds maximum"));
@@ -513,10 +583,7 @@ impl Projection {
             .await
             .map_err(lance_error)?;
 
-        // Build SQL predicate from filters.
         let predicate = build_predicate(&request.filters);
-
-        // Over-fetch by one to detect `has_more`.
         let fetch = limit + offset + 1;
 
         let mut query = table
@@ -535,11 +602,6 @@ impl Projection {
             .map_err(lance_error)?;
 
         let mut hits = decode_search_hits(&batches)?;
-        // Apply tag filter in Rust (tags are not indexed in LanceDB SQL).
-        // Post-filtering means `total` and `has_more` are lower bounds, not
-        // exact counts, when tag filters are active — LanceDB may have more
-        // matching rows beyond the over-fetch window that also pass the tag
-        // filter. Without tag filters the counts are exact.
         if !request.filters.tags.is_empty() {
             hits.retain(|hit| {
                 request
@@ -549,26 +611,72 @@ impl Projection {
                     .all(|tag| hit.tags.iter().any(|t| t == tag))
             });
         }
+
+        let fts_count = hits.len();
+        let mut mode = SearchMode::Fts;
+        let degraded = self.embed_provider.is_none();
+
+        if let Some(ref provider) = self.embed_provider {
+            let active_fp = provider_fingerprint(provider);
+            let fp_matches = status.fingerprint.as_deref() == Some(active_fp.as_str());
+            if !fp_matches {
+                eprintln!(
+                    "git-memory: projection fingerprint mismatch — vector rescue skipped"
+                );
+            } else if fts_count < RESCUE_THRESHOLD {
+                let query_text = apply_prefix(provider.query_prefix(), &request.query);
+                let query_vectors = provider
+                    .embed(&[query_text])
+                    .await
+                    .map_err(|error| IndexError::new(format!("embed query: {error}")))?;
+                let query_vector = query_vectors
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| IndexError::new("embed query returned no vector"))?;
+                let mut vq = table
+                    .query()
+                    .nearest_to(query_vector)
+                    .map_err(lance_error)?
+                    .distance_type(DistanceType::Cosine)
+                    .limit(VECTOR_FETCH);
+                if let Some(ref predicate) = predicate {
+                    vq = vq.only_if(predicate);
+                }
+                let v_batches = vq
+                    .execute()
+                    .await
+                    .map_err(lance_error)?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(lance_error)?;
+                let mut vec_hits = decode_vector_hits(&v_batches)?;
+                if !request.filters.tags.is_empty() {
+                    vec_hits.retain(|hit| {
+                        request
+                            .filters
+                            .tags
+                            .iter()
+                            .all(|tag| hit.tags.iter().any(|t| t == tag))
+                    });
+                }
+                if !vec_hits.is_empty() {
+                    mode = SearchMode::Hybrid;
+                    hits = rrf_fuse(hits, vec_hits);
+                }
+            }
+        }
+
         let filtered_total = hits.len();
         let has_more = filtered_total > limit + offset;
-        let page: Vec<SearchHit> = hits
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|mut hit| {
-                // Normalise: combined_rank equals fts_score when no vector channel.
-                hit.combined_rank = hit.fts_score.unwrap_or(0.0);
-                hit
-            })
-            .collect();
+        let page: Vec<SearchHit> = hits.into_iter().skip(offset).take(limit).collect();
         Ok(SearchResult {
             hits: page,
             total: filtered_total,
             limit,
             offset,
             has_more,
-            mode: SearchMode::Fts,
-            degraded: true,
+            mode,
+            degraded,
             revision: request.revision.clone(),
         })
     }
@@ -622,6 +730,7 @@ impl Projection {
             state: ProjectionState::Corrupt,
             canonical_revision: None,
             target_revision: Some(snapshot.revision().clone()),
+            fingerprint: None,
         })?;
         let lance = self.root.join("lance");
         if lance.exists() {
@@ -635,6 +744,188 @@ impl Projection {
             .write()
             .map_err(|_| IndexError::new("projection connection lock is poisoned"))? = connection;
         self.rebuild_unlocked(snapshot).await
+    }
+
+    /// Destroy the ephemeral projection — delete the LanceDB directory and
+    /// status file so no plaintext persists on disk.
+    ///
+    /// Used by encrypted projects on `lock()`: the index is rebuilt from
+    /// decrypted records on the next `unlock()`, so it must not survive on
+    /// disk while locked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the filesystem delete fails.
+    pub async fn destroy(&self) -> Result<(), IndexError> {
+        let _lock = self.write_lock_async().await?;
+        let lance = self.root.join("lance");
+        if lance.exists() {
+            fs::remove_dir_all(&lance)?;
+        }
+        let status = self.status_path();
+        let _ = fs::remove_file(&status);
+        let tmp = self.root.join("status.json.tmp");
+        let _ = fs::remove_file(&tmp);
+        Ok(())
+    }
+
+    /// Synchronous wrapper: destroy the default per-repository projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime or destroy fails.
+    pub fn destroy_store(store: &GitStore) -> Result<(), IndexError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| IndexError::new(format!("create destroy runtime: {error}")))?;
+        runtime.block_on(async {
+            let projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            projection.destroy().await
+        })
+    }
+
+    /// Crash-safe destroy: remove the index directory directly without opening
+    /// LanceDB. Used on encrypted-project start to wipe any plaintext left by a
+    /// process that was killed before `memory_lock` could run. Unlike
+    /// [`destroy_store`](Self::destroy_store), this never opens a catalog, so a
+    /// corrupt or half-written index from a crash is removed rather than
+    /// failing to open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the directory exists but cannot be removed.
+    pub fn destroy_store_silent(store: &GitStore) -> Result<(), IndexError> {
+        let root = store.git_dir().join("git-memory/index");
+        if root.exists() {
+            fs::remove_dir_all(&root)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the projection from pre-decrypted envelopes.
+    ///
+    /// Used by encrypted projects on `unlock()`: the canonical Git snapshot
+    /// contains encrypted blobs, so the standard `rebuild` (which reads
+    /// plaintext records from the snapshot) cannot be used. Instead, the
+    /// caller decrypts all records via `EncryptedStore::list()` and passes
+    /// the resulting `(key, envelope)` pairs here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog or derived table fails.
+    pub async fn rebuild_from_envelopes(
+        &self,
+        records: &[(String, Envelope)],
+        revision: &Revision,
+    ) -> Result<ProjectionStatus, IndexError> {
+        let _lock = self.write_lock_async().await?;
+        self.write_status(&ProjectionStatus {
+            schema_version: META_SCHEMA,
+            state: ProjectionState::Rebuilding,
+            canonical_revision: self
+                .read_status_unlocked()
+                .ok()
+                .and_then(|s| s.canonical_revision),
+            target_revision: Some(revision.clone()),
+            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+        })?;
+        let (batch, vector_dim) =
+            build_batch_from_envelopes(records, self.embed_provider.as_ref()).await?;
+        let connection = self.connection()?;
+        let names = connection
+            .table_names()
+            .execute()
+            .await
+            .map_err(lance_error)?;
+        if names.iter().any(|name| name == TABLE) {
+            connection
+                .drop_table(TABLE, &[])
+                .await
+                .map_err(lance_error)?;
+        }
+        let schema = match vector_dim {
+            Some(dim) => schema_with_vector(dim),
+            None => schema(),
+        };
+        if batch.num_rows() == 0 {
+            connection
+                .create_empty_table(TABLE, schema)
+                .execute()
+                .await
+                .map_err(lance_error)?;
+        } else {
+            connection
+                .create_table(TABLE, reader(batch))
+                .execute()
+                .await
+                .map_err(lance_error)?;
+        }
+        if !records.is_empty() {
+            let table = connection
+                .open_table(TABLE)
+                .execute()
+                .await
+                .map_err(lance_error)?;
+            for column in ["title", "content", "kind"] {
+                table
+                    .create_index(
+                        &[column],
+                        LanceIndex::FTS(FtsIndexBuilder::default().with_position(true)),
+                    )
+                    .execute()
+                    .await
+                    .map_err(lance_error)?;
+            }
+        }
+        let status = ProjectionStatus {
+            schema_version: META_SCHEMA,
+            state: ProjectionState::Fresh,
+            canonical_revision: Some(revision.clone()),
+            target_revision: None,
+            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+        };
+        self.write_status(&status)?;
+        Ok(status)
+    }
+
+    /// Synchronous wrapper: rebuild the default per-repository projection
+    /// from decrypted envelopes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, catalog, or rebuild fails.
+    pub fn rebuild_from_envelopes_store(
+        store: &GitStore,
+        records: &[(String, Envelope)],
+        revision: &Revision,
+    ) -> Result<ProjectionStatus, IndexError> {
+        Self::rebuild_from_envelopes_store_with(store, records, revision, None)
+    }
+
+    /// Synchronous wrapper: rebuild the default per-repository projection
+    /// from decrypted envelopes with an optional embedding provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, catalog, or rebuild fails.
+    pub fn rebuild_from_envelopes_store_with(
+        store: &GitStore,
+        records: &[(String, Envelope)],
+        revision: &Revision,
+        provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Result<ProjectionStatus, IndexError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| IndexError::new(format!("create rebuild runtime: {error}")))?;
+        runtime.block_on(async {
+            let mut projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            if let Some(provider) = provider {
+                projection = projection.with_embed_provider(provider);
+            }
+            projection.rebuild_from_envelopes(records, revision).await
+        })
     }
 
     fn status_path(&self) -> PathBuf {
@@ -728,6 +1019,7 @@ fn read_status_at(root: &Path) -> Result<ProjectionStatus, IndexError> {
             state: ProjectionState::Lagging,
             canonical_revision: None,
             target_revision: None,
+            fingerprint: None,
         }),
         Err(error) => Err(error.into()),
     }
@@ -746,6 +1038,28 @@ fn schema() -> SchemaRef {
     ]))
 }
 
+fn schema_with_vector(dim: usize) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, true),
+        Field::new("title", DataType::Utf8, true),
+        Field::new("content", DataType::Utf8, true),
+        Field::new("archived", DataType::Boolean, false),
+        Field::new("freshness", DataType::Utf8, true),
+        Field::new("tags", DataType::Utf8, true),
+        Field::new("record_json", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            true,
+        ),
+        Field::new("content_hash", DataType::Utf8, true),
+    ]))
+}
+
 struct ProjectionRow<'a> {
     id: String,
     kind: Option<&'a str>,
@@ -755,11 +1069,14 @@ struct ProjectionRow<'a> {
     freshness: Option<String>,
     tags: Option<String>,
     record_json: String,
+    render_text: String,
+    vector: Option<Vec<f32>>,
+    content_hash: Option<String>,
 }
 
 impl<'a> ProjectionRow<'a> {
     fn from_record(id: &RecordId, record: &'a StoredRecord) -> Result<Self, IndexError> {
-        let (kind, title, content, archived, freshness, tags) = match record {
+        let (kind, title, content, archived, freshness, tags, render_text) = match record {
             StoredRecord::Plaintext { envelope } => (
                 Some(envelope.kind.as_str()),
                 envelope.title.as_deref(),
@@ -767,8 +1084,9 @@ impl<'a> ProjectionRow<'a> {
                 envelope.archive.archived,
                 Some(format!("{:?}", envelope.freshness.state).to_ascii_lowercase()),
                 Some(encode_tags(&envelope.tags)),
+                render_envelope(record),
             ),
-            StoredRecord::Encrypted { .. } => (None, None, None, false, None, None),
+            StoredRecord::Encrypted { .. } => (None, None, None, false, None, None, String::new()),
         };
         Ok(Self {
             id: id.display_value(),
@@ -780,51 +1098,170 @@ impl<'a> ProjectionRow<'a> {
             tags,
             record_json: serde_json::to_string(record)
                 .map_err(|error| IndexError::new(format!("serialize projected record: {error}")))?,
+            render_text,
+            vector: None,
+            content_hash: None,
+        })
+    }
+
+    fn from_envelope(key: &str, envelope: &'a Envelope) -> Result<Self, IndexError> {
+        let render_text = render_envelope_inner(envelope);
+        Ok(Self {
+            id: key.to_owned(),
+            kind: Some(envelope.kind.as_str()),
+            title: envelope.title.as_deref(),
+            content: Some(envelope.content.as_str()),
+            archived: envelope.archive.archived,
+            freshness: Some(format!("{:?}", envelope.freshness.state).to_ascii_lowercase()),
+            tags: Some(encode_tags(&envelope.tags)),
+            record_json: serde_json::to_string(envelope)
+                .map_err(|error| IndexError::new(format!("serialize projected record: {error}")))?,
+            render_text,
+            vector: None,
+            content_hash: None,
         })
     }
 }
 
-fn batch(records: &[(RecordId, StoredRecord)], _: &Revision) -> Result<RecordBatch, IndexError> {
-    let rows = records
+async fn build_batch_from_records(
+    records: &[(RecordId, StoredRecord)],
+    provider: Option<&Arc<dyn EmbeddingProvider>>,
+) -> Result<(RecordBatch, Option<usize>), IndexError> {
+    let mut rows = records
         .iter()
         .map(|(id, record)| ProjectionRow::from_record(id, record))
         .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(
-        schema(),
-        vec![
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| &row.id),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.title).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.content).collect::<Vec<_>>(),
-            )),
-            Arc::new(
-                rows.iter()
-                    .map(|row| row.archived)
-                    .collect::<BooleanArray>(),
-            ),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.freshness.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.tags.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| &row.record_json),
-            )),
-        ],
-    )
-    .map_err(|error| IndexError::new(format!("build projection batch: {error}")))
+    if let Some(provider) = provider {
+        let dim = embed_rows(provider, &mut rows).await?;
+        Ok((batch_from_rows(&rows, Some(dim))?, Some(dim)))
+    } else {
+        Ok((batch_from_rows(&rows, None)?, None))
+    }
+}
+
+async fn build_batch_from_envelopes(
+    records: &[(String, Envelope)],
+    provider: Option<&Arc<dyn EmbeddingProvider>>,
+) -> Result<(RecordBatch, Option<usize>), IndexError> {
+    let mut rows = records
+        .iter()
+        .map(|(key, envelope)| ProjectionRow::from_envelope(key, envelope))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(provider) = provider {
+        let dim = embed_rows(provider, &mut rows).await?;
+        Ok((batch_from_rows(&rows, Some(dim))?, Some(dim)))
+    } else {
+        Ok((batch_from_rows(&rows, None)?, None))
+    }
+}
+
+/// Embed the render text of each row in batches, attaching the resulting
+/// vector and content hash. Returns the provider's output dimension.
+async fn embed_rows(
+    provider: &Arc<dyn EmbeddingProvider>,
+    rows: &mut [ProjectionRow<'_>],
+) -> Result<usize, IndexError> {
+    let dim = provider.dimensions();
+    let doc_prefix = provider.doc_prefix();
+    let indices: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !row.render_text.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    for chunk in indices.chunks(EMBED_BATCH) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|&i| apply_prefix(doc_prefix, &rows[i].render_text))
+            .collect();
+        let vectors = provider
+            .embed(&texts)
+            .await
+            .map_err(|error| IndexError::new(format!("embed records: {error}")))?;
+        for (offset, &row_idx) in chunk.iter().enumerate() {
+            if let Some(vector) = vectors.get(offset) {
+                if vector.len() == dim {
+                    rows[row_idx].vector = Some(vector.clone());
+                }
+            }
+            rows[row_idx].content_hash = Some(content_hash_of(&rows[row_idx].render_text));
+        }
+    }
+    Ok(dim)
+}
+
+fn batch_from_rows(rows: &[ProjectionRow<'_>], vector_dim: Option<usize>) -> Result<RecordBatch, IndexError> {
+    let schema = match vector_dim {
+        Some(dim) => schema_with_vector(dim),
+        None => schema(),
+    };
+    let mut columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|row| &row.id),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.title).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.content).collect::<Vec<_>>(),
+        )),
+        Arc::new(
+            rows.iter()
+                .map(|row| row.archived)
+                .collect::<BooleanArray>(),
+        ),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.freshness.as_deref())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.tags.as_deref())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|row| &row.record_json),
+        )),
+    ];
+    if let Some(dim) = vector_dim {
+        columns.push(Arc::new(build_vector_array(rows, dim)));
+        columns.push(Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.content_hash.as_deref())
+                .collect::<Vec<_>>(),
+        )));
+    }
+    RecordBatch::try_new(schema, columns)
+        .map_err(|error| IndexError::new(format!("build projection batch: {error}")))
+}
+
+fn build_vector_array(rows: &[ProjectionRow<'_>], dim: usize) -> FixedSizeListArray {
+    let mut builder = FixedSizeListBuilder::with_capacity(
+        Float32Builder::new(),
+        dim as i32,
+        rows.len(),
+    );
+    for row in rows {
+        match &row.vector {
+            Some(vector) if vector.len() == dim => {
+                for value in vector {
+                    builder.values().append_value(*value);
+                }
+                builder.append(true);
+            }
+            _ => {
+                for _ in 0..dim {
+                    builder.values().append_null();
+                }
+                builder.append(false);
+            }
+        }
+    }
+    builder.finish()
 }
 
 fn reader(batch: RecordBatch) -> Box<dyn arrow_array::RecordBatchReader + Send> {
@@ -895,9 +1332,10 @@ fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
             .column_by_name("archived")
             .and_then(|value| value.as_any().downcast_ref::<BooleanArray>())
             .ok_or_else(|| IndexError::new("search column `archived` is corrupt"))?;
-        // LanceDB adds `_distance` for FTS results (Float32, negative BM25).
+        // LanceDB adds `_score` for FTS results (BM25 score, Float32).
         let distance = batch
             .column_by_name("_distance")
+            .or_else(|| batch.column_by_name("_score"))
             .and_then(|value| value.as_any().downcast_ref::<Float32Array>());
         for row in 0..batch.num_rows() {
             let optional =
@@ -906,10 +1344,7 @@ fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
                 .and_then(|array| (!array.is_null(row)).then(|| decode_tags(array.value(row))))
                 .unwrap_or_default();
             let fts_score = distance.and_then(|array| {
-                (!array.is_null(row)).then(|| {
-                    // LanceDB stores BM25 as negative _distance; negate for rank.
-                    f64::from(-array.value(row))
-                })
+                (!array.is_null(row)).then(|| f64::from(array.value(row)))
             });
             hits.push(SearchHit {
                 id: ids.value(row).to_owned(),
@@ -921,7 +1356,7 @@ fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
                 tags,
                 fts_score,
                 vector_score: None,
-                combined_rank: 0.0,
+                combined_rank: fts_score.unwrap_or(0.0),
             });
         }
     }
@@ -1107,6 +1542,135 @@ fn lance_error(error: impl fmt::Display) -> IndexError {
 }
 fn store_error(error: impl fmt::Display) -> IndexError {
     IndexError::new(format!("canonical Git Memory read failed: {error}"))
+}
+
+/// Derive the active fingerprint digest for a provider. Uses the provider's
+/// `model_id` as the model digest — the projection layer does not have access
+/// to the verified GGUF SHA-256, so the model id serves as a stable proxy.
+fn provider_fingerprint(provider: &Arc<dyn EmbeddingProvider>) -> String {
+    Fingerprint::from_provider(&**provider, provider.model_id()).digest()
+}
+
+/// Prepend a prefix (if present) to a text string.
+fn apply_prefix(prefix: Option<&str>, text: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{p}{text}"),
+        _ => text.to_owned(),
+    }
+}
+
+/// Decode vector kNN result batches into search hits. Applies the cosine
+/// similarity floor: hits with `similarity < VECTOR_RESCUE_FLOOR` are
+/// discarded.
+fn decode_vector_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexError> {
+    let mut hits = Vec::new();
+    for batch in batches {
+        let strings = |name: &str| -> Result<&StringArray, IndexError> {
+            batch
+                .column_by_name(name)
+                .and_then(|value| value.as_any().downcast_ref())
+                .ok_or_else(|| IndexError::new(format!("search column `{name}` is corrupt")))
+        };
+        let ids = strings("id")?;
+        let kinds = strings("kind")?;
+        let titles = strings("title")?;
+        let contents = strings("content")?;
+        let freshness = strings("freshness")?;
+        let tags_col = batch
+            .column_by_name("tags")
+            .and_then(|value| value.as_any().downcast_ref::<StringArray>());
+        let archived = batch
+            .column_by_name("archived")
+            .and_then(|value| value.as_any().downcast_ref::<BooleanArray>())
+            .ok_or_else(|| IndexError::new("search column `archived` is corrupt"))?;
+        let distance = batch
+            .column_by_name("_distance")
+            .and_then(|value| value.as_any().downcast_ref::<Float32Array>());
+        for row in 0..batch.num_rows() {
+            let optional =
+                |array: &StringArray| (!array.is_null(row)).then(|| array.value(row).to_owned());
+            let tags = tags_col
+                .and_then(|array| (!array.is_null(row)).then(|| decode_tags(array.value(row))))
+                .unwrap_or_default();
+            // Cosine distance: 0 = identical, 2 = opposite.
+            // similarity = 1.0 - distance.
+            let vector_score = distance.and_then(|array| {
+                (!array.is_null(row)).then(|| {
+                    let dist = f64::from(array.value(row));
+                    1.0 - dist
+                })
+            });
+            let Some(score) = vector_score else { continue };
+            if score < VECTOR_RESCUE_FLOOR {
+                continue;
+            }
+            hits.push(SearchHit {
+                id: ids.value(row).to_owned(),
+                kind: optional(kinds),
+                title: optional(titles),
+                content: optional(contents),
+                archived: archived.value(row),
+                freshness: optional(freshness),
+                tags,
+                fts_score: None,
+                vector_score: Some(score),
+                combined_rank: score,
+            });
+        }
+    }
+    hits.sort_by(|left, right| {
+        let left_score = left.vector_score.unwrap_or(0.0);
+        let right_score = right.vector_score.unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(hits)
+}
+
+/// Reciprocal Rank Fusion of BM25 and vector hits.
+///
+/// `combined_rank = 1/(K+bm25_rank) + 1/(K+vec_rank)` where a hit absent from
+/// one channel contributes nothing for that term. Higher is better.
+fn rrf_fuse(fts_hits: Vec<SearchHit>, vec_hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    use std::collections::HashMap;
+    let mut fts_rank: HashMap<String, (usize, SearchHit)> = HashMap::new();
+    for (rank, hit) in fts_hits.into_iter().enumerate() {
+        fts_rank.insert(hit.id.clone(), (rank, hit));
+    }
+    let mut vec_rank: HashMap<String, (usize, SearchHit)> = HashMap::new();
+    for (rank, hit) in vec_hits.into_iter().enumerate() {
+        vec_rank.insert(hit.id.clone(), (rank, hit));
+    }
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    ids.extend(fts_rank.keys().cloned());
+    ids.extend(vec_rank.keys().cloned());
+    let mut fused: Vec<SearchHit> = ids
+        .into_iter()
+        .map(|id| {
+            let fts = fts_rank.get(&id);
+            let vec = vec_rank.get(&id);
+            let mut hit = fts
+                .map(|(_, h)| h.clone())
+                .or_else(|| vec.map(|(_, h)| h.clone()))
+                .unwrap_or_else(|| panic!("rrf_fuse: id present in neither channel"));
+            let fts_term = fts.map(|(r, _)| 1.0 / (RRF_K + r) as f64).unwrap_or(0.0);
+            let vec_term = vec.map(|(r, _)| 1.0 / (RRF_K + r) as f64).unwrap_or(0.0);
+            hit.fts_score = fts.and_then(|(_, h)| h.fts_score);
+            hit.vector_score = vec.and_then(|(_, h)| h.vector_score);
+            hit.combined_rank = fts_term + vec_term;
+            hit
+        })
+        .collect();
+    fused.sort_by(|left, right| {
+        right
+            .combined_rank
+            .partial_cmp(&left.combined_rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    fused
 }
 
 #[cfg(test)]
