@@ -11,21 +11,23 @@ use std::sync::{Arc, RwLock};
 
 use arrow_array::{
     Array, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
-    StringArray, builder::{FixedSizeListBuilder, Float32Builder},
+    StringArray,
+    builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fs2::FileExt;
 use futures::TryStreamExt;
 use git_memory_core::{Envelope, StoredRecord};
 use git_memory_embed::{
-    EmbeddingProvider, Fingerprint, content_hash_of, render_envelope, renderer::render_envelope_inner,
+    EmbeddingProvider, Fingerprint, content_hash_of, render_envelope,
+    renderer::render_envelope_inner,
 };
 use git_memory_store::{ChangeKind, GitStore, RecordId, Revision, Snapshot};
+use lancedb::DistanceType;
 use lancedb::connection::Connection;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::DistanceType;
 use serde::{Deserialize, Serialize};
 
 const TABLE: &str = "records";
@@ -374,11 +376,14 @@ impl Projection {
                 .ok()
                 .and_then(|s| s.canonical_revision),
             target_revision: Some(target.clone()),
-            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+            fingerprint: self
+                .embed_provider
+                .as_ref()
+                .map(|p| provider_fingerprint(p)),
         })?;
         let records = snapshot.records().map_err(store_error)?;
-        let (batch, vector_dim) = build_batch_from_records(&records, self.embed_provider.as_ref())
-            .await?;
+        let (batch, vector_dim) =
+            build_batch_from_records(&records, self.embed_provider.as_ref()).await?;
         let connection = self.connection()?;
         let names = connection
             .table_names()
@@ -430,7 +435,10 @@ impl Projection {
             state: ProjectionState::Fresh,
             canonical_revision: Some(target),
             target_revision: None,
-            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+            fingerprint: self
+                .embed_provider
+                .as_ref()
+                .map(|p| provider_fingerprint(p)),
         };
         self.write_status(&status)?;
         Ok(status)
@@ -463,7 +471,10 @@ impl Projection {
             state: ProjectionState::Lagging,
             canonical_revision: Some(from.clone()),
             target_revision: Some(to.clone()),
-            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+            fingerprint: self
+                .embed_provider
+                .as_ref()
+                .map(|p| provider_fingerprint(p)),
         })?;
         let table = self
             .connection()?
@@ -502,10 +513,7 @@ impl Projection {
             merge
                 .when_matched_update_all(None)
                 .when_not_matched_insert_all();
-            merge
-                .execute(reader(batch))
-                .await
-                .map_err(lance_error)?;
+            merge.execute(reader(batch)).await.map_err(lance_error)?;
             let _ = vector_dim; // schema dimension; merge_insert infers from the batch.
         }
         let status = ProjectionStatus {
@@ -513,7 +521,10 @@ impl Projection {
             state: ProjectionState::Fresh,
             canonical_revision: Some(to.clone()),
             target_revision: None,
-            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+            fingerprint: self
+                .embed_provider
+                .as_ref()
+                .map(|p| provider_fingerprint(p)),
         };
         self.write_status(&status)?;
         Ok(status)
@@ -620,9 +631,7 @@ impl Projection {
             let active_fp = provider_fingerprint(provider);
             let fp_matches = status.fingerprint.as_deref() == Some(active_fp.as_str());
             if !fp_matches {
-                eprintln!(
-                    "git-memory: projection fingerprint mismatch — vector rescue skipped"
-                );
+                eprintln!("git-memory: projection fingerprint mismatch — vector rescue skipped");
             } else if fts_count < RESCUE_THRESHOLD {
                 let query_text = apply_prefix(provider.query_prefix(), &request.query);
                 let query_vectors = provider
@@ -828,7 +837,10 @@ impl Projection {
                 .ok()
                 .and_then(|s| s.canonical_revision),
             target_revision: Some(revision.clone()),
-            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+            fingerprint: self
+                .embed_provider
+                .as_ref()
+                .map(|p| provider_fingerprint(p)),
         })?;
         let (batch, vector_dim) =
             build_batch_from_envelopes(records, self.embed_provider.as_ref()).await?;
@@ -883,7 +895,10 @@ impl Projection {
             state: ProjectionState::Fresh,
             canonical_revision: Some(revision.clone()),
             target_revision: None,
-            fingerprint: self.embed_provider.as_ref().map(|p| provider_fingerprint(p)),
+            fingerprint: self
+                .embed_provider
+                .as_ref()
+                .map(|p| provider_fingerprint(p)),
         };
         self.write_status(&status)?;
         Ok(status)
@@ -1190,7 +1205,10 @@ async fn embed_rows(
     Ok(dim)
 }
 
-fn batch_from_rows(rows: &[ProjectionRow<'_>], vector_dim: Option<usize>) -> Result<RecordBatch, IndexError> {
+fn batch_from_rows(
+    rows: &[ProjectionRow<'_>],
+    vector_dim: Option<usize>,
+) -> Result<RecordBatch, IndexError> {
     let schema = match vector_dim {
         Some(dim) => schema_with_vector(dim),
         None => schema(),
@@ -1240,11 +1258,8 @@ fn batch_from_rows(rows: &[ProjectionRow<'_>], vector_dim: Option<usize>) -> Res
 }
 
 fn build_vector_array(rows: &[ProjectionRow<'_>], dim: usize) -> FixedSizeListArray {
-    let mut builder = FixedSizeListBuilder::with_capacity(
-        Float32Builder::new(),
-        dim as i32,
-        rows.len(),
-    );
+    let mut builder =
+        FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim as i32, rows.len());
     for row in rows {
         match &row.vector {
             Some(vector) if vector.len() == dim => {
@@ -1343,9 +1358,8 @@ fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
             let tags = tags_col
                 .and_then(|array| (!array.is_null(row)).then(|| decode_tags(array.value(row))))
                 .unwrap_or_default();
-            let fts_score = distance.and_then(|array| {
-                (!array.is_null(row)).then(|| f64::from(array.value(row)))
-            });
+            let fts_score = distance
+                .and_then(|array| (!array.is_null(row)).then(|| f64::from(array.value(row))));
             hits.push(SearchHit {
                 id: ids.value(row).to_owned(),
                 kind: optional(kinds),

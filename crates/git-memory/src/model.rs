@@ -727,3 +727,203 @@ impl DoctorModelStatus {
         }
     }
 }
+
+/// `git memory setup` — first-run wizard.
+///
+/// 1. Checks if binary is accessible
+/// 2. Shows available models with the platform default highlighted
+/// 3. Downloads the selected model with progress bar
+/// 4. Sets it as active in config
+/// 5. Runs doctor for final verification
+pub(crate) fn setup(output: Output) -> Code {
+    let active = config::resolve_active_model();
+    let platform_default = git_memory_embed::platform_default_model();
+    let opts = DownloadOpts::default();
+
+    // Collect model info for display
+    let models: Vec<(&ModelEntry, bool)> = all_models()
+        .iter()
+        .map(|entry| {
+            let on_disk = matches!(
+                verify_model_sync(*entry, &opts),
+                Ok(ModelVerification::Present { .. })
+            );
+            (*entry, on_disk)
+        })
+        .collect();
+
+    match output {
+        Output::Json => {
+            let models_json: Vec<serde_json::Value> = models
+                .iter()
+                .map(|(entry, on_disk)| {
+                    serde_json::json!({
+                        "id": entry.id,
+                        "display_name": entry.display_name,
+                        "dimensions": entry.dimensions,
+                        "size_bytes": entry.size_bytes,
+                        "on_disk": on_disk,
+                        "is_platform_default": entry.id == platform_default.id,
+                        "is_active": entry.id == active.id,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "setup": true,
+                    "platform_default": platform_default.id,
+                    "active_model": active.id,
+                    "models": models_json,
+                })
+            );
+            // In JSON mode, download the platform default if not on disk.
+            if !skip_model_check(&models, platform_default.id) {
+                run_setup_download(platform_default.id, output);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::json!({"setup_complete": true, "model": platform_default.id, "already_on_disk": true})
+                );
+            }
+        }
+        Output::Human => {
+            println!("Git Memory Setup Wizard");
+            println!("=======================");
+            println!();
+
+            // Check if binary is accessible
+            println!("1. Checking installation...");
+            let exe = std::env::current_exe();
+            match &exe {
+                Ok(path) => {
+                    println!("   Binary: {}", path.display());
+                }
+                Err(error) => {
+                    println!("   Warning: could not determine binary path: {error}");
+                }
+            }
+            println!();
+
+            // Show models
+            println!("2. Available models:");
+            for (entry, on_disk) in &models {
+                let default_marker = if entry.id == platform_default.id {
+                    " (platform default)"
+                } else {
+                    ""
+                };
+                let active_marker = if entry.id == active.id {
+                    " [active]"
+                } else {
+                    ""
+                };
+                let disk_marker = if *on_disk { " [on disk]" } else { "" };
+                println!(
+                    "   - {}{}{}{}",
+                    entry.display_name, default_marker, active_marker, disk_marker
+                );
+                println!(
+                    "     id: {}, dimensions: {}, size: {:.1} MB",
+                    entry.id,
+                    entry.dimensions,
+                    entry.size_bytes as f64 / 1_048_576.0
+                );
+            }
+            println!();
+
+            // Select model — use platform default, or the first one on disk.
+            let selected_id = if active.id != platform_default.id
+                || !models
+                    .iter()
+                    .any(|(e, on_disk)| e.id == active.id && *on_disk)
+            {
+                platform_default.id.to_owned()
+            } else {
+                active.id.to_owned()
+            };
+
+            // Check if already on disk
+            let already_downloaded = models
+                .iter()
+                .any(|(entry, on_disk)| entry.id == selected_id && *on_disk);
+
+            if already_downloaded {
+                println!("3. Model '{}' is already on disk.", selected_id);
+                if let Err(error) = config::set_active_model(&selected_id) {
+                    eprintln!("git-memory: failed to set active model: {error}");
+                    return Code::Internal;
+                }
+                println!("   Set as active model.");
+            } else {
+                println!("3. Downloading model '{}'...", selected_id);
+                let result = download(&selected_id, output);
+                if matches!(result, Code::Success) {
+                    if let Err(error) = config::set_active_model(&selected_id) {
+                        eprintln!("git-memory: failed to set active model: {error}");
+                        return Code::Internal;
+                    }
+                    println!("   Model '{}' set as active.", selected_id);
+                } else {
+                    println!("   Model download failed. MCP will run in FTS-only mode.");
+                    println!(
+                        "   You can retry later with: git memory model download {}",
+                        selected_id
+                    );
+                }
+            }
+            println!();
+
+            // Run doctor
+            println!("4. Running doctor check...");
+            let report = crate::doctor::inspect(None);
+            if report.is_healthy() {
+                println!("   All checks passed.");
+            } else {
+                println!("   Some checks failed — see doctor output above.");
+            }
+
+            println!();
+            println!("Setup complete!");
+            println!("Run 'git memory mcp' to start the MCP server.");
+        }
+    }
+    Code::Success
+}
+
+/// Check if the platform default model is already on disk.
+fn skip_model_check(models: &[(&ModelEntry, bool)], model_id: &str) -> bool {
+    models
+        .iter()
+        .any(|(entry, on_disk)| entry.id == model_id && *on_disk)
+}
+
+/// Download and set a model as active in JSON mode.
+fn run_setup_download(model_id: &str, output: Output) {
+    let result = download(model_id, output);
+    if matches!(result, Code::Success) {
+        let _ = config::set_active_model(model_id);
+        println!(
+            "{}",
+            serde_json::json!({"setup_complete": true, "model": model_id})
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::json!({"setup_complete": false, "model": model_id, "error": "download failed"})
+        );
+    }
+}
+
+/// Check if any model is on disk. Used by the MCP server to print a first-run
+/// hint when no model is available.
+#[must_use]
+pub(crate) fn any_model_on_disk() -> bool {
+    let opts = DownloadOpts::default();
+    all_models().iter().any(|entry| {
+        matches!(
+            verify_model_sync(*entry, &opts),
+            Ok(ModelVerification::Present { .. })
+        )
+    })
+}

@@ -1,0 +1,160 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin git-memory
+
+      - name: Strip binary (Linux)
+        if: runner.os == 'Linux'
+        run: strip target/${{ matrix.target }}/release/git-memory
+
+      - name: Create archive
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/git-memory staging/
+          cp README.md staging/
+          cp LICENSE staging/ 2>/dev/null || true
+          cp install.sh staging/
+          tar -czf git-memory-${{ matrix.target }}.tar.gz -C staging .
+
+      - name: Generate checksum
+        run: shasum -a 256 git-memory-${{ matrix.target }}.tar.gz >> checksums.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-memory-${{ matrix.target }}
+          path: |
+            git-memory-${{ matrix.target }}.tar.gz
+            checksums.txt
+
+  sbom:
+    name: sbom / dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-sbom
+      - name: Generate cargo-deny advisories report
+        run: |
+          cargo install cargo-deny --locked --version ^0.16 || true
+          cargo deny check advisories --format json > sbom-advisories.json 2>/dev/null || true
+          cargo deny check licenses --format json > sbom-licenses.json 2>/dev/null || true
+      - name: Generate dependency tree
+        run: cargo tree --workspace --all-features > dependency-tree.txt
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-advisories.json
+            sbom-licenses.json
+            dependency-tree.txt
+
+  contract-test:
+    name: contract / release binary
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-contract
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: git-memory-x86_64-unknown-linux-gnu
+          path: release-artifacts
+
+      - name: Extract binary
+        run: |
+          mkdir -p bin
+          tar -xzf release-artifacts/git-memory-x86_64-unknown-linux-gnu.tar.gz -C bin
+          chmod +x bin/git-memory
+
+      - name: Run contract tests against release binary
+        run: |
+          cargo test --locked -p git-memory-contract --test release_binary_contract -- --nocapture
+        env:
+          GIT_MEMORY_RELEASE_BINARY: ${{ github.workspace }}/bin/git-memory
+
+  release:
+    name: publish / github release
+    needs: [build, sbom, contract-test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge checksums
+        run: |
+          find artifacts -name "checksums.txt" -exec cat {} \; | sort -u > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*/git-memory-*.tar.gz
+            checksums.txt
+            artifacts/sbom/sbom-advisories.json
+            artifacts/sbom/sbom-licenses.json
+            artifacts/sbom/dependency-tree.txt
+            install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -17,6 +17,7 @@ use git_memory_crypto::load_ssh_identity;
 use git_memory_embed::{EmbeddingProvider, ModelRuntime, ModelStatusBuilder};
 use git_memory_index::{IndexError, Projection, SearchFilters, SearchRequest};
 use git_memory_reconcile::{DivergenceMode, ReconcileError, ReconcileErrorKind, Reconciler};
+use git_memory_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition};
 use git_memory_store::{
     EncryptedStore, GitStore, Operation, RecordId, Revision, StoreError, Transaction,
     is_encrypted_project,
@@ -24,6 +25,9 @@ use git_memory_store::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+
+mod schema_instructions;
+pub use schema_instructions::{schema_instructions, schema_resource, single_type_resource};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const MEMORY_INTERFACE_MAJOR: u16 = 1;
@@ -74,17 +78,17 @@ fn serve_io(project: PathBuf, input: impl BufRead, mut output: impl Write) -> io
     Ok(())
 }
 
-struct Session {
-    project: PathBuf,
-    initialized: bool,
-    revision_subscribed: bool,
-    reconciliation: Value,
-    encrypted_store: Option<EncryptedStore>,
-    embed_provider: Option<Arc<dyn EmbeddingProvider>>,
+pub struct Session {
+    pub project: PathBuf,
+    pub initialized: bool,
+    pub revision_subscribed: bool,
+    pub reconciliation: Value,
+    pub encrypted_store: Option<EncryptedStore>,
+    pub embed_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl Session {
-    fn new(project: PathBuf) -> Self {
+    pub fn new(project: PathBuf) -> Self {
         let encrypted_store = is_encrypted_project(&project)
             .unwrap_or(false)
             .then(|| EncryptedStore::open_locked(&project).ok())
@@ -175,7 +179,7 @@ impl Session {
         }))
     }
 
-    fn initialize(&mut self, params: &Value) -> Result<Value, RpcFailure> {
+    pub fn initialize(&mut self, params: &Value) -> Result<Value, RpcFailure> {
         let requested_protocol = required_string(params, "protocolVersion")?;
         if requested_protocol != MCP_PROTOCOL_VERSION {
             return Err(RpcFailure::new(
@@ -222,6 +226,12 @@ impl Session {
         }
         let handshake = self.handshake();
         self.initialized = true;
+        let encryption_mode = if self.is_encrypted() {
+            "encrypted"
+        } else {
+            "plaintext"
+        };
+        let instructions = self.composed_instructions(encryption_mode);
         Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {
@@ -230,7 +240,7 @@ impl Session {
                 "experimental": {"gitMemory": handshake}
             },
             "serverInfo": {"name": "git-memory", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": builtin_instructions(if self.is_encrypted() { "encrypted" } else { "plaintext" }),
+            "instructions": instructions,
             "_meta": {"gitMemory": handshake}
         }))
     }
@@ -264,7 +274,60 @@ impl Session {
         })
     }
 
-    fn store(&self) -> Result<GitStore, RpcFailure> {
+    /// Compose built-in instructions with project-specific schema text.
+    ///
+    /// Loads the schema registry from the current revision. When type records
+    /// exist, appends a `## Document Types` section after the built-in
+    /// conductor. When the registry is empty, only the built-in text is sent.
+    fn composed_instructions(&self, encryption_mode: &str) -> String {
+        let mut text = builtin_instructions(encryption_mode);
+        if let Ok(registry) = self.load_schema_registry() {
+            let schema_text = schema_instructions::schema_instructions(&registry);
+            if !schema_text.is_empty() {
+                text.push_str(&schema_text);
+            }
+        }
+        text
+    }
+
+    /// Load the schema registry from the current revision.
+    ///
+    /// For encrypted projects, builds the registry from decrypted records via
+    /// [`EncryptedStore`]. For plaintext projects, loads from the Git snapshot.
+    fn load_schema_registry(&self) -> Result<SchemaRegistry, RpcFailure> {
+        if self.is_encrypted() {
+            let store = self
+                .require_unlocked_encrypted()
+                .map_err(|e| RpcFailure::new(-32_602, e.message, e.data))?;
+            store.list().map_err(RpcFailure::store).and_then(|records| {
+                let definitions = records
+                    .iter()
+                    .filter(|(_, envelope)| envelope.kind == TYPE_KIND)
+                    .filter_map(|(_, envelope)| {
+                        TypeDefinition::from_content(&envelope.content).ok()
+                    })
+                    .collect::<Vec<_>>();
+                SchemaRegistry::from_type_definitions(definitions).map_err(|error| {
+                    RpcFailure::new(
+                        -32_603,
+                        "schema registry could not be built",
+                        json!({
+                            "field": error.field,
+                            "reason": error.message,
+                        }),
+                    )
+                })
+            })
+        } else {
+            let store = self.store()?;
+            let snapshot = store.current().map_err(RpcFailure::store)?;
+            store
+                .load_schema_registry(snapshot.revision())
+                .map_err(RpcFailure::store)
+        }
+    }
+
+    pub fn store(&self) -> Result<GitStore, RpcFailure> {
         GitStore::open(&self.project).map_err(RpcFailure::store)
     }
 
@@ -294,25 +357,20 @@ impl Session {
         if let Some(store) = self.encrypted_store.as_ref()
             && store.is_unlocked()
         {
-            let records = store.list().map_err(|e| {
-                IndexError::new(format!("decrypt records for index rebuild: {e}"))
-            })?;
-            let revision = store.current_revision().map_err(|e| {
-                IndexError::new(format!("read current revision for index: {e}"))
-            })?;
-            let git_store = GitStore::open(&self.project).map_err(|e| {
-                IndexError::new(format!("open store for index rebuild: {e}"))
-            })?;
+            let records = store
+                .list()
+                .map_err(|e| IndexError::new(format!("decrypt records for index rebuild: {e}")))?;
+            let revision = store
+                .current_revision()
+                .map_err(|e| IndexError::new(format!("read current revision for index: {e}")))?;
+            let git_store = GitStore::open(&self.project)
+                .map_err(|e| IndexError::new(format!("open store for index rebuild: {e}")))?;
             Projection::rebuild_from_envelopes_store_with(
-                &git_store,
-                &records,
-                &revision,
-                provider,
+                &git_store, &records, &revision, provider,
             )?;
         } else {
-            let store = GitStore::open(&self.project).map_err(|e| {
-                IndexError::new(format!("open store for index sync: {e}"))
-            })?;
+            let store = GitStore::open(&self.project)
+                .map_err(|e| IndexError::new(format!("open store for index sync: {e}")))?;
             Projection::synchronize_store_with(&store, provider)?;
         }
         Ok(())
@@ -336,7 +394,7 @@ impl Session {
         Ok(json!({}))
     }
 
-    fn read_resource(&self, params: &Value) -> Result<Value, RpcFailure> {
+    pub fn read_resource(&self, params: &Value) -> Result<Value, RpcFailure> {
         let uri = required_string(params, "uri")?;
         let content = match uri {
             "memory://project" => {
@@ -363,8 +421,18 @@ impl Session {
             "memory://policy/effective" => policy_resource(),
             "memory://encryption/status" => self.encryption_status(),
             "memory://records/summary" => self.records_summary()?,
+            "memory://schema" => {
+                let registry = self.load_schema_registry()?;
+                schema_instructions::schema_resource(&registry)
+            }
             _ => {
-                if let Some(key) = uri.strip_prefix("memory://records/") {
+                if let Some(kind) = uri.strip_prefix("memory://schema/") {
+                    let registry = self.load_schema_registry()?;
+                    match registry.get(kind) {
+                        Some(definition) => schema_instructions::single_type_resource(definition),
+                        None => return Err(resource_not_found(uri)),
+                    }
+                } else if let Some(key) = uri.strip_prefix("memory://records/") {
                     if key == "summary" {
                         return Err(resource_not_found(uri));
                     }
@@ -454,7 +522,11 @@ impl Session {
         }
     }
 
-    fn execute_tool(&mut self, name: &str, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+    fn execute_tool(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<ToolOutcome, ToolCallFailure> {
         match name {
             "memory_apply_transaction" => self.apply_transaction(arguments),
             "memory_get_record" => self.get_record(arguments),
@@ -480,6 +552,8 @@ impl Session {
             "memory_list_recipients" => self.list_recipients(),
             "memory_add_recipient" => self.add_recipient(arguments),
             "memory_remove_recipient" => self.remove_recipient(arguments),
+            "memory_list_types" => self.list_types(),
+            "memory_schema_status" => self.schema_status(),
             _ => Err(ToolCallFailure::Rpc(RpcFailure::new(
                 -32_602,
                 "tool not found",
@@ -512,11 +586,9 @@ impl Session {
 
     fn records_summary(&self) -> Result<Value, RpcFailure> {
         let (revision, envelopes): (Revision, Vec<(String, Envelope)>) = if self.is_encrypted() {
-            let store = self.require_unlocked_encrypted().map_err(|e| RpcFailure::new(
-                -32_602,
-                e.message,
-                e.data,
-            ))?;
+            let store = self
+                .require_unlocked_encrypted()
+                .map_err(|e| RpcFailure::new(-32_602, e.message, e.data))?;
             let records = store.list().map_err(RpcFailure::store)?;
             let rev = store.current_revision().map_err(RpcFailure::store)?;
             (rev, records)
@@ -528,17 +600,17 @@ impl Session {
             let envelopes = records
                 .into_iter()
                 .filter_map(|(id, record)| match record {
-                    StoredRecord::Plaintext { envelope } => {
-                        Some((id.display_value(), *envelope))
-                    }
+                    StoredRecord::Plaintext { envelope } => Some((id.display_value(), *envelope)),
                     StoredRecord::Encrypted { .. } => None,
                 })
                 .collect();
             (rev, envelopes)
         };
         let total = envelopes.len();
-        let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        let mut by_freshness: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_kind: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut by_freshness: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         let mut archived = 0usize;
         for (_, env) in &envelopes {
             *by_kind.entry(env.kind.clone()).or_default() += 1;
@@ -557,6 +629,95 @@ impl Session {
             "archived": archived,
             "live": total - archived,
         }))
+    }
+
+    pub fn list_types(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        let registry = self.load_schema_registry()?;
+        let types: Vec<Value> = registry
+            .iter()
+            .map(|(_, definition)| {
+                json!({
+                    "kind_name": definition.kind_name,
+                    "description": definition.description,
+                    "field_count": definition.fields.len(),
+                    "relationship_count": definition.relationships.len(),
+                })
+            })
+            .collect();
+        Ok(ToolOutcome::read(json!({
+            "schemaVersion": 1,
+            "typeCount": types.len(),
+            "types": types,
+        })))
+    }
+
+    pub fn schema_status(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        let registry = self.load_schema_registry()?;
+        if registry.is_empty() {
+            return Ok(ToolOutcome::read(json!({
+                "schemaVersion": 1,
+                "schemaActive": false,
+                "totalRecords": 0,
+                "incompatible": [],
+                "message": "No type definitions found — schema validation is inactive."
+            })));
+        }
+        let (revision, envelopes): (Revision, Vec<(String, Envelope)>) = if self.is_encrypted() {
+            let store = self.require_unlocked_encrypted()?;
+            let records = store.list().map_err(RpcFailure::store)?;
+            let rev = store.current_revision().map_err(RpcFailure::store)?;
+            (rev, records)
+        } else {
+            let store = self.store()?;
+            let snapshot = store.current().map_err(RpcFailure::store)?;
+            let rev = snapshot.revision().clone();
+            let records = snapshot.records().map_err(RpcFailure::store)?;
+            let envs = records
+                .into_iter()
+                .filter_map(|(id, record)| match record {
+                    StoredRecord::Plaintext { envelope } => Some((id.display_value(), *envelope)),
+                    StoredRecord::Encrypted { .. } => None,
+                })
+                .collect();
+            (rev, envs)
+        };
+        let mut incompatible: Vec<Value> = Vec::new();
+        let mut total = 0usize;
+        for (key, envelope) in &envelopes {
+            if envelope.kind == TYPE_KIND {
+                continue;
+            }
+            total += 1;
+            if let Some(definition) = registry.get(&envelope.kind) {
+                if let Err(error) = definition.validate(envelope) {
+                    incompatible.push(json!({
+                        "key": key,
+                        "kind": envelope.kind,
+                        "violations": [{
+                            "field": error.field,
+                            "reason": error.message,
+                        }]
+                    }));
+                }
+            } else {
+                incompatible.push(json!({
+                    "key": key,
+                    "kind": envelope.kind,
+                    "violations": [{
+                        "field": "kind",
+                        "reason": format!("kind `{}` has no type definition", envelope.kind),
+                    }]
+                }));
+            }
+        }
+        Ok(ToolOutcome::read(json!({
+            "schemaVersion": 1,
+            "schemaActive": true,
+            "revision": revision,
+            "totalRecords": total,
+            "incompatibleCount": incompatible.len(),
+            "incompatible": incompatible,
+        })))
     }
 
     fn apply_transaction(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
@@ -596,20 +757,25 @@ impl Session {
                         RecordId::Opaque(_) => {
                             return Err(ToolFailure {
                                 kind: "invalid_argument".to_owned(),
-                                message: "encrypted projects delete by semantic key, not opaque id".to_owned(),
+                                message: "encrypted projects delete by semantic key, not opaque id"
+                                    .to_owned(),
                                 data: json!({}),
-                            }.into());
+                            }
+                            .into());
                         }
                     },
                 }
             }
-            let puts_refs: Vec<(&str, Envelope)> = puts
-                .iter()
-                .map(|(k, e)| (k.as_str(), e.clone()))
-                .collect();
+            let puts_refs: Vec<(&str, Envelope)> =
+                puts.iter().map(|(k, e)| (k.as_str(), e.clone())).collect();
             let deletes_refs: Vec<&str> = deletes.iter().map(String::as_str).collect();
             let result = store
-                .apply(&transaction_id, expected_revision, &puts_refs, &deletes_refs)
+                .apply(
+                    &transaction_id,
+                    expected_revision,
+                    &puts_refs,
+                    &deletes_refs,
+                )
                 .map_err(ToolFailure::store)?;
             Ok(ToolOutcome::mutation(json!(result)))
         } else {
@@ -655,10 +821,7 @@ impl Session {
             .and_then(Value::as_u64)
             .unwrap_or(50)
             .min(200) as usize;
-        let offset = arguments
-            .get("offset")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let kind_filter = arguments
             .get("kind")
             .and_then(Value::as_str)
@@ -718,9 +881,7 @@ impl Session {
             let envelopes = records
                 .into_iter()
                 .filter_map(|(id, record)| match record {
-                    StoredRecord::Plaintext { envelope } => {
-                        Some((id.display_value(), *envelope))
-                    }
+                    StoredRecord::Plaintext { envelope } => Some((id.display_value(), *envelope)),
                     StoredRecord::Encrypted { .. } => None,
                 })
                 .collect::<Vec<_>>();
@@ -737,7 +898,9 @@ impl Session {
                     return false;
                 }
                 if !tag_filters.is_empty()
-                    && !tag_filters.iter().all(|tag| env.tags.iter().any(|t| t == tag))
+                    && !tag_filters
+                        .iter()
+                        .all(|tag| env.tags.iter().any(|t| t == tag))
                 {
                     return false;
                 }
@@ -758,8 +921,10 @@ impl Session {
 
         // Compute counts over the full filtered set.
         let total = filtered.len();
-        let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        let mut by_freshness: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut by_kind: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut by_freshness: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         let mut archived_count = 0usize;
         for (_, env) in &filtered {
             *by_kind.entry(env.kind.clone()).or_default() += 1;
@@ -783,7 +948,12 @@ impl Session {
         sorted.sort_by(|a, b| {
             let cmp = match sort_field {
                 "kind" => a.1.kind.cmp(&b.1.kind),
-                "title" => a.1.title.as_deref().unwrap_or("").cmp(b.1.title.as_deref().unwrap_or("")),
+                "title" => {
+                    a.1.title
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b.1.title.as_deref().unwrap_or(""))
+                }
                 "freshness" => {
                     let fa = freshness_str(a.1.freshness.state);
                     let fb = freshness_str(b.1.freshness.state);
@@ -924,10 +1094,7 @@ impl Session {
                 data: e.data,
             })?;
             let status = Projection::rebuild_from_envelopes_store_with(
-                &git_store,
-                &records,
-                &revision,
-                provider,
+                &git_store, &records, &revision, provider,
             )
             .map_err(ToolFailure::index)?;
             Ok(ToolOutcome::read(json!(status)))
@@ -1059,8 +1226,8 @@ impl Session {
         // The index is already synchronized after each mutation (see call_tool),
         // so we search directly. If the index is stale for the requested
         // revision, search_store returns a structured error.
-        let result =
-            Projection::search_store_with(&store, &request, self.provider()).map_err(ToolFailure::index)?;
+        let result = Projection::search_store_with(&store, &request, self.provider())
+            .map_err(ToolFailure::index)?;
         Ok(ToolOutcome::read(json!(result)))
     }
 
@@ -1089,8 +1256,7 @@ impl Session {
     fn transport_status(&self) -> Result<ToolOutcome, ToolCallFailure> {
         let store = self.store()?;
         let git_dir = store.git_dir();
-        let remote = git_memory_store::read_remote_config(git_dir)
-            .map_err(ToolFailure::store)?;
+        let remote = git_memory_store::read_remote_config(git_dir).map_err(ToolFailure::store)?;
         let has_remote = remote.is_some();
         Ok(ToolOutcome::read(json!({
             "remoteConfigured": has_remote,
@@ -1109,8 +1275,8 @@ impl Session {
                 message: "no memory remote configured".to_owned(),
                 data: json!({"recovery_action": "configure_remote_first"}),
             })?;
-        let result = git_memory_store::fetch_and_merge(&store, &remote, &[])
-            .map_err(ToolFailure::store)?;
+        let result =
+            git_memory_store::fetch_and_merge(&store, &remote, &[]).map_err(ToolFailure::store)?;
         let changed = result.local_revision_before != result.local_revision_after;
         Ok(ToolOutcome {
             content: json!({
@@ -1155,8 +1321,7 @@ impl Session {
                 message: "no memory remote configured".to_owned(),
                 data: json!({"recovery_action": "configure_remote_first"}),
             })?;
-        git_memory_store::push_to_remote(&git_dir, &remote, force)
-            .map_err(ToolFailure::store)?;
+        git_memory_store::push_to_remote(&git_dir, &remote, force).map_err(ToolFailure::store)?;
         Ok(ToolOutcome::read(json!({
             "pushed": true,
             "force": force,
@@ -1241,9 +1406,7 @@ impl Session {
             data: json!({}),
         })?;
         store.unlock(identity).map_err(ToolFailure::store)?;
-        let result = store
-            .init(vec![recipient])
-            .map_err(ToolFailure::store)?;
+        let result = store.init(vec![recipient]).map_err(ToolFailure::store)?;
         Ok(ToolOutcome::read(json!({
             "initialized": true,
             "backupIdentity": result.backup_identity,
@@ -1335,7 +1498,7 @@ fn parse_operation(value: &Value) -> Result<Operation, RpcFailure> {
     }
 }
 
-fn list_resources() -> Value {
+pub fn list_resources() -> Value {
     let resources = [
         ("Git Memory project", "memory://project"),
         ("Current revision", "memory://revision/current"),
@@ -1344,6 +1507,7 @@ fn list_resources() -> Value {
         ("Effective policy", "memory://policy/effective"),
         ("Encryption status", "memory://encryption/status"),
         ("Records summary", "memory://records/summary"),
+        ("Document type schema", "memory://schema"),
     ]
     .into_iter()
     .map(|(name, uri)| json!({"name": name, "uri": uri, "mimeType": "application/json"}))
@@ -1351,13 +1515,21 @@ fn list_resources() -> Value {
     json!({"resources": resources})
 }
 
-fn list_resource_templates() -> Value {
-    json!({"resourceTemplates": [{
-        "name": "Memory record",
-        "uriTemplate": "memory://records/{key}",
-        "mimeType": "application/json",
-        "description": "Current canonical record identified by its plaintext key"
-    }]})
+pub fn list_resource_templates() -> Value {
+    json!({"resourceTemplates": [
+        {
+            "name": "Memory record",
+            "uriTemplate": "memory://records/{key}",
+            "mimeType": "application/json",
+            "description": "Current canonical record identified by its plaintext key"
+        },
+        {
+            "name": "Document type definition",
+            "uriTemplate": "memory://schema/{kind_name}",
+            "mimeType": "application/json",
+            "description": "Schema for a single document type"
+        }
+    ]})
 }
 
 /// Built-in agent instructions — describes the storage layer tools, the
@@ -1440,7 +1612,9 @@ fn builtin_instructions(encryption_mode: &str) -> String {
 
     s.push_str("\n### Export / Import\n\n");
     s.push_str("- **memory_export** (`revision`): Export a deterministic record bundle.\n");
-    s.push_str("- **memory_import** (`bundle`): Import records from a bundle in one transaction.\n");
+    s.push_str(
+        "- **memory_import** (`bundle`): Import records from a bundle in one transaction.\n",
+    );
 
     // ── Encryption ──
     if encryption_mode == "encrypted" {
@@ -1489,7 +1663,7 @@ fn builtin_instructions(encryption_mode: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn list_tools() -> Value {
+pub fn list_tools() -> Value {
     let mut tools = vec![
         tool(
             "memory_apply_transaction",
@@ -1520,14 +1694,26 @@ fn list_tools() -> Value {
             object_schema(
                 &[
                     ("revision", string_schema()),
-                    ("limit", json!({"type":"integer","minimum":1,"maximum":200,"default":50})),
+                    (
+                        "limit",
+                        json!({"type":"integer","minimum":1,"maximum":200,"default":50}),
+                    ),
                     ("offset", json!({"type":"integer","minimum":0,"default":0})),
                     ("kind", string_schema()),
                     ("tags", json!({"type":"array","items":{"type":"string"}})),
                     ("archived", json!({"type":"boolean"})),
-                    ("freshness", json!({"type":"array","items":{"type":"string","enum":["fresh","stale","unverified","invalid"]}})),
-                    ("sort", json!({"type":"string","enum":["key","kind","title","freshness","archived"],"default":"key"})),
-                    ("sort_order", json!({"type":"string","enum":["asc","desc"],"default":"asc"})),
+                    (
+                        "freshness",
+                        json!({"type":"array","items":{"type":"string","enum":["fresh","stale","unverified","invalid"]}}),
+                    ),
+                    (
+                        "sort",
+                        json!({"type":"string","enum":["key","kind","title","freshness","archived"],"default":"key"}),
+                    ),
+                    (
+                        "sort_order",
+                        json!({"type":"string","enum":["asc","desc"],"default":"asc"}),
+                    ),
                     ("metadata_only", json!({"type":"boolean","default":false})),
                 ],
                 &[],
@@ -1637,14 +1823,29 @@ fn list_tools() -> Value {
         ),
     ];
     tools.push(tool("memory_reindex", "Rebuild the LanceDB search index from canonical records. Use after corruption or manual Git operations.", object_schema(&[], &[])));
-    tools.push(tool("memory_transport_status", "Check if a memory remote is configured and report sync status.", object_schema(&[], &[])));
-    tools.push(tool("memory_fetch", "Pull memory refs from the configured remote and merge records into local store.", object_schema(&[], &[])));
+    tools.push(tool(
+        "memory_transport_status",
+        "Check if a memory remote is configured and report sync status.",
+        object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_fetch",
+        "Pull memory refs from the configured remote and merge records into local store.",
+        object_schema(&[], &[]),
+    ));
     tools.push(tool(
         "memory_push",
         "Push memory refs to the configured remote",
-        object_schema(&[("force", json!({"type": "boolean", "default": false}))], &[]),
+        object_schema(
+            &[("force", json!({"type": "boolean", "default": false}))],
+            &[],
+        ),
     ));
-    tools.push(tool("memory_model_status", "Report embedding model status", object_schema(&[], &[])));
+    tools.push(tool(
+        "memory_model_status",
+        "Report embedding model status",
+        object_schema(&[], &[]),
+    ));
     tools.push(tool(
         "memory_unlock",
         "Unlock the encrypted store with an SSH identity and rebuild the ephemeral index",
@@ -1679,7 +1880,10 @@ fn list_tools() -> Value {
         object_schema(
             &[
                 ("public_key", string_schema()),
-                ("key_type", json!({"type":"string","enum":["ssh","x25519"],"default":"ssh"})),
+                (
+                    "key_type",
+                    json!({"type":"string","enum":["ssh","x25519"],"default":"ssh"}),
+                ),
                 ("label", string_schema()),
             ],
             &["public_key"],
@@ -1689,6 +1893,16 @@ fn list_tools() -> Value {
         "memory_remove_recipient",
         "Remove a recipient, re-encrypt all records, and rebuild the index",
         object_schema(&[("public_key", string_schema())], &["public_key"]),
+    ));
+    tools.push(tool(
+        "memory_list_types",
+        "List document types defined in this project (from __type__ records). Returns kind_name, description, field_count, relationship_count.",
+        object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_schema_status",
+        "Check all records against the current schema and report incompatible ones. Returns a list of records with validation violations (key, kind, field, reason).",
+        object_schema(&[], &[]),
     ));
     json!({"tools": tools})
 }
@@ -1827,9 +2041,9 @@ fn tool_error(error: ToolFailure) -> Value {
     json!({"content": [{"type": "text", "text": content.to_string()}], "structuredContent": content, "isError": true})
 }
 
-struct ToolOutcome {
-    content: Value,
-    revision_changed: bool,
+pub struct ToolOutcome {
+    pub content: Value,
+    pub revision_changed: bool,
 }
 
 impl ToolOutcome {
@@ -1848,10 +2062,10 @@ impl ToolOutcome {
 }
 
 #[derive(Debug)]
-struct RpcFailure {
-    code: i64,
-    message: String,
-    data: Value,
+pub struct RpcFailure {
+    pub code: i64,
+    pub message: String,
+    pub data: Value,
 }
 
 impl RpcFailure {
@@ -1921,10 +2135,11 @@ impl RpcFailure {
     }
 }
 
-struct ToolFailure {
-    kind: String,
-    message: String,
-    data: Value,
+#[derive(Debug)]
+pub struct ToolFailure {
+    pub kind: String,
+    pub message: String,
+    pub data: Value,
 }
 
 impl ToolFailure {
@@ -1951,7 +2166,8 @@ impl ToolFailure {
     }
 }
 
-enum ToolCallFailure {
+#[derive(Debug)]
+pub enum ToolCallFailure {
     Rpc(RpcFailure),
     Tool(ToolFailure),
 }

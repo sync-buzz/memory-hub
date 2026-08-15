@@ -12,7 +12,7 @@ use git_memory_core::{FreshnessState, PolicyMode, PolicyResolver, StoredRecord};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    GitStore, Operation, RecordId, Revision, StoreError, StoreErrorKind, Transaction, STAGED_REF,
+    GitStore, Operation, RecordId, Revision, STAGED_REF, StoreError, StoreErrorKind, Transaction,
 };
 
 const FETCH_TEMP_REF: &str = "refs/memory/tmp-fetch";
@@ -740,7 +740,7 @@ fn extract_gpgsig(raw: &[u8]) -> (Vec<u8>, Option<String>) {
     // `start` points at the `\n` before `gpgsig `.
     // `header_start` points at `gpgsig `.
     let header_start = start + 1; // skip \n
-                                  // `value_start` points at the first char of the value (after "gpgsig ").
+    // `value_start` points at the first char of the value (after "gpgsig ").
     let value_start = header_start + "gpgsig ".len();
 
     // The rest of the text starting from the first value line.

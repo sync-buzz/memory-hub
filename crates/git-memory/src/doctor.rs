@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use git_memory_reconcile::{DivergenceMode, ReconcileErrorKind, Reconciler};
-use git_memory_store::{read_remote_config, GitStore};
+use git_memory_store::{GitStore, read_remote_config};
 use serde::Serialize;
 
 use crate::model;
@@ -453,7 +453,7 @@ pub(crate) fn render_json(report: &Report) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_failure, inspect, normalized_output, Status, SCHEMA_VERSION};
+    use super::{SCHEMA_VERSION, Status, command_failure, inspect, normalized_output};
 
     #[test]
     fn trims_command_output() {

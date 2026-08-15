@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use age::{Decryptor, Encryptor};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Digest, Sha256};
 
 /// Cipher suite identifier stored in `EncryptedRecord`.

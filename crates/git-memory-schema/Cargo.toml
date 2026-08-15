@@ -1,6 +1,6 @@
 [package]
-name = "git-memory-store"
-description = "Atomic Git object store for Git Memory"
+name = "git-memory-schema"
+description = "Document type definitions, JSON Schema generation and envelope validation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,18 +10,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-base64.workspace = true
 git-memory-core = { path = "../git-memory-core" }
-git-memory-crypto = { path = "../git-memory-crypto" }
-git-memory-schema = { path = "../git-memory-schema" }
-git2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-
-[dev-dependencies]
-age.workspace = true
-tempfile.workspace = true
+jsonschema.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

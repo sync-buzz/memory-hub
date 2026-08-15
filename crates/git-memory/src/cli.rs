@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use git_memory_index::Projection;
 use git_memory_reconcile::{DivergenceMode, Reconciler};
 use git_memory_store::{
-    check_push_policy, fetch_and_merge, push_to_remote, read_remote_config, remove_remote_config,
-    write_remote_config, GitStore, MemoryRemote, StoreErrorKind,
+    GitStore, MemoryRemote, StoreErrorKind, check_push_policy, fetch_and_merge, push_to_remote,
+    read_remote_config, remove_remote_config, write_remote_config,
 };
 
 use crate::doctor;
@@ -77,6 +77,13 @@ enum Command {
         output: Output,
     },
 
+    /// First-run setup wizard: choose and download an embedding model.
+    Setup {
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human)]
+        output: Output,
+    },
+
     /// Manage the memory remote (separate from code origin).
     Remote {
         #[command(subcommand)]
@@ -111,6 +118,34 @@ enum Command {
         /// Force-push (overwrite remote history). Use with caution.
         #[arg(long)]
         force: bool,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human)]
+        output: Output,
+    },
+
+    /// Manage the installation registry (consumers, repositories, uninstall).
+    Registry {
+        #[command(subcommand)]
+        subcommand: RegistryCommand,
+
+        /// Select human-readable or stable JSON output.
+        #[arg(long, value_enum, default_value_t = Output::Human, global = true)]
+        output: Output,
+    },
+
+    /// Uninstall git-memory: list consumers and repositories, then remove
+    /// the installation. Canonical data (refs, config, models) is preserved
+    /// by default — use --purge to remove everything.
+    Uninstall {
+        /// Remove all git-memory data (config, models, registry).
+        /// Without this flag, only the binary is removed from the registry.
+        #[arg(long)]
+        purge: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
 
         /// Select human-readable or stable JSON output.
         #[arg(long, value_enum, default_value_t = Output::Human)]
@@ -168,6 +203,38 @@ enum RemoteCommand {
     Remove,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RegistryCommand {
+    /// Show the installation registry (consumers, repositories, installation).
+    List,
+
+    /// Register a consumer (e.g. "sync") with a required major version.
+    RegisterConsumer {
+        /// Consumer name (e.g. "sync", "custom-client").
+        name: String,
+        /// Required memory interface major version.
+        major: u16,
+    },
+
+    /// Unregister a consumer. Does not delete git-memory or any data.
+    UnregisterConsumer {
+        /// Consumer name to remove.
+        name: String,
+    },
+
+    /// Register a repository path (for uninstall warnings).
+    AddRepository {
+        /// Absolute path to a project repository.
+        path: PathBuf,
+    },
+
+    /// Remove a repository from the registry.
+    RemoveRepository {
+        /// Absolute path to remove.
+        path: PathBuf,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub(crate) enum Output {
     #[default]
@@ -206,6 +273,14 @@ where
                     return Code::Internal;
                 }
             };
+            // First-run hint: if no model is on disk, suggest running setup.
+            if !model::any_model_on_disk() {
+                eprintln!("git-memory: no embedding model found — MCP will run in FTS-only mode.");
+                eprintln!(
+                    "  Run 'git memory setup' to download a model, or 'git memory model list' to see options."
+                );
+                eprintln!();
+            }
             if let Err(error) = git_memory_mcp::serve(&project) {
                 eprintln!("git-memory: MCP server failed: {error}");
                 return Code::Internal;
@@ -296,6 +371,7 @@ where
                 ModelCommand::Benchmark { id } => model::benchmark(&id, output),
             }
         }
+        Command::Setup { output } => model::setup(model::Output::from(output)),
         Command::Remote {
             subcommand,
             project,
@@ -389,7 +465,9 @@ where
             let remote = match read_remote_config(&git_dir) {
                 Ok(Some(remote)) => remote,
                 Ok(None) => {
-                    eprintln!("git-memory: no memory remote configured — run `git memory remote add <url>`");
+                    eprintln!(
+                        "git-memory: no memory remote configured — run `git memory remote add <url>`"
+                    );
                     return Code::Usage;
                 }
                 Err(error) => {
@@ -465,7 +543,9 @@ where
             let remote = match read_remote_config(&git_dir) {
                 Ok(Some(remote)) => remote,
                 Ok(None) => {
-                    eprintln!("git-memory: no memory remote configured — run `git memory remote add <url>`");
+                    eprintln!(
+                        "git-memory: no memory remote configured — run `git memory remote add <url>`"
+                    );
                     return Code::Usage;
                 }
                 Err(error) => {
@@ -520,6 +600,10 @@ where
                     code
                 }
             }
+        }
+        Command::Registry { subcommand, output } => crate::registry_cli::handle(subcommand, output),
+        Command::Uninstall { purge, yes, output } => {
+            crate::registry_cli::handle_uninstall(purge, yes, output)
         }
     }
 }

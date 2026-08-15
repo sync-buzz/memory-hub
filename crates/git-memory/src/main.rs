@@ -3,6 +3,8 @@ mod config;
 mod doctor;
 mod exit;
 mod model;
+mod registry;
+mod registry_cli;
 
 use std::process::ExitCode;
 

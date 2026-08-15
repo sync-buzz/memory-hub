@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "source": "sync-memory",
+  "source_version": "0.7.0",
+  "description": "Migration fixtures from current Sync .sync/ format. Each record is a generic Envelope that maps directly to Git Memory's envelope model.",
+  "records": [
+    {
+      "key": "decisions/mcp-seam",
+      "kind": "decision",
+      "title": "Use MCP as the public seam between Sync and Git Memory",
+      "content": "We chose MCP as the public contract because it is a language-agnostic JSON-RPC protocol that any consumer can speak. Sync and other clients depend on the MCP interface, not on private Rust crates. This allows independent versioning and release cycles.",
+      "tags": ["architecture", "mcp"],
+      "source_paths": ["crates/sync-desktop/src/ipc.rs"],
+      "archive": { "archived": false },
+      "freshness": { "state": "valid" },
+      "extensions": {
+        "rationale_summary": "MCP is the language-agnostic public contract"
+      },
+      "links": [{ "key": "specs/mcp-interface", "relation": "references" }]
+    },
+    {
+      "key": "constraints/no-private-deps",
+      "kind": "constraint",
+      "title": "Consumers must not depend on private Git Memory crates",
+      "content": "Consumers (Sync, third-party tools) must use only the public MCP JSON-RPC interface. They must not add path dependencies on git-memory-store, git-memory-core, or other private crates. This ensures independent release cycles and compatibility guarantees.",
+      "tags": ["architecture", "compatibility"],
+      "source_paths": [],
+      "archive": { "archived": false },
+      "freshness": { "state": "valid" },
+      "extensions": {},
+      "links": []
+    },
+    {
+      "key": "specs/release-artifacts",
+      "kind": "spec",
+      "title": "Release artifacts, compatibility matrix and independent consumer",
+      "content": "Final capstone spec. Proves Git Memory is a standalone product, not path dependencies that happen to compile next to Sync. Ships public contract, artifacts, fixtures and compatibility guarantees.",
+      "tags": ["release", "m4"],
+      "source_paths": ["docs/compatibility-matrix.md"],
+      "archive": { "archived": false },
+      "freshness": { "state": "valid" },
+      "extensions": {
+        "status": "in_progress",
+        "priority": "critical"
+      },
+      "links": [{ "key": "decisions/mcp-seam", "relation": "depends_on" }]
+    },
+    {
+      "key": "observations/contract-harness-exists",
+      "kind": "observation",
+      "title": "git-memory-contract crate already provides black-box behavioral tests",
+      "content": "The git-memory-contract crate ships 9 scenarios: atomic_batch, snapshot_consistency, different_key_race, same_key_conflict, interrupted_write_recovery, history_diff_import_export, search_fts_and_filters, search_pagination, backlinks_explicit_and_mentions. ReleaseBinaryTarget launches the binary via stdio and validates the full MCP lifecycle.",
+      "tags": ["testing"],
+      "source_paths": ["crates/git-memory-contract/"],
+      "archive": { "archived": false },
+      "freshness": { "state": "valid" },
+      "extensions": {},
+      "links": []
+    },
+    {
+      "key": "questions/model-fingerprint-stability",
+      "kind": "question",
+      "title": "Should model fingerprint changes trigger a re-index?",
+      "content": "When the embedding model changes, vector distances become incomparable. Should the server automatically re-index, or should consumers decide? Current design: server reports modelFingerprint in handshake, consumers decide.",
+      "tags": ["search", "model"],
+      "source_paths": [],
+      "archive": { "archived": false },
+      "freshness": { "state": "valid" },
+      "extensions": {},
+      "links": []
+    }
+  ]
+}

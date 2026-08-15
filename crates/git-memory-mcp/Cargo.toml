@@ -15,6 +15,7 @@ git-memory-crypto = { path = "../git-memory-crypto" }
 git-memory-embed = { path = "../git-memory-embed" }
 git-memory-index = { path = "../git-memory-index" }
 git-memory-reconcile = { path = "../git-memory-reconcile" }
+git-memory-schema = { path = "../git-memory-schema" }
 git-memory-store = { path = "../git-memory-store" }
 serde.workspace = true
 serde_json.workspace = true

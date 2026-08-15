@@ -5,7 +5,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use git_memory_crypto::{generate_backup_identity, Identity};
+use git_memory_crypto::{Identity, generate_backup_identity};
 use git_memory_store::{EncryptedStore, RecipientEntry};
 use tempfile::TempDir;
 
@@ -596,7 +596,7 @@ fn ssh_commit_signing_produces_gpgsig_header() {
 
 mod encrypted_transport {
     use super::*;
-    use git_memory_store::{write_remote_config, MemoryRemote};
+    use git_memory_store::{MemoryRemote, write_remote_config};
     use std::process::Command;
 
     fn bare_remote() -> TempDir {

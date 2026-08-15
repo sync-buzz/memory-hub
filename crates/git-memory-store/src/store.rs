@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use git_memory_core::StoredRecord;
+use git_memory_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition};
 use git2::{ErrorCode, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -66,6 +67,7 @@ impl CommitSigner for git_memory_crypto::SshSigner {
 pub struct GitStore {
     git_dir: PathBuf,
     signer: Option<Arc<dyn CommitSigner>>,
+    strict_schema: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -133,6 +135,7 @@ impl GitStore {
         let store = Self {
             git_dir,
             signer: None,
+            strict_schema: true,
         };
         store.ensure_staged()?;
         Ok(store)
@@ -142,6 +145,7 @@ impl GitStore {
         Self {
             git_dir,
             signer: None,
+            strict_schema: true,
         }
     }
 
@@ -150,6 +154,17 @@ impl GitStore {
     #[must_use]
     pub fn with_signer(mut self, signer: Arc<dyn CommitSigner>) -> Self {
         self.signer = Some(signer);
+        self
+    }
+
+    /// Control whether records with unknown kinds are rejected.
+    ///
+    /// When `strict` (the default), a record whose `kind` has no matching
+    /// `__type__` definition is rejected. When `false`, unknown kinds are
+    /// accepted without schema validation.
+    #[must_use]
+    pub fn with_schema_strict(mut self, strict: bool) -> Self {
+        self.strict_schema = strict;
         self
     }
 
@@ -204,6 +219,14 @@ impl GitStore {
         let repository = self.repository()?;
         let expected_oid = transaction.expected_revision.oid()?;
         require_retained_revision(&repository, expected_oid)?;
+
+        // Schema validation: load the registry from the expected revision and
+        // validate every plaintext Put against it before entering the CAS loop.
+        // Encrypted records are validated by EncryptedStore before encryption.
+        // Type records (__type__) are always validated structurally, even when
+        // the registry is empty — a malformed type definition is never accepted.
+        let schema_registry = self.load_schema_registry(&transaction.expected_revision)?;
+        validate_operations_against_schema(&schema_registry, transaction, self.strict_schema)?;
 
         for _ in 0..MAX_CAS_ATTEMPTS {
             let current_oid = current_oid(&repository)?;
@@ -591,6 +614,29 @@ impl GitStore {
         self.read_records(revision)
     }
 
+    /// Load a [`SchemaRegistry`] from all `__type__` records in the given
+    /// revision.
+    ///
+    /// Encrypted records are skipped — the [`EncryptedStore`] validates
+    /// envelopes before encryption, so the Git layer only needs to validate
+    /// plaintext records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the revision cannot be read or a type record
+    /// is malformed.
+    pub fn load_schema_registry(&self, revision: &Revision) -> Result<SchemaRegistry, StoreError> {
+        let records = self.read_records(revision)?;
+        let definitions = filter_type_definitions(&records)?;
+        SchemaRegistry::from_type_definitions(definitions).map_err(schema_registry_error)
+    }
+
+    /// Whether this store rejects records with unknown kinds.
+    #[must_use]
+    pub const fn strict_schema(&self) -> bool {
+        self.strict_schema
+    }
+
     /// Read a single record from a revision without requiring it to be in
     /// the local staged history. Used by the transport merge module.
     ///
@@ -722,6 +768,108 @@ impl StoreError {
             serde_json::json!(format!("{:?}", error.code()).to_ascii_lowercase());
         self
     }
+}
+
+/// Extract and parse `__type__` definitions from a record list.
+///
+/// Encrypted records are skipped — only plaintext `__type__` records can be
+/// validated at the Git layer.
+fn filter_type_definitions(
+    records: &[(RecordId, StoredRecord)],
+) -> Result<Vec<TypeDefinition>, StoreError> {
+    records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            StoredRecord::Plaintext { envelope } if envelope.kind == TYPE_KIND => {
+                Some(TypeDefinition::from_content(&envelope.content))
+            }
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            StoreError::new(
+                StoreErrorKind::InvalidRecord,
+                "type definition record has malformed JSON",
+                serde_json::json!({"detail": error.to_string()}),
+            )
+        })
+}
+
+/// Map a [`git_memory_schema::ValidationError`] to a [`StoreError`].
+fn schema_validation_error(
+    envelope_kind: &str,
+    error: git_memory_schema::ValidationError,
+) -> StoreError {
+    StoreError::new(
+        StoreErrorKind::InvalidRecord,
+        format!("record of kind `{envelope_kind}` failed schema validation"),
+        serde_json::json!({
+            "kind": envelope_kind,
+            "field": error.field,
+            "reason": error.message,
+            "validation_kind": format!("{:?}", error.kind),
+        }),
+    )
+}
+
+/// Map a [`SchemaRegistry`] construction error to a [`StoreError`].
+fn schema_registry_error(error: git_memory_schema::ValidationError) -> StoreError {
+    StoreError::new(
+        StoreErrorKind::InvalidRecord,
+        "schema registry could not be built from type records",
+        serde_json::json!({
+            "field": error.field,
+            "reason": error.message,
+            "validation_kind": format!("{:?}", error.kind),
+        }),
+    )
+}
+
+/// Validate every plaintext Put operation against the schema registry.
+///
+/// `__type__` records are always validated structurally (the type definition
+/// itself is well-formed), regardless of registry state. Regular records are
+/// validated against the registry only when it is non-empty — an empty
+/// registry means no types are defined, so validation is disabled. In strict
+/// mode, unknown kinds are rejected; in non-strict mode, they pass.
+fn validate_operations_against_schema(
+    registry: &SchemaRegistry,
+    transaction: &Transaction,
+    strict: bool,
+) -> Result<(), StoreError> {
+    for operation in &transaction.operations {
+        let Operation::Put { record } = operation else {
+            continue;
+        };
+        let StoredRecord::Plaintext { envelope } = record else {
+            continue;
+        };
+        if envelope.kind == TYPE_KIND {
+            let definition = TypeDefinition::from_content(&envelope.content).map_err(|error| {
+                StoreError::new(
+                    StoreErrorKind::InvalidRecord,
+                    "type definition record has malformed JSON",
+                    serde_json::json!({"detail": error.to_string()}),
+                )
+            })?;
+            definition.validate_self().map_err(|error| {
+                StoreError::new(
+                    StoreErrorKind::InvalidRecord,
+                    "type definition failed self-validation",
+                    serde_json::json!({
+                        "kind": "__type__",
+                        "field": error.field,
+                        "reason": error.message,
+                    }),
+                )
+            })?;
+        } else if !registry.is_empty() {
+            registry
+                .validate_record(envelope, strict)
+                .map_err(|error| schema_validation_error(&envelope.kind, error))?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_transaction(

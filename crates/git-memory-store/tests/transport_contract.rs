@@ -7,12 +7,12 @@
 use std::fs;
 use std::process::Command;
 
-use git2::Repository;
 use git_memory_core::{Envelope, StoredRecord};
 use git_memory_store::{
-    fetch_and_merge, push_to_remote, read_remote_config, write_remote_config, GitStore,
-    MemoryRemote, Operation, RecordId, StoreErrorKind, Transaction,
+    GitStore, MemoryRemote, Operation, RecordId, StoreErrorKind, Transaction, fetch_and_merge,
+    push_to_remote, read_remote_config, write_remote_config,
 };
+use git2::Repository;
 
 fn repo_with_store() -> (tempfile::TempDir, GitStore) {
     let dir = tempfile::tempdir().unwrap();

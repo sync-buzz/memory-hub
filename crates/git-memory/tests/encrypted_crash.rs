@@ -14,10 +14,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use git_memory_core::Envelope;
-use git_memory_crypto::{generate_backup_identity, Identity};
+use git_memory_crypto::{Identity, generate_backup_identity};
 use git_memory_index::Projection;
 use git_memory_store::{EncryptedStore, GitStore, RecipientEntry};
 

@@ -7,6 +7,7 @@ use git_memory_crypto::{
     CIPHER_SUITE, CryptoError, Identity, Recipient, backup_identity_to_string, decrypt_b64,
     encrypt_b64, generate_backup_identity, generate_storage_id, hex_lower,
 };
+use git_memory_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -144,6 +145,7 @@ enum LockState {
 pub struct EncryptedStore {
     store: GitStore,
     state: LockState,
+    strict_schema: bool,
 }
 
 impl EncryptedStore {
@@ -157,6 +159,7 @@ impl EncryptedStore {
         Ok(Self {
             store,
             state: LockState::Locked,
+            strict_schema: true,
         })
     }
 
@@ -165,6 +168,18 @@ impl EncryptedStore {
     #[must_use]
     pub fn with_signer(mut self, signer: std::sync::Arc<dyn CommitSigner>) -> Self {
         self.store = self.store.with_signer(signer);
+        self
+    }
+
+    /// Control whether records with unknown kinds are rejected.
+    ///
+    /// When `strict` (the default), a record whose `kind` has no matching
+    /// `__type__` definition is rejected. When `false`, unknown kinds are
+    /// accepted without schema validation.
+    #[must_use]
+    pub fn with_schema_strict(mut self, strict: bool) -> Self {
+        self.strict_schema = strict;
+        self.store = self.store.with_schema_strict(strict);
         self
     }
 
@@ -340,6 +355,17 @@ impl EncryptedStore {
                 "no recipients in manifest — run init first",
                 serde_json::json!({}),
             ));
+        }
+
+        // Schema validation: build a registry from decrypted records in the
+        // manifest, then validate every put envelope against it before
+        // encryption. Type definitions (__type__ kind) are validated
+        // structurally.
+        let schema_registry = self.load_encrypted_schema_registry(&manifest)?;
+        if !schema_registry.is_empty() {
+            for (_, envelope) in puts {
+                validate_envelope_against_schema(&schema_registry, envelope, self.strict_schema)?;
+            }
         }
 
         let mut operations = Vec::with_capacity(puts.len() + deletes.len() + 1);
@@ -579,7 +605,8 @@ impl EncryptedStore {
         let remote_manifest = self.read_manifest_unchecked(identity, &remote_revision)?;
 
         // Step 4: Take union of recipients.
-        let union_recipients = union_recipient_lists(&local_manifest.recipients, &remote_manifest.recipients);
+        let union_recipients =
+            union_recipient_lists(&local_manifest.recipients, &remote_manifest.recipients);
         local_manifest.recipients = union_recipients;
         let parsed_recipients = parse_recipients(&local_manifest.recipients)?;
 
@@ -602,8 +629,7 @@ impl EncryptedStore {
                 // Key only in remote — decrypt and add to local.
                 let storage_id = parse_storage_id(&remote_entry.storage_id)?;
                 let id = RecordId::opaque(storage_id);
-                let Some(stored) = self.store.read_record_unchecked(&remote_revision, &id)?
-                else {
+                let Some(stored) = self.store.read_record_unchecked(&remote_revision, &id)? else {
                     continue;
                 };
                 let ciphertext_b64 = match stored {
@@ -692,6 +718,64 @@ impl EncryptedStore {
             fast_forward: false,
             merged: true,
             conflicts: Vec::new(),
+        })
+    }
+
+    /// Build a [`SchemaRegistry`] from decrypted `__type__` records in the
+    /// manifest.
+    ///
+    /// Type definitions are stored as regular records with `kind = "__type__"`.
+    /// Their content is the JSON type definition, encrypted alongside other
+    /// records. This method decrypts only the `__type__` records to build
+    /// the registry.
+    fn load_encrypted_schema_registry(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<SchemaRegistry, StoreError> {
+        let identity = self.require_unlocked()?;
+        let revision = self.current_revision()?;
+        let mut definitions = Vec::new();
+        for (key, entry) in &manifest.records {
+            if entry.kind != TYPE_KIND {
+                continue;
+            }
+            let storage_id = parse_storage_id(&entry.storage_id)?;
+            let id = RecordId::opaque(storage_id);
+            let Some(stored) = self.store.read_record_pub(&revision, &id)? else {
+                continue;
+            };
+            let ciphertext_b64 = match stored {
+                StoredRecord::Encrypted { encrypted } => encrypted.ciphertext.clone(),
+                StoredRecord::Plaintext { .. } => continue,
+            };
+            let plaintext = decrypt_b64(&ciphertext_b64, std::slice::from_ref(identity))
+                .map_err(crypto_to_store_error)?;
+            let definition =
+                TypeDefinition::from_content(&String::from_utf8(plaintext).map_err(|e| {
+                    StoreError::new(
+                        crate::StoreErrorKind::InvalidRecord,
+                        "type record content is not valid UTF-8",
+                        serde_json::json!({"key": key, "detail": e.to_string()}),
+                    )
+                })?)
+                .map_err(|e| {
+                    StoreError::new(
+                        crate::StoreErrorKind::InvalidRecord,
+                        "type definition record has malformed JSON",
+                        serde_json::json!({"key": key, "detail": e.to_string()}),
+                    )
+                })?;
+            definitions.push(definition);
+        }
+        SchemaRegistry::from_type_definitions(definitions).map_err(|error| {
+            StoreError::new(
+                crate::StoreErrorKind::InvalidRecord,
+                "schema registry could not be built from type records",
+                serde_json::json!({
+                    "field": error.field,
+                    "reason": error.message,
+                }),
+            )
         })
     }
 
@@ -987,6 +1071,56 @@ fn crypto_to_store_error(error: CryptoError) -> StoreError {
         "cryptographic operation failed",
         serde_json::json!({"detail": error.to_string()}),
     )
+}
+
+/// Validate a single envelope against the schema registry.
+///
+/// `__type__` records are validated structurally. Regular records are
+/// validated against the registry — in strict mode, unknown kinds are
+/// rejected.
+fn validate_envelope_against_schema(
+    registry: &SchemaRegistry,
+    envelope: &Envelope,
+    strict: bool,
+) -> Result<(), StoreError> {
+    if envelope.kind == TYPE_KIND {
+        let definition = TypeDefinition::from_content(&envelope.content).map_err(|e| {
+            StoreError::new(
+                crate::StoreErrorKind::InvalidRecord,
+                "type definition record has malformed JSON",
+                serde_json::json!({"detail": e.to_string()}),
+            )
+        })?;
+        definition.validate_self().map_err(|error| {
+            StoreError::new(
+                crate::StoreErrorKind::InvalidRecord,
+                "type definition failed self-validation",
+                serde_json::json!({
+                    "kind": "__type__",
+                    "field": error.field,
+                    "reason": error.message,
+                }),
+            )
+        })?;
+    } else {
+        registry
+            .validate_record(envelope, strict)
+            .map_err(|error| {
+                StoreError::new(
+                    crate::StoreErrorKind::InvalidRecord,
+                    format!(
+                        "record of kind `{}` failed schema validation",
+                        envelope.kind
+                    ),
+                    serde_json::json!({
+                        "kind": envelope.kind,
+                        "field": error.field,
+                        "reason": error.message,
+                    }),
+                )
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

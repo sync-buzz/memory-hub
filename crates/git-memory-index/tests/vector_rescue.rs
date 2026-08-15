@@ -1,11 +1,15 @@
 use git_memory_core::{Envelope, StoredRecord};
 use git_memory_embed::MockProvider;
-use git_memory_index::{Projection, SearchMode, SearchRequest, SearchFilters};
+use git_memory_index::{Projection, SearchFilters, SearchMode, SearchRequest};
 use git_memory_store::{GitStore, Operation, Transaction};
 use git2::Repository;
 use std::sync::Arc;
 
-fn record(key: &str, kind: &str, content: &str) -> Result<StoredRecord, Box<dyn std::error::Error>> {
+fn record(
+    key: &str,
+    kind: &str,
+    content: &str,
+) -> Result<StoredRecord, Box<dyn std::error::Error>> {
     Ok(StoredRecord::Plaintext {
         envelope: Box::new(Envelope::new(key, kind, content)?),
     })
@@ -76,11 +80,16 @@ async fn vector_rescue_fires_when_bm25_below_threshold() -> Result<(), Box<dyn s
     // vector channel finds "alpha" with cosine sim = 1.0 (same text → same
     // hash → same vector).
     let query = render_text("note", "alpha beta gamma");
-    let result = projection.search(&search_request(&query, &revision)).await?;
+    let result = projection
+        .search(&search_request(&query, &revision))
+        .await?;
     assert_eq!(result.mode, SearchMode::Hybrid, "vector rescue should fire");
     assert!(!result.degraded);
     assert!(
-        result.hits.iter().any(|h| h.id == "alpha" && h.vector_score.is_some()),
+        result
+            .hits
+            .iter()
+            .any(|h| h.id == "alpha" && h.vector_score.is_some()),
         "alpha should appear with a vector score"
     );
     Ok(())
@@ -98,7 +107,9 @@ async fn rrf_fuse_combines_bm25_and_vector_channels() -> Result<(), Box<dyn std:
     projection.rebuild(&snapshot).await?;
 
     let query = render_text("note", "alpha beta gamma");
-    let result = projection.search(&search_request(&query, &revision)).await?;
+    let result = projection
+        .search(&search_request(&query, &revision))
+        .await?;
     assert_eq!(result.mode, SearchMode::Hybrid);
     assert!(!result.hits.is_empty());
 
@@ -157,7 +168,9 @@ async fn fingerprint_mismatch_skips_vector_channel() -> Result<(), Box<dyn std::
         .with_embed_provider(provider_b);
 
     let query = render_text("note", "alpha beta gamma");
-    let result = projection.search(&search_request(&query, &revision)).await?;
+    let result = projection
+        .search(&search_request(&query, &revision))
+        .await?;
     assert_eq!(
         result.mode,
         SearchMode::Fts,
