@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use git_memory_reconcile::{DivergenceMode, ReconcileErrorKind, Reconciler};
+use git_memory_store::GitStore;
 use serde::Serialize;
 
 use crate::model;
@@ -67,6 +68,7 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
     if git_available && requested_project.is_dir() {
         checks.push(repository_check(&requested_project));
         checks.push(reconciliation_check(&requested_project));
+        checks.push(encryption_check(&requested_project));
     } else {
         checks.push(Check::error(
             "git.repository",
@@ -77,6 +79,11 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
             "memory.reconciliation",
             "reconciliation_check_skipped",
             "reconciliation check was skipped because a prerequisite failed",
+        ));
+        checks.push(Check::error(
+            "memory.encryption",
+            "encryption_check_skipped",
+            "encryption check was skipped because a prerequisite failed",
         ));
     }
 
@@ -124,6 +131,62 @@ const fn reconcile_kind(kind: ReconcileErrorKind) -> &'static str {
         ReconcileErrorKind::Cursor => "cursor_error",
         ReconcileErrorKind::Diverged => "code_history_diverged",
         ReconcileErrorKind::Store => "store_error",
+    }
+}
+
+fn encryption_check(project: &Path) -> Check {
+    let store = match GitStore::open(project) {
+        Ok(store) => store,
+        Err(error) => {
+            return Check::ok_with_kind(
+                "memory.encryption",
+                "store_unavailable",
+                format!("encrypted-mode check skipped: {error}"),
+                None,
+            );
+        }
+    };
+    let snapshot = match store.current() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Check::ok_with_kind(
+                "memory.encryption",
+                "snapshot_unavailable",
+                format!("encrypted-mode check skipped: {error}"),
+                None,
+            );
+        }
+    };
+    let encrypted = match store.has_encrypted_records(snapshot.revision()) {
+        Ok(encrypted) => encrypted,
+        Err(error) => {
+            return Check::ok_with_kind(
+                "memory.encryption",
+                "records_unavailable",
+                format!("encrypted-mode check skipped: {error}"),
+                None,
+            );
+        }
+    };
+
+    if encrypted {
+        Check::ok_with_kind(
+            "memory.encryption",
+            "rotation_limitation",
+            "encrypted mode is active: recipient rotation (add/remove) \
+             re-encrypts future snapshots only — already-downloaded plaintext, \
+             exported records, and old Git history remain readable by former \
+             recipients. Old SSH/X25519 keys are not revoked; rotate keys at \
+             the provider if compromise is suspected."
+                .to_string(),
+            None,
+        )
+    } else {
+        Check::ok(
+            "memory.encryption",
+            "encrypted mode is not active; records are stored in plaintext".to_string(),
+            None,
+        )
     }
 }
 

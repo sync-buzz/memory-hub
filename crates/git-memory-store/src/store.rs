@@ -2,8 +2,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::BTreeSet;
+use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -25,14 +27,45 @@ const CONTRACT_PAUSE_BEFORE_REF_UPDATE: &str = "GIT_MEMORY_CONTRACT_PAUSE_BEFORE
 mod chain;
 mod records;
 use chain::{
-    changes_since, find_transaction, genesis_commit, memory_commit, require_retained_revision,
-    transaction_commit,
+    changes_since, create_commit, find_transaction, genesis_commit, memory_commit,
+    require_retained_revision, transaction_commit,
 };
 use records::{build_tree, decode_record, snapshot_tree, verify_record_location};
+
+/// A signer that produces an SSH (or other) signature for Git commit content.
+///
+/// When attached to a [`GitStore`] via [`GitStore::with_signer`], every
+/// commit on `refs/memory/*` carries a `gpgsig` header with the returned
+/// signature. This provides cryptographic integrity for collaborative
+/// scenarios where GitHub does not protect custom refs (see constraint
+/// `c-fe39e4`).
+pub trait CommitSigner: Debug + Send + Sync {
+    /// Sign the raw commit content buffer and return the signature string
+    /// (including any armor/header lines Git expects in `gpgsig`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if signing fails.
+    fn sign_commit(&self, commit_content: &[u8]) -> Result<String, StoreError>;
+}
+
+/// [`CommitSigner`] backed by `ssh-keygen -Y sign -n git`.
+impl CommitSigner for git_memory_crypto::SshSigner {
+    fn sign_commit(&self, commit_content: &[u8]) -> Result<String, StoreError> {
+        self.sign(commit_content).map_err(|e| {
+            StoreError::new(
+                StoreErrorKind::Repository,
+                "SSH commit signing failed",
+                serde_json::json!({"detail": e.to_string()}),
+            )
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct GitStore {
     git_dir: PathBuf,
+    signer: Option<Arc<dyn CommitSigner>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -97,13 +130,27 @@ impl GitStore {
             ));
         }
         let git_dir = Self::discover_git_dir(project)?;
-        let store = Self { git_dir };
+        let store = Self {
+            git_dir,
+            signer: None,
+        };
         store.ensure_staged()?;
         Ok(store)
     }
 
     pub(crate) const fn from_git_dir(git_dir: PathBuf) -> Self {
-        Self { git_dir }
+        Self {
+            git_dir,
+            signer: None,
+        }
+    }
+
+    /// Attach a commit signer so every subsequent commit on `refs/memory/*`
+    /// carries an SSH (or other) signature.
+    #[must_use]
+    pub fn with_signer(mut self, signer: Arc<dyn CommitSigner>) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     /// Return the current immutable snapshot.
@@ -209,6 +256,7 @@ impl GitStore {
                 transaction,
                 &request_hash,
                 &changed_ids.iter().cloned().collect::<Vec<_>>(),
+                self.signer.as_deref(),
             )?;
             pause_before_ref_update()?;
             match repository.reference_matching(
@@ -313,16 +361,15 @@ impl GitStore {
         };
         let commit_message = serde_json::to_string(&metadata)
             .map_err(|error| serialization_error("serialize checkpoint", error))?;
-        let commit_oid = repository
-            .commit(
-                None,
-                &signature,
-                &signature,
-                &commit_message,
-                &tree,
-                &parents,
-            )
-            .map_err(|error| StoreError::repository("write checkpoint commit", error))?;
+        let commit_oid = create_commit(
+            &repository,
+            &signature,
+            &signature,
+            &commit_message,
+            &tree,
+            &parents,
+            self.signer.as_deref(),
+        )?;
         update_optional_ref(&repository, MAIN_REF, commit_oid, parent_oid)?;
         Ok(Checkpoint {
             commit: commit_oid.to_string(),
@@ -531,6 +578,28 @@ impl GitStore {
         Ok(records)
     }
 
+    /// Check whether the snapshot contains at least one encrypted record.
+    ///
+    /// Stops at the first encrypted record — cheaper than [`Self::read_records`]
+    /// when only an encrypted-mode signal is needed (e.g. doctor).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the repository or a record blob is corrupt.
+    pub fn has_encrypted_records(&self, revision: &Revision) -> Result<bool, StoreError> {
+        let repository = self.repository()?;
+        let tree = snapshot_tree(&repository, revision)?;
+        for entry in &tree {
+            if entry.name().ok().is_some_and(|name| name.starts_with("r-")) {
+                let record = decode_record(&repository, entry.id())?;
+                if matches!(record, StoredRecord::Encrypted { .. }) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn repository(&self) -> Result<Repository, StoreError> {
         Repository::open(&self.git_dir).map_err(|error| StoreError::repository("open", error))
     }
@@ -547,7 +616,7 @@ impl GitStore {
         let tree = repository
             .find_tree(empty)
             .map_err(|error| StoreError::repository("find empty tree", error))?;
-        let genesis = genesis_commit(&repository, &tree)?;
+        let genesis = genesis_commit(&repository, &tree, None)?;
         match repository.reference(STAGED_REF, genesis, false, "git-memory: initialize") {
             Ok(_) => Ok(()),
             Err(error) if error.code() == ErrorCode::Exists => Ok(()),

@@ -4,13 +4,15 @@ use git_memory_core::{
     CURRENT_ENVELOPE_VERSION, EncryptedRecord, Envelope, OpaqueStorageId, StoredRecord,
 };
 use git_memory_crypto::{
-    CIPHER_SUITE, CryptoError, Identity, Recipient, decrypt_b64, encrypt_b64, generate_storage_id,
-    hex_lower,
+    CIPHER_SUITE, CryptoError, Identity, Recipient, backup_identity_to_string, decrypt_b64,
+    encrypt_b64, generate_backup_identity, generate_storage_id, hex_lower,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ApplyResult, GitStore, Operation, RecordId, Revision, StoreError, Transaction};
+use crate::{
+    ApplyResult, CommitSigner, GitStore, Operation, RecordId, Revision, StoreError, Transaction,
+};
 
 /// Deterministic storage id for the encrypted manifest blob.
 #[allow(clippy::expect_used)]
@@ -36,6 +38,18 @@ pub struct RecipientEntry {
     /// Human-readable label (GitHub username, device name, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// Result of initializing an encrypted store.
+///
+/// Contains the backup X25519 identity string (`AGE-SECRET-KEY-1...`)
+/// generated during `init()`. The caller MUST persist this in a safe
+/// location — it is the recovery path if the owner loses their SSH key.
+#[derive(Debug)]
+#[must_use]
+pub struct InitResult {
+    /// BECH32-encoded backup X25519 private key.
+    pub backup_identity: String,
 }
 
 /// Plaintext manifest content before age encryption.
@@ -112,6 +126,14 @@ impl EncryptedStore {
         })
     }
 
+    /// Attach a commit signer so every subsequent commit on `refs/memory/*`
+    /// carries an SSH signature for integrity.
+    #[must_use]
+    pub fn with_signer(mut self, signer: std::sync::Arc<dyn CommitSigner>) -> Self {
+        self.store = self.store.with_signer(signer);
+        self
+    }
+
     /// Check whether a manifest already exists in the current snapshot.
     fn has_manifest(&self) -> Result<bool, StoreError> {
         let revision = self.current_revision()?;
@@ -142,14 +164,20 @@ impl EncryptedStore {
 
     /// Initialize the encrypted store with the first recipient.
     ///
-    /// Creates an initial empty manifest encrypted to the provided
-    /// recipients and commits it. Must be called before `apply()`.
+    /// Generates a backup X25519 identity and adds it to the recipients
+    /// list so the owner can recover if they lose their SSH key. The
+    /// backup private key is returned in [`InitResult`] — the caller MUST
+    /// persist it in a safe location outside the repository.
+    ///
+    /// Creates an initial empty manifest encrypted to all recipients
+    /// (including the backup) and commits it. Must be called before
+    /// `apply()`.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the store is locked, encryption fails, or
     /// a manifest already exists.
-    pub fn init(&self, recipients: Vec<RecipientEntry>) -> Result<(), StoreError> {
+    pub fn init(&self, mut recipients: Vec<RecipientEntry>) -> Result<InitResult, StoreError> {
         let identity = self.require_unlocked()?;
 
         if self.has_manifest()? {
@@ -160,15 +188,26 @@ impl EncryptedStore {
             ));
         }
 
-        let manifest = Manifest::new(recipients);
-        let parsed_recipients = parse_recipients(&manifest.recipients)?;
-        if parsed_recipients.is_empty() {
+        if recipients.is_empty() {
             return Err(StoreError::new(
                 crate::StoreErrorKind::InvalidArgument,
-                "at least one recipient is required to initialize",
+                "at least one user recipient is required to initialize (backup is added automatically)",
                 serde_json::json!({}),
             ));
         }
+
+        // Generate a backup X25519 identity for recovery.
+        let (backup_identity, backup_recipient) = generate_backup_identity();
+        let backup_key_string = backup_identity_to_string(&backup_identity);
+        let backup_recipient_string = backup_recipient.to_string();
+        recipients.push(RecipientEntry {
+            public_key: backup_recipient_string,
+            key_type: "x25519".to_string(),
+            label: Some("backup".to_string()),
+        });
+
+        let manifest = Manifest::new(recipients);
+        let parsed_recipients = parse_recipients(&manifest.recipients)?;
 
         let manifest_blob = Self::encrypt_manifest(&manifest, &parsed_recipients)?;
         let revision = self.current_revision()?;
@@ -182,7 +221,9 @@ impl EncryptedStore {
             }],
         })?;
         let _ = identity;
-        Ok(())
+        Ok(InitResult {
+            backup_identity: backup_key_string,
+        })
     }
 
     /// Lock the store by dropping the in-memory identity.
@@ -508,12 +549,16 @@ impl EncryptedStore {
     ///
     /// Updates manifest `storage_ids` for re-encrypted records BEFORE writing
     /// the manifest blob, so the manifest always matches the tree.
+    ///
+    /// Uses `expected_revision` from the caller (the revision the manifest
+    /// was read at) so that a concurrent write between read and re-encrypt
+    /// is detected as a CAS conflict rather than silently rebasing over it.
     fn reencrypt_all(
         &self,
         manifest: &mut Manifest,
         identity: &Identity,
         recipients: &[Recipient],
-        revision: &Revision,
+        expected_revision: &Revision,
     ) -> Result<(), StoreError> {
         let mut operations = Vec::new();
 
@@ -523,7 +568,7 @@ impl EncryptedStore {
         for (key, entry) in &manifest.records {
             let storage_id = parse_storage_id(&entry.storage_id)?;
             let id = RecordId::opaque(storage_id.clone());
-            if let Some(stored) = self.store.read_record_pub(revision, &id)? {
+            if let Some(stored) = self.store.read_record_pub(expected_revision, &id)? {
                 let ciphertext_b64 = match stored {
                     StoredRecord::Encrypted { encrypted } => encrypted.ciphertext,
                     StoredRecord::Plaintext { .. } => continue,
@@ -573,10 +618,9 @@ impl EncryptedStore {
             },
         });
 
-        let rev = self.current_revision()?;
         self.store.apply(&Transaction {
             id: format!("reencrypt-{}", random_suffix()),
-            expected_revision: rev,
+            expected_revision: expected_revision.clone(),
             operations,
         })?;
 

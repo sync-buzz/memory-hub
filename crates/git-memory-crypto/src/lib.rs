@@ -159,6 +159,18 @@ pub fn generate_backup_identity() -> (age::x25519::Identity, age::x25519::Recipi
     (identity, recipient)
 }
 
+/// Serialize a backup X25519 identity to a BECH32 secret-key string
+/// (`AGE-SECRET-KEY-1...`).
+///
+/// The caller MUST persist the returned string in a safe location outside
+/// the repository — it is the recovery path if the owner loses their SSH
+/// key.
+#[must_use]
+pub fn backup_identity_to_string(identity: &age::x25519::Identity) -> String {
+    use secrecy::ExposeSecret;
+    identity.to_string().expose_secret().to_string()
+}
+
 /// Generate a random 64-hex-digit opaque storage id.
 ///
 /// # Errors
@@ -175,6 +187,112 @@ pub fn generate_storage_id() -> Result<String, CryptoError> {
 pub fn key_fingerprint(key_str: &str) -> String {
     let digest = Sha256::digest(key_str.as_bytes());
     format!("sha256:{}", hex_lower(&digest[..8]))
+}
+
+/// SSH commit signer that shells out to `ssh-keygen -Y sign`.
+///
+/// Produces an armored SSH signature (`-----BEGIN SSH SIGNATURE-----`)
+/// suitable for Git's `gpgsig` header. The private key file must be
+/// unencrypted or the key must be in `ssh-agent`.
+#[derive(Debug)]
+pub struct SshSigner {
+    key_path: std::path::PathBuf,
+}
+
+impl SshSigner {
+    /// Create a signer from an SSH private key file path.
+    #[must_use]
+    pub fn new(key_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            key_path: key_path.into(),
+        }
+    }
+
+    /// Create a signer from the default SSH key (`~/.ssh/id_ed25519`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] if the home directory cannot be resolved
+    /// or the default key file does not exist.
+    pub fn default_key() -> Result<Self, CryptoError> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            CryptoError::Key("cannot resolve home directory for default SSH key".into())
+        })?;
+        let key_path = home.join(".ssh").join("id_ed25519");
+        if !key_path.is_file() {
+            return Err(CryptoError::Key(format!(
+                "default SSH key not found at {}",
+                key_path.display()
+            )));
+        }
+        Ok(Self { key_path })
+    }
+
+    /// Sign arbitrary data using `ssh-keygen -Y sign -n git`.
+    ///
+    /// Returns the armored signature string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] if `ssh-keygen` is unavailable, fails, or
+    /// produces an unreadable signature.
+    pub fn sign(&self, data: &[u8]) -> Result<String, CryptoError> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // ssh-keygen -Y sign writes the signature to <file>.sig. We create
+        // a private temp dir (0700) and use a random filename for the data
+        // so the .sig path is not predictable by an attacker.
+        let temp = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .map_err(|e| CryptoError::Io(e.to_string()))?;
+        let data_filename = format!("commit-{}", random_hex_suffix()?);
+        let data_path = temp.path().join(&data_filename);
+        {
+            let mut file = std::fs::File::create(&data_path)
+                .map_err(|e| CryptoError::Io(format!("create temp file: {e}")))?;
+            file.write_all(data)
+                .map_err(|e| CryptoError::Io(format!("write temp file: {e}")))?;
+        }
+
+        let output = Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-f"])
+            .arg(&self.key_path)
+            .args(["-n", "git"])
+            .arg(&data_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| CryptoError::Key(format!("spawn ssh-keygen: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(CryptoError::Key(format!(
+                "ssh-keygen -Y sign failed: {stderr}"
+            )));
+        }
+
+        let sig_path = temp.path().join(format!("{data_filename}.sig"));
+        let signature = std::fs::read_to_string(&sig_path)
+            .map_err(|e| CryptoError::Key(format!("read signature file: {e}")))?
+            .trim()
+            .to_string();
+
+        if signature.is_empty() {
+            return Err(CryptoError::Key(
+                "ssh-keygen produced an empty signature".into(),
+            ));
+        }
+        Ok(signature)
+    }
+}
+
+/// Generate a short random hex suffix for unpredictable temp filenames.
+fn random_hex_suffix() -> Result<String, CryptoError> {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).map_err(|e| CryptoError::Key(format!("CSPRNG: {e}")))?;
+    Ok(hex_lower(&buf))
 }
 
 /// Encode bytes as lowercase hex string.

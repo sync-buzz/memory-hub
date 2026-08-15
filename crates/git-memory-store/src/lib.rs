@@ -9,9 +9,9 @@ mod error;
 mod store;
 mod types;
 
-pub use encrypted::{EncryptedStore, RecipientEntry};
+pub use encrypted::{EncryptedStore, InitResult, RecipientEntry};
 pub use error::{StoreError, StoreErrorKind};
-pub use store::GitStore;
+pub use store::{CommitSigner, GitStore};
 pub use types::{
     ApplyResult, ChangeKind, Checkpoint, ExportBundle, Operation, RecordChange, RecordId, Revision,
     Snapshot, Transaction,
