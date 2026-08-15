@@ -1,9 +1,13 @@
 [package]
 name = "git-memory-index"
+description = "Recoverable LanceDB projection for Git Memory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 arrow-array.workspace = true

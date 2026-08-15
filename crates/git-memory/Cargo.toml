@@ -16,7 +16,9 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 git-memory-mcp = { path = "../git-memory-mcp" }
+git-memory-index = { path = "../git-memory-index" }
 git-memory-reconcile = { path = "../git-memory-reconcile" }
+git-memory-store = { path = "../git-memory-store" }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -105,6 +105,26 @@ async fn corrupt_status_is_recovered_automatically() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_recovery_is_serialized_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+    let project = tempfile::tempdir()?;
+    Repository::init(project.path())?;
+    let store = GitStore::open(project.path())?;
+    let snapshot = store.current()?;
+    let projection = Projection::open(project.path().join("derived-index")).await?;
+    projection.rebuild(&snapshot).await?;
+    let left = projection.clone();
+    let right = projection.clone();
+    let left_snapshot = snapshot.clone();
+    let right_snapshot = snapshot.clone();
+    let (left_result, right_result) =
+        tokio::join!(left.recover(&left_snapshot), right.recover(&right_snapshot));
+    left_result?;
+    right_result?;
+    assert!(projection.records(snapshot.revision()).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn reader_waits_for_the_projection_writer_lock() -> Result<(), Box<dyn std::error::Error>> {
     use fs2::FileExt;
 
@@ -135,44 +155,52 @@ async fn reader_waits_for_the_projection_writer_lock() -> Result<(), Box<dyn std
 #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
 async fn incremental_update_cost_tracks_delta_not_corpus() -> Result<(), Box<dyn std::error::Error>>
 {
-    const CORPUS: usize = 1_500;
+    let mut incremental = Vec::new();
+    for corpus in [250, 1_500, 5_000] {
+        let (rebuild, update) = benchmark_case(corpus).await?;
+        eprintln!(
+            "corpus={corpus} delta=1 rebuild_ms={} incremental_ms={}",
+            rebuild.as_millis(),
+            update.as_millis()
+        );
+        assert!(update < rebuild);
+        incremental.push(update);
+    }
+    let fastest = incremental.iter().min().ok_or("missing benchmark")?;
+    let slowest = incremental.iter().max().ok_or("missing benchmark")?;
+    assert!(
+        *slowest < *fastest * 8,
+        "delta=1 cost grew with the 20x corpus increase"
+    );
+    Ok(())
+}
+
+async fn benchmark_case(corpus: usize) -> Result<(Duration, Duration), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     Repository::init(project.path())?;
     let store = GitStore::open(project.path())?;
-    let base = store.current()?.revision().clone();
-    let operations = (0..CORPUS)
-        .map(|index| record(&format!("record-{index:04}"), "stable body").map(Operation::put))
+    let operations = (0..corpus)
+        .map(|index| record(&format!("record-{index:05}"), "stable body").map(Operation::put))
         .collect::<Result<Vec<_>, _>>()?;
     let seeded = store.apply(&Transaction {
         id: "benchmark-seed".into(),
-        expected_revision: base,
+        expected_revision: store.current()?.revision().clone(),
         operations,
     })?;
     let projection = Projection::open(project.path().join("derived-index")).await?;
-    let rebuild_started = Instant::now();
+    let started = Instant::now();
     projection
         .rebuild(&store.snapshot(&seeded.revision)?)
         .await?;
-    let rebuild_elapsed = rebuild_started.elapsed();
-
+    let rebuild = started.elapsed();
     let changed = store.apply(&Transaction {
         id: "benchmark-one-record".into(),
         expected_revision: seeded.revision.clone(),
-        operations: vec![Operation::put(record("record-0750", "changed body")?)],
+        operations: vec![Operation::put(record("record-00000", "changed body")?)],
     })?;
-    let update_started = Instant::now();
+    let started = Instant::now();
     projection
         .update(&store, &seeded.revision, &changed.revision)
         .await?;
-    let update_elapsed = update_started.elapsed();
-    eprintln!(
-        "corpus={CORPUS} delta=1 rebuild_ms={} incremental_ms={}",
-        rebuild_elapsed.as_millis(),
-        update_elapsed.as_millis()
-    );
-    assert!(
-        update_elapsed < rebuild_elapsed,
-        "one-record incremental update must be cheaper than a full rebuild"
-    );
-    Ok(())
+    Ok((rebuild, started.elapsed()))
 }

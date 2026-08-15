@@ -163,5 +163,10 @@ fn running_mcp_reconciles_before_the_first_memory_mutation()
     assert_eq!(newest["code_revision"], code_revision);
     assert_eq!(newest["revision"], base);
     assert_ne!(newest["revision"], applied_revision);
+    let index_status: Value = serde_json::from_slice(&fs::read(
+        project.path().join(".git/git-memory/index/status.json"),
+    )?)?;
+    assert_eq!(index_status["state"], "fresh");
+    assert_eq!(index_status["canonical_revision"], applied_revision);
     Ok(())
 }

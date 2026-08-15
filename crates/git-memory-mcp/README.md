@@ -15,7 +15,7 @@ Git Memory handshake in `capabilities.experimental.gitMemory` and
   "memoryInterfaceVersion": {"major": 1, "minor": 1},
   "storeVersion": {"major": 1, "minor": 1},
   "envelopeVersion": {"major": 1, "minor": 0},
-  "indexVersion": {"major": 0, "minor": 0},
+  "indexVersion": {"major": 1, "minor": 0},
   "modelFingerprint": null,
   "encryptionMode": "plaintext",
   "installationId": "installation-<sha256>",
@@ -40,7 +40,7 @@ All resource bodies are UTF-8 JSON with `mimeType: application/json`.
 | `memory://project` | handshake fields above plus `gitDir` |
 | `memory://revision/current` | `{schemaVersion: 1, revision: string}` |
 | `memory://records/{key}` | `{schemaVersion: 1, revision: string, record: StoredRecord|null}` |
-| `memory://index/status` | `{schemaVersion: 1, available: bool, capability, plannedSpec}` |
+| `memory://index/status` | `{schemaVersion: 1, available: true, state, canonicalRevision, targetRevision}` |
 | `memory://model/status` | `{schemaVersion: 1, available: bool, capability, plannedSpec}` |
 | `memory://policy/effective` | `{schemaVersion: 1, policies: EffectivePolicy[]}` |
 | `memory://encryption/status` | `{schemaVersion: 1, mode, available, encryptedStoreAvailable, encryptedIndexAvailable}` |
@@ -66,6 +66,7 @@ surface is:
 | `memory_export` | `revision` | `{revision, bundle}` |
 | `memory_import` | `transaction_id`, `expected_revision`, `bundle` | `{revision, changed_keys}` |
 | `memory_reconcile` | optional `divergence: report\|full_rebuild` | `ReconcileReport` |
+| `memory_reindex` | none | current durable projection status |
 | `memory_doctor` | none | repository/store health |
 | `memory_encryption_status` | none | current plaintext/encryption availability |
 
@@ -78,8 +79,8 @@ Initialization and every mutating tool reconcile code history first. Divergence
 returns `kind: diverged` until the client explicitly calls `memory_reconcile`
 with `divergence: full_rebuild`.
 
-The stable future-facing catalogue also declares search/backlinks, reindex,
-remote transport, and model operations. Until their owning roadmap
+The stable future-facing catalogue also declares search/backlinks, remote
+transport, and model operations. Until their owning roadmap
 specs land, calls fail explicitly with `kind: capability_unavailable`, the
 planned spec, and an upgrade recovery action; the server never pretends that a
 degraded implementation completed the operation.

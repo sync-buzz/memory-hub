@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use git_memory_index::Projection;
 use git_memory_reconcile::{DivergenceMode, Reconciler};
+use git_memory_store::GitStore;
 
 use crate::doctor;
 use crate::exit::Code;
@@ -132,8 +134,19 @@ where
             } else {
                 DivergenceMode::Report
             };
-            match Reconciler::open(project).and_then(|reconciler| reconciler.reconcile(mode)) {
+            match Reconciler::open(&project).and_then(|reconciler| reconciler.reconcile(mode)) {
                 Ok(report) => {
+                    let index_result = GitStore::open(&project)
+                        .map_err(|error| error.to_string())
+                        .and_then(|store| {
+                            Projection::synchronize_store(&store)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = index_result {
+                        eprintln!("git-memory: index synchronization failed: {error}");
+                        return Code::Internal;
+                    }
                     let rendered = match output {
                         Output::Json => serde_json::to_string(&report),
                         Output::Human => Ok(format!(

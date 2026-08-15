@@ -2150,8 +2150,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "git-memory-contract",
+ "git-memory-index",
  "git-memory-mcp",
  "git-memory-reconcile",
+ "git-memory-store",
  "git2",
  "serde",
  "serde_json",
@@ -2203,6 +2205,7 @@ name = "git-memory-mcp"
 version = "0.1.0"
 dependencies = [
  "git-memory-core",
+ "git-memory-index",
  "git-memory-reconcile",
  "git-memory-store",
  "serde",

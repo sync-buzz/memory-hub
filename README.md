@@ -6,9 +6,10 @@ named `git-memory`, so Git exposes it as `git memory` whenever it is available o
 
 The repository contains the bootstrap CLI, the product-neutral envelope and
 policy contract, the atomic Git object store, hookless code-history
-reconciliation, the public MCP stdio interface, and a reusable black-box
-behavioral contract harness. Index, search, remote exchange, and encryption
-implementations are intentionally capability-gated for later releases.
+reconciliation, a recoverable local LanceDB projection, the public MCP stdio
+interface, and a reusable black-box behavioral contract harness. Search,
+remote exchange, and encryption implementations remain capability-gated for
+later releases.
 
 ## Build and verify
 
@@ -19,6 +20,7 @@ cargo build --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo deny check
 ```
 
 ## Behavioral contract harness
@@ -76,6 +78,14 @@ update generic record freshness and each processed commit receives a
 code-linked Memory checkpoint. Rebase/reset divergence is reported and requires
 an explicit full rebuild; hooks are never required for correctness. See
 [`crates/git-memory-reconcile/README.md`](crates/git-memory-reconcile/README.md).
+
+## Local index
+
+`git-memory-index` maintains a disposable LanceDB read model under the Git
+directory. MCP startup, successful Memory mutations, explicit reconciliation,
+and `memory_reindex` synchronize it to the canonical Git Memory revision.
+Interrupted or corrupt projections rebuild exclusively from an immutable Git
+snapshot; readers refuse lagging generations.
 
 ## MCP interface
 

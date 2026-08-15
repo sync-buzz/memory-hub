@@ -12,6 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use git_memory_core::{CURRENT_ENVELOPE_VERSION, PolicyResolver, StoredRecord};
+use git_memory_index::{IndexError, Projection};
 use git_memory_reconcile::{DivergenceMode, ReconcileError, ReconcileErrorKind, Reconciler};
 use git_memory_store::{GitStore, Operation, RecordId, Revision, StoreError, Transaction};
 use serde::Deserialize;
@@ -162,6 +163,8 @@ impl Session {
             }
             Err(error) => return Err(RpcFailure::reconcile(error)),
         };
+        let store = self.store()?;
+        Projection::synchronize_store(&store).map_err(RpcFailure::index)?;
         let handshake = self.handshake();
         self.initialized = true;
         Ok(json!({
@@ -193,7 +196,7 @@ impl Session {
             "memoryInterfaceVersion": version(MEMORY_INTERFACE_MAJOR, MEMORY_INTERFACE_MINOR),
             "storeVersion": version(1, 1),
             "envelopeVersion": CURRENT_ENVELOPE_VERSION,
-            "indexVersion": version(0, 0),
+            "indexVersion": version(1, 0),
             "modelFingerprint": null,
             "encryptionMode": "plaintext",
             "installationId": installation_id,
@@ -239,7 +242,16 @@ impl Session {
                 let snapshot = self.store()?.current().map_err(RpcFailure::store)?;
                 json!({"schemaVersion": 1, "revision": snapshot.revision()})
             }
-            "memory://index/status" => unavailable_status("index", "GITMEMO-7"),
+            "memory://index/status" => {
+                let status = Projection::status_store(&self.store()?).map_err(RpcFailure::index)?;
+                json!({
+                    "schemaVersion": status.schema_version,
+                    "available": true,
+                    "state": status.state,
+                    "canonicalRevision": status.canonical_revision,
+                    "targetRevision": status.target_revision
+                })
+            }
             "memory://model/status" => unavailable_status("model", "GITMEMO-8"),
             "memory://policy/effective" => policy_resource(),
             "memory://encryption/status" => json!({
@@ -309,6 +321,14 @@ impl Session {
                 content,
                 revision_changed,
             }) => {
+                if revision_changed || reconciliation_changed {
+                    let index_result = self.store().and_then(|store| {
+                        Projection::synchronize_store(&store).map_err(RpcFailure::index)
+                    });
+                    if let Err(error) = index_result {
+                        return Ok(rpc_result(id, tool_error(error.into_tool_failure())));
+                    }
+                }
                 if (revision_changed || reconciliation_changed) && self.revision_subscribed {
                     write_json(
                         output,
@@ -344,7 +364,8 @@ impl Session {
             "memory_import" => self.import(arguments),
             "memory_doctor" => self.doctor(),
             "memory_reconcile" => self.reconcile(arguments),
-            "memory_search" | "memory_backlinks" | "memory_reindex" => {
+            "memory_reindex" => self.reindex(),
+            "memory_search" | "memory_backlinks" => {
                 Err(unavailable("search_index", "GITMEMO-7/GITMEMO-9"))
             }
             "memory_transport_status" | "memory_fetch" | "memory_push" => {
@@ -489,6 +510,12 @@ impl Session {
             "gitDir": store.git_dir(),
             "revision": current.revision()
         })))
+    }
+
+    fn reindex(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        let store = self.store()?;
+        let status = Projection::synchronize_store(&store).map_err(ToolFailure::index)?;
+        Ok(ToolOutcome::read(json!(status)))
     }
 
     fn reconcile(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
@@ -877,6 +904,13 @@ impl RpcFailure {
             }),
         )
     }
+    fn index(error: IndexError) -> Self {
+        Self::new(
+            -32_603,
+            "Git Memory index unavailable",
+            json!({"kind": "index", "message": error.to_string()}),
+        )
+    }
 
     fn into_tool_failure(self) -> ToolFailure {
         let kind = self
@@ -923,6 +957,13 @@ impl ToolFailure {
             kind: snake_reconcile_kind(error.kind).to_owned(),
             message: error.message,
             data: error.data,
+        }
+    }
+    fn index(error: IndexError) -> Self {
+        Self {
+            kind: "index".into(),
+            message: error.to_string(),
+            data: Value::Null,
         }
     }
 }

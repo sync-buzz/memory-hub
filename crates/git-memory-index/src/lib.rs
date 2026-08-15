@@ -51,7 +51,6 @@ pub struct ProjectedRecord {
     pub content: Option<String>,
     pub archived: bool,
     pub freshness: Option<String>,
-    pub canonical_revision: Revision,
 }
 
 #[derive(Debug)]
@@ -88,6 +87,35 @@ pub struct Projection {
 }
 
 impl Projection {
+    /// Synchronize the default per-repository projection from synchronous
+    /// adapters such as the MCP stdio server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime, catalog, or synchronization fails.
+    pub fn synchronize_store(store: &GitStore) -> Result<ProjectionStatus, IndexError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| IndexError::new(format!("create projection runtime: {error}")))?;
+        runtime.block_on(async {
+            let projection = Self::open(store.git_dir().join("git-memory/index")).await?;
+            projection.synchronize(store).await
+        })
+    }
+
+    /// Read the default per-repository projection status without opening the
+    /// `LanceDB` catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock or durable status cannot be read.
+    pub fn status_store(store: &GitStore) -> Result<ProjectionStatus, IndexError> {
+        let root = store.git_dir().join("git-memory/index");
+        let _lock = lock_at(&root, false)?;
+        read_status_at(&root)
+    }
+
     /// Open the disposable projection at an explicit local-state directory.
     ///
     /// # Errors
@@ -129,7 +157,11 @@ impl Projection {
     ///
     /// Returns an error when the canonical snapshot or derived catalog fails.
     pub async fn rebuild(&self, snapshot: &Snapshot) -> Result<ProjectionStatus, IndexError> {
-        let _lock = self.write_lock()?;
+        let _lock = self.write_lock_async().await?;
+        self.rebuild_unlocked(snapshot).await
+    }
+
+    async fn rebuild_unlocked(&self, snapshot: &Snapshot) -> Result<ProjectionStatus, IndexError> {
         let target = snapshot.revision().clone();
         self.write_status(&ProjectionStatus {
             schema_version: META_SCHEMA,
@@ -205,7 +237,7 @@ impl Projection {
         from: &Revision,
         to: &Revision,
     ) -> Result<ProjectionStatus, IndexError> {
-        let _lock = self.write_lock()?;
+        let _lock = self.write_lock_async().await?;
         let current = self.read_status_unlocked()?;
         if current.state != ProjectionState::Fresh
             || current.canonical_revision.as_ref() != Some(from)
@@ -278,7 +310,7 @@ impl Projection {
     ///
     /// Returns an error when the index is stale, unavailable, or malformed.
     pub async fn records(&self, revision: &Revision) -> Result<Vec<ProjectedRecord>, IndexError> {
-        let _lock = self.read_lock()?;
+        let _lock = self.read_lock_async().await?;
         let status = self.read_status_unlocked()?;
         if status.state != ProjectionState::Fresh
             || status.canonical_revision.as_ref() != Some(revision)
@@ -318,7 +350,10 @@ impl Projection {
                     && status.canonical_revision.as_ref() == Some(snapshot.revision()) =>
             {
                 match self.records(snapshot.revision()).await {
-                    Ok(_) => Ok(status),
+                    Ok(rows) => match self.verify_fts(rows.is_empty()).await {
+                        Ok(()) => Ok(status),
+                        Err(_) => self.recover(&snapshot).await,
+                    },
                     Err(_) => self.recover(&snapshot).await,
                 }
             }
@@ -344,28 +379,25 @@ impl Projection {
     ///
     /// Returns an error when cleanup, catalog reopening, or rebuilding fails.
     pub async fn recover(&self, snapshot: &Snapshot) -> Result<ProjectionStatus, IndexError> {
-        {
-            let _lock = self.write_lock()?;
-            self.write_status(&ProjectionStatus {
-                schema_version: META_SCHEMA,
-                state: ProjectionState::Corrupt,
-                canonical_revision: None,
-                target_revision: Some(snapshot.revision().clone()),
-            })?;
-            let lance = self.root.join("lance");
-            if lance.exists() {
-                fs::remove_dir_all(&lance)?;
-            }
-            fs::create_dir_all(&lance)?;
+        let _lock = self.write_lock_async().await?;
+        self.write_status(&ProjectionStatus {
+            schema_version: META_SCHEMA,
+            state: ProjectionState::Corrupt,
+            canonical_revision: None,
+            target_revision: Some(snapshot.revision().clone()),
+        })?;
+        let lance = self.root.join("lance");
+        if lance.exists() {
+            fs::remove_dir_all(&lance)?;
         }
-        // Reopen because Lance connections retain catalog state.
+        fs::create_dir_all(&lance)?;
         let replacement = Self::open(&self.root).await?;
         let connection = replacement.connection()?;
         *self
             .connection
             .write()
             .map_err(|_| IndexError::new("projection connection lock is poisoned"))? = connection;
-        self.rebuild(snapshot).await
+        self.rebuild_unlocked(snapshot).await
     }
 
     fn status_path(&self) -> PathBuf {
@@ -379,47 +411,58 @@ impl Projection {
             .map_err(|_| IndexError::new("projection connection lock is poisoned"))
     }
 
-    fn lock_file(&self) -> Result<File, IndexError> {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join("projection.lock"))
-            .map_err(Into::into)
-    }
-
     fn read_lock(&self) -> Result<File, IndexError> {
-        let file = self.lock_file()?;
-        file.lock_shared()?;
-        Ok(file)
+        lock_at(&self.root, false)
     }
 
-    fn write_lock(&self) -> Result<File, IndexError> {
-        let file = self.lock_file()?;
-        file.lock_exclusive()?;
-        Ok(file)
+    async fn read_lock_async(&self) -> Result<File, IndexError> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || lock_at(&root, false))
+            .await
+            .map_err(|error| IndexError::new(format!("projection lock worker failed: {error}")))?
+    }
+
+    async fn write_lock_async(&self) -> Result<File, IndexError> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || lock_at(&root, true))
+            .await
+            .map_err(|error| IndexError::new(format!("projection lock worker failed: {error}")))?
+    }
+
+    async fn verify_fts(&self, empty: bool) -> Result<(), IndexError> {
+        if empty {
+            return Ok(());
+        }
+        let table = self
+            .connection()?
+            .open_table(TABLE)
+            .execute()
+            .await
+            .map_err(lance_error)?;
+        let indices = table.list_indices().await.map_err(lance_error)?;
+        for expected in ["title", "content", "kind"] {
+            let index = indices
+                .iter()
+                .find(|index| index.columns == [expected.to_owned()])
+                .ok_or_else(|| {
+                    IndexError::new(format!("projection FTS index for `{expected}` is missing"))
+                })?;
+            if table
+                .index_stats(&index.name)
+                .await
+                .map_err(lance_error)?
+                .is_none()
+            {
+                return Err(IndexError::new(format!(
+                    "projection FTS index for `{expected}` is unreadable"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn read_status_unlocked(&self) -> Result<ProjectionStatus, IndexError> {
-        match fs::read(self.status_path()) {
-            Ok(bytes) => {
-                let status: ProjectionStatus = serde_json::from_slice(&bytes).map_err(|error| {
-                    IndexError::new(format!("projection status is corrupt: {error}"))
-                })?;
-                if status.schema_version != META_SCHEMA {
-                    return Err(IndexError::new("projection status schema is unsupported"));
-                }
-                Ok(status)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProjectionStatus {
-                schema_version: META_SCHEMA,
-                state: ProjectionState::Lagging,
-                canonical_revision: None,
-                target_revision: None,
-            }),
-            Err(error) => Err(error.into()),
-        }
+        read_status_at(&self.root)
     }
 
     fn write_status(&self, status: &ProjectionStatus) -> Result<(), IndexError> {
@@ -432,6 +475,27 @@ impl Projection {
     }
 }
 
+fn read_status_at(root: &Path) -> Result<ProjectionStatus, IndexError> {
+    match fs::read(root.join("status.json")) {
+        Ok(bytes) => {
+            let status: ProjectionStatus = serde_json::from_slice(&bytes).map_err(|error| {
+                IndexError::new(format!("projection status is corrupt: {error}"))
+            })?;
+            if status.schema_version != META_SCHEMA {
+                return Err(IndexError::new("projection status schema is unsupported"));
+            }
+            Ok(status)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProjectionStatus {
+            schema_version: META_SCHEMA,
+            state: ProjectionState::Lagging,
+            canonical_revision: None,
+            target_revision: None,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -441,72 +505,77 @@ fn schema() -> SchemaRef {
         Field::new("archived", DataType::Boolean, false),
         Field::new("freshness", DataType::Utf8, true),
         Field::new("record_json", DataType::Utf8, false),
-        Field::new("canonical_revision", DataType::Utf8, false),
     ]))
 }
 
-fn batch(
-    records: &[(RecordId, StoredRecord)],
-    revision: &Revision,
-) -> Result<RecordBatch, IndexError> {
-    let ids = records
-        .iter()
-        .map(|(id, _)| id.display_value())
-        .collect::<Vec<_>>();
-    let kinds = records
-        .iter()
-        .map(|(_, record)| match record {
-            StoredRecord::Plaintext { envelope } => Some(envelope.kind.as_str()),
-            StoredRecord::Encrypted { .. } => None,
+struct ProjectionRow<'a> {
+    id: String,
+    kind: Option<&'a str>,
+    title: Option<&'a str>,
+    content: Option<&'a str>,
+    archived: bool,
+    freshness: Option<String>,
+    record_json: String,
+}
+
+impl<'a> ProjectionRow<'a> {
+    fn from_record(id: &RecordId, record: &'a StoredRecord) -> Result<Self, IndexError> {
+        let (kind, title, content, archived, freshness) = match record {
+            StoredRecord::Plaintext { envelope } => (
+                Some(envelope.kind.as_str()),
+                envelope.title.as_deref(),
+                Some(envelope.content.as_str()),
+                envelope.archive.archived,
+                Some(format!("{:?}", envelope.freshness.state).to_ascii_lowercase()),
+            ),
+            StoredRecord::Encrypted { .. } => (None, None, None, false, None),
+        };
+        Ok(Self {
+            id: id.display_value(),
+            kind,
+            title,
+            content,
+            archived,
+            freshness,
+            record_json: serde_json::to_string(record)
+                .map_err(|error| IndexError::new(format!("serialize projected record: {error}")))?,
         })
-        .collect::<Vec<_>>();
-    let titles = records
+    }
+}
+
+fn batch(records: &[(RecordId, StoredRecord)], _: &Revision) -> Result<RecordBatch, IndexError> {
+    let rows = records
         .iter()
-        .map(|(_, record)| match record {
-            StoredRecord::Plaintext { envelope } => envelope.title.as_deref(),
-            StoredRecord::Encrypted { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    let contents = records
-        .iter()
-        .map(|(_, record)| match record {
-            StoredRecord::Plaintext { envelope } => Some(envelope.content.as_str()),
-            StoredRecord::Encrypted { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    let archived = records
-        .iter()
-        .map(|(_, record)| match record {
-            StoredRecord::Plaintext { envelope } => envelope.archive.archived,
-            StoredRecord::Encrypted { .. } => false,
-        })
-        .collect::<Vec<_>>();
-    let freshness = records
-        .iter()
-        .map(|(_, record)| match record {
-            StoredRecord::Plaintext { envelope } => {
-                Some(format!("{:?}", envelope.freshness.state).to_ascii_lowercase())
-            }
-            StoredRecord::Encrypted { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    let json = records
-        .iter()
-        .map(|(_, record)| serde_json::to_string(record))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| IndexError::new(format!("serialize projected record: {error}")))?;
-    let revisions = vec![revision.as_str(); records.len()];
+        .map(|(id, record)| ProjectionRow::from_record(id, record))
+        .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(
         schema(),
         vec![
-            Arc::new(StringArray::from(ids)),
-            Arc::new(StringArray::from(kinds)),
-            Arc::new(StringArray::from(titles)),
-            Arc::new(StringArray::from(contents)),
-            Arc::new(BooleanArray::from(archived)),
-            Arc::new(StringArray::from(freshness)),
-            Arc::new(StringArray::from(json)),
-            Arc::new(StringArray::from(revisions)),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| &row.id),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.title).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.content).collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                rows.iter()
+                    .map(|row| row.archived)
+                    .collect::<BooleanArray>(),
+            ),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.freshness.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| &row.record_json),
+            )),
         ],
     )
     .map_err(|error| IndexError::new(format!("build projection batch: {error}")))
@@ -531,7 +600,6 @@ fn decode_batches(batches: &[RecordBatch]) -> Result<Vec<ProjectedRecord>, Index
         let titles = strings("title")?;
         let contents = strings("content")?;
         let freshness = strings("freshness")?;
-        let revisions = strings("canonical_revision")?;
         let archived = batch
             .column_by_name("archived")
             .and_then(|value| value.as_any().downcast_ref::<BooleanArray>())
@@ -546,15 +614,26 @@ fn decode_batches(batches: &[RecordBatch]) -> Result<Vec<ProjectedRecord>, Index
                 content: optional(contents),
                 archived: archived.value(row),
                 freshness: optional(freshness),
-                canonical_revision: serde_json::from_value(serde_json::json!(revisions.value(row)))
-                    .map_err(|error| {
-                        IndexError::new(format!("decode projected revision: {error}"))
-                    })?,
             });
         }
     }
     rows.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(rows)
+}
+
+fn lock_at(root: &Path, exclusive: bool) -> Result<File, IndexError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("projection.lock"))?;
+    if exclusive {
+        file.lock_exclusive()?;
+    } else {
+        file.lock_shared()?;
+    }
+    Ok(file)
 }
 
 fn sql_escape(value: &str) -> String {
@@ -565,4 +644,54 @@ fn lance_error(error: impl fmt::Display) -> IndexError {
 }
 fn store_error(error: impl fmt::Display) -> IndexError {
     IndexError::new(format!("canonical Git Memory read failed: {error}"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use git_memory_core::{Envelope, StoredRecord};
+    use git_memory_store::{GitStore, Operation, Transaction};
+
+    use super::{Projection, TABLE};
+
+    #[tokio::test]
+    async fn synchronize_rebuilds_when_fts_metadata_is_missing() {
+        let project = tempfile::tempdir().unwrap();
+        git2::Repository::init(project.path()).unwrap();
+        let store = GitStore::open(project.path()).unwrap();
+        let base = store.current().unwrap().revision().clone();
+        store
+            .apply(&Transaction {
+                id: "fts-health".into(),
+                expected_revision: base,
+                operations: vec![Operation::put(StoredRecord::Plaintext {
+                    envelope: Box::new(Envelope::new("fts", "note", "searchable").unwrap()),
+                })],
+            })
+            .unwrap();
+        let projection = Projection::open(project.path().join("index"))
+            .await
+            .unwrap();
+        projection.synchronize(&store).await.unwrap();
+        let table = projection
+            .connection()
+            .unwrap()
+            .open_table(TABLE)
+            .execute()
+            .await
+            .unwrap();
+        for index in table.list_indices().await.unwrap() {
+            table.drop_index(&index.name).await.unwrap();
+        }
+
+        projection.synchronize(&store).await.unwrap();
+        let table = projection
+            .connection()
+            .unwrap()
+            .open_table(TABLE)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(table.list_indices().await.unwrap().len(), 3);
+    }
 }

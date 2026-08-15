@@ -16,9 +16,17 @@ ignore = []
 version = 2
 allow = [
     "Apache-2.0",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
     "FSL-1.1-MIT",
+    "ISC",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
+    "Zlib",
 ]
 confidence-threshold = 0.93
 
