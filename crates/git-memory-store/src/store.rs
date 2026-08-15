@@ -28,7 +28,7 @@ use chain::{
     changes_since, find_transaction, genesis_commit, memory_commit, require_retained_revision,
     transaction_commit,
 };
-use records::{build_tree, decode_record, record_oids, snapshot_tree, verify_record_location};
+use records::{build_tree, decode_record, snapshot_tree, verify_record_location};
 
 #[derive(Clone, Debug)]
 pub struct GitStore {
@@ -380,31 +380,37 @@ impl GitStore {
     /// Returns [`StoreError`] if either revision or record blob is invalid.
     pub fn diff(&self, from: &Revision, to: &Revision) -> Result<Vec<RecordChange>, StoreError> {
         let repository = self.repository()?;
-        let from_records = record_oids(&repository, &snapshot_tree(&repository, from)?)?;
-        let to_records = record_oids(&repository, &snapshot_tree(&repository, to)?)?;
-        let ids = from_records
-            .keys()
-            .chain(to_records.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| match (from_records.get(&id), to_records.get(&id)) {
-                (None, Some(_)) => Some(RecordChange {
-                    id,
-                    kind: ChangeKind::Added,
-                }),
-                (Some(_), None) => Some(RecordChange {
-                    id,
-                    kind: ChangeKind::Deleted,
-                }),
-                (Some(left), Some(right)) if left != right => Some(RecordChange {
-                    id,
-                    kind: ChangeKind::Modified,
-                }),
-                _ => None,
-            })
-            .collect())
+        let from_tree = snapshot_tree(&repository, from)?;
+        let to_tree = snapshot_tree(&repository, to)?;
+        let diff = repository
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+            .map_err(|error| StoreError::repository("diff memory trees", error))?;
+        let mut changes = Vec::new();
+        for delta in diff.deltas() {
+            let (oid, kind) = match delta.status() {
+                git2::Delta::Added => (delta.new_file().id(), ChangeKind::Added),
+                git2::Delta::Deleted => (delta.old_file().id(), ChangeKind::Deleted),
+                git2::Delta::Modified => (delta.new_file().id(), ChangeKind::Modified),
+                _ => continue,
+            };
+            let path = match kind {
+                ChangeKind::Deleted => delta.old_file().path(),
+                ChangeKind::Added | ChangeKind::Modified => delta.new_file().path(),
+            };
+            if !path
+                .and_then(Path::to_str)
+                .is_some_and(|path| path.starts_with("r-"))
+            {
+                continue;
+            }
+            let record = decode_record(&repository, oid)?;
+            changes.push(RecordChange {
+                id: RecordId::from_record(&record),
+                kind,
+            });
+        }
+        changes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(changes)
     }
 
     /// Export a deterministic record-only JSON bundle.

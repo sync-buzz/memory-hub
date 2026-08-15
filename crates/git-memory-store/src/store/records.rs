@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use git_memory_core::StoredRecord;
 use git2::{Oid, Repository, Tree};
@@ -56,28 +56,6 @@ pub(super) fn build_tree(
         .write()
         .map_err(|error| StoreError::repository("write transaction tree", error))?;
     Ok((tree, changed))
-}
-
-pub(super) fn record_oids(
-    repository: &Repository,
-    tree: &Tree<'_>,
-) -> Result<BTreeMap<RecordId, Oid>, StoreError> {
-    let mut result = BTreeMap::new();
-    for entry in tree {
-        if entry.name().ok().is_some_and(|name| name.starts_with("r-")) {
-            let record = decode_record(repository, entry.id())?;
-            let id = RecordId::from_record(&record);
-            verify_record_location(&id, &record, entry.name().ok())?;
-            if result.insert(id.clone(), entry.id()).is_some() {
-                return Err(StoreError::new(
-                    StoreErrorKind::InvalidRecord,
-                    "duplicate logical record in snapshot",
-                    serde_json::json!({"record": id.display_value()}),
-                ));
-            }
-        }
-    }
-    Ok(result)
 }
 
 pub(super) fn decode_record(repository: &Repository, oid: Oid) -> Result<StoredRecord, StoreError> {
