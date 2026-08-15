@@ -4,6 +4,7 @@ members = [
     "crates/git-memory",
     "crates/git-memory-contract",
     "crates/git-memory-core",
+    "crates/git-memory-embed",
     "crates/git-memory-mcp",
     "crates/git-memory-index",
     "crates/git-memory-reconcile",
@@ -30,18 +31,29 @@ todo = "warn"
 dbg_macro = "warn"
 
 [workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
 clap = { version = "4.5.46", features = ["derive"] }
+dirs = "5"
 fs2 = "0.4.3"
 arrow-array = "58.4"
 arrow-schema = "58.4"
 futures = "0.3.31"
 git2 = { version = "0.21.0", default-features = false }
+indicatif = "0.17"
+llama-cpp-2 = { version = "=0.1.154", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.154", default-features = false }
 lancedb = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 sha2 = "0.10.9"
 tempfile = "3.21.0"
+thiserror = "2"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"
