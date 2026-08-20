@@ -8,9 +8,11 @@
 //! easy to lose again, and cheap to state.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use git2::Repository;
 use memory_hub_core::{Envelope, StoredRecord};
+use memory_hub_embed::{EmbeddingProvider, MockProvider};
 use memory_hub_index::{SearchFilters, SearchRequest};
 use memory_hub_schema::type_key;
 use memory_hub_service::{ListingQuery, MemoryService, ScanChange};
@@ -20,10 +22,29 @@ use serde_json::json;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn service() -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
+    open_service(None)
+}
+
+/// The same project, answering the meaning channel with a stub.
+///
+/// Left to itself the service resolves whatever model the machine has on disk,
+/// so a test that reaches the vector channel passes where a GGUF was
+/// downloaded and fails where none ever was. The stub is the same everywhere.
+fn service_with_vectors() -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>>
+{
+    open_service(Some(Arc::new(MockProvider::new(64).constant())))
+}
+
+fn open_service(
+    provider: Option<Arc<dyn EmbeddingProvider>>,
+) -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     Repository::init(project.path())?;
     declare_storages(project.path())?;
-    let service = MemoryService::open(project.path().to_path_buf());
+    let mut service = MemoryService::open(project.path().to_path_buf());
+    if provider.is_some() {
+        service = service.with_provider(provider);
+    }
     Ok((project, service))
 }
 
@@ -65,7 +86,19 @@ fn seed(
 }
 
 fn attached_project() -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
-    let (project, service) = service()?;
+    attach(service()?)
+}
+
+/// An attached project whose meaning channel does not depend on the machine.
+fn attached_project_with_vectors()
+-> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
+    attach(service_with_vectors()?)
+}
+
+/// Declare the two types these tests use and create the folder `doc` names.
+fn attach(
+    (project, service): (tempfile::TempDir, MemoryService),
+) -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(project.path().join("docs"))?;
     seed(
         &service,
@@ -581,7 +614,11 @@ fn two_documents_whose_names_slug_alike_can_both_be_scanned() -> TestResult {
 /// empty document.
 #[test]
 fn a_binary_document_is_scanned_and_indexed_as_binary() -> TestResult {
-    let (project, service) = attached_project()?;
+    // With vectors, because a binary document has no text: its body is empty
+    // and a scanned document has no title, so neither BM25 nor the substring
+    // pass can reach it. What the index recorded about it is only observable
+    // through the meaning channel.
+    let (project, service) = attached_project_with_vectors()?;
     std::fs::write(
         project.path().join("docs/diagram.md"),
         [0x00_u8, 0xff, 0xfe, 0x01, 0x02],

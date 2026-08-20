@@ -130,6 +130,23 @@ impl MemoryService {
         }
     }
 
+    /// Use `provider` for the vector channel instead of whatever model this
+    /// machine happens to have on disk.
+    ///
+    /// Whether a GGUF is present is a property of the machine, so anything
+    /// that reaches the meaning channel answers one way on a laptop that has
+    /// downloaded a model and another on a runner that never has. A caller
+    /// that needs the channel to behave the same everywhere installs its own
+    /// provider — a test, above all.
+    ///
+    /// Takes effect only before the provider is first resolved; after that the
+    /// service keeps the one it has already answered with.
+    #[must_use]
+    pub fn with_provider(self, provider: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+        let _ = self.embed_provider.set(provider);
+        self
+    }
+
     #[must_use]
     pub fn project(&self) -> &Path {
         &self.project

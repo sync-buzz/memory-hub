@@ -17,6 +17,7 @@ pub struct MockProvider {
     pooling: Pooling,
     query_prefix: Option<String>,
     doc_prefix: Option<String>,
+    constant: bool,
 }
 
 impl MockProvider {
@@ -33,7 +34,21 @@ impl MockProvider {
             pooling: Pooling::Mean,
             query_prefix: None,
             doc_prefix: None,
+            constant: false,
         }
+    }
+
+    /// Answer every input with one and the same vector.
+    ///
+    /// Derived vectors are blake3 noise, and noise never clears the vector
+    /// channel's rescue floor — that floor is tuned for a model whose
+    /// distances mean something. A test that has to see the whole field
+    /// rather than a ranking of it asks for this: every record is then exactly
+    /// as near every query, and nothing is dropped on the way out.
+    #[must_use]
+    pub fn constant(mut self) -> Self {
+        self.constant = true;
+        self
     }
 
     #[must_use]
@@ -100,7 +115,10 @@ impl EmbeddingProvider for MockProvider {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(texts
             .iter()
-            .map(|t| derive_vector(t, self.dimensions))
+            .map(|text| {
+                let seed = if self.constant { "" } else { text.as_str() };
+                derive_vector(seed, self.dimensions)
+            })
             .collect())
     }
 }
