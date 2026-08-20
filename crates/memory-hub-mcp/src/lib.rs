@@ -471,6 +471,69 @@ impl Session {
         }]}))
     }
 
+    /// Run one tool by name, and do everything running it entails.
+    ///
+    /// Reconciliation ahead of a mutating tool and bringing the index to the
+    /// new revision after one are here, not at the call site: a host that had
+    /// to remember them would be reimplementing the engine, and the copy that
+    /// forgets one is the copy that corrupts something quietly.
+    ///
+    /// Notifications are deliberately not here. Which of these facts a client
+    /// is told, and in what words, belongs to whatever protocol the caller
+    /// speaks — this crate's own stdio server says it one way, a host that
+    /// links this crate and serves its own interface says it another. What
+    /// happened is reported; saying it is the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Failures arrive inside [`ToolCall::result`] rather than as an `Err`,
+    /// because a call that fails can still have moved the revision — a
+    /// reconciliation that pulled changes in before the tool refused is the
+    /// ordinary case — and a caller that dropped that would leave every client
+    /// reading a revision that no longer exists.
+    pub fn call(&mut self, name: &str, arguments: &Value) -> ToolCall {
+        let reconciled = if MUTATING_TOOLS.contains(&name) {
+            match self.service.reconcile_before_mutation() {
+                Ok(changed) => changed,
+                Err(error) => {
+                    return ToolCall {
+                        result: Err(ToolFailure::service(error).into()),
+                        revision_changed: false,
+                        changed: Vec::new(),
+                    };
+                }
+            }
+        } else {
+            false
+        };
+        match self.execute_tool(name, arguments) {
+            Ok(ToolOutcome {
+                content,
+                revision_changed,
+                changed,
+            }) => {
+                let moved = revision_changed || reconciled;
+                if moved && let Err(error) = self.service.sync_index() {
+                    return ToolCall {
+                        result: Err(ToolFailure::service(error).into()),
+                        revision_changed: moved,
+                        changed: Vec::new(),
+                    };
+                }
+                ToolCall {
+                    result: Ok(content),
+                    revision_changed: moved,
+                    changed,
+                }
+            }
+            Err(failure) => ToolCall {
+                result: Err(failure),
+                revision_changed: reconciled,
+                changed: Vec::new(),
+            },
+        }
+    }
+
     fn call_tool(
         &mut self,
         id: Value,
@@ -485,21 +548,15 @@ impl Session {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let reconciliation_changed = if matches!(
-            name,
-            "memory_apply_transaction" | "memory_checkpoint" | "memory_import"
-        ) {
-            match self.service.reconcile_before_mutation() {
-                Ok(changed) => changed,
-                Err(error) => {
-                    return Ok(rpc_result(id, tool_error(ToolFailure::service(error))));
-                }
-            }
-        } else {
-            false
-        };
-        let result = self.execute_tool(name, &arguments);
-        if reconciliation_changed && result.is_err() && self.revision_subscribed {
+        let ToolCall {
+            result,
+            revision_changed,
+            changed,
+        } = self.call(name, &arguments);
+        if !changed.is_empty() && self.records_subscribed {
+            write_json(output, &records_changed_notification(&changed))?;
+        }
+        if revision_changed && self.revision_subscribed {
             write_json(
                 output,
                 &json!({
@@ -510,31 +567,7 @@ impl Session {
             )?;
         }
         match result {
-            Ok(ToolOutcome {
-                content,
-                revision_changed,
-                changed,
-            }) => {
-                if (revision_changed || reconciliation_changed)
-                    && let Err(error) = self.service.sync_index()
-                {
-                    return Ok(rpc_result(id, tool_error(ToolFailure::service(error))));
-                }
-                if !changed.is_empty() && self.records_subscribed {
-                    write_json(output, &records_changed_notification(&changed))?;
-                }
-                if (revision_changed || reconciliation_changed) && self.revision_subscribed {
-                    write_json(
-                        output,
-                        &json!({
-                            "jsonrpc": "2.0",
-                            "method": "notifications/resources/updated",
-                            "params": {"uri": "memory://revision/current"}
-                        }),
-                    )?;
-                }
-                Ok(rpc_result(id, tool_success(content)))
-            }
+            Ok(content) => Ok(rpc_result(id, tool_success(content))),
             Err(ToolCallFailure::Rpc(error)) => {
                 if error.data.get("kind").and_then(Value::as_str) == Some("tool_not_found") {
                     Ok(rpc_error_owned(id, error.code, &error.message, error.data))
@@ -2371,6 +2404,28 @@ fn tool_error(error: ToolFailure) -> Value {
     let content =
         json!({"error": {"kind": error.kind, "message": error.message, "data": error.data}});
     json!({"content": [{"type": "text", "text": content.to_string()}], "structuredContent": content, "isError": true})
+}
+
+/// Tools that write, and so reconcile with the remote before they run.
+///
+/// Named here rather than spelled into the dispatch, because two places that
+/// list which tools write is one place too many.
+const MUTATING_TOOLS: &[&str] = &[
+    "memory_apply_transaction",
+    "memory_checkpoint",
+    "memory_import",
+];
+
+/// What one call to [`Session::call`] did.
+pub struct ToolCall {
+    /// What the tool answered, or how it failed.
+    pub result: Result<Value, ToolCallFailure>,
+    /// The revision moved — because the tool moved it, or because the
+    /// reconciliation ahead of it did. True even when the call then failed.
+    pub revision_changed: bool,
+    /// Which records the call touched, and how. Empty when the call failed:
+    /// what a client is told to re-read has to be something that was written.
+    pub changed: Vec<RecordNotice>,
 }
 
 pub struct ToolOutcome {
