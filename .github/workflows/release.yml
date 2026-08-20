@@ -1,0 +1,225 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    # Declared at job level so the signing step's `if` can test whether the
+    # certificate is configured — a step cannot read its own `env` in `if`.
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin memory-hub
+
+      - name: Strip binary (Linux)
+        if: runner.os == 'Linux'
+        run: strip target/${{ matrix.target }}/release/memory-hub
+
+      # The binary ships inside signed application bundles, and an unsigned executable
+      # in a signed bundle is a Gatekeeper failure. Signing happens here, at the
+      # point the artifact is produced; notarization is the bundling
+      # application's job, since a bare executable cannot be stapled.
+      #
+      # Without the certificate secrets this step is skipped and the release
+      # carries an unsigned macOS binary — usable for development, not for
+      # bundling.
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          certificate="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          codesign --force --timestamp --options runtime \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            target/${{ matrix.target }}/release/memory-hub
+          codesign --verify --strict --verbose=2 \
+            target/${{ matrix.target }}/release/memory-hub
+          rm -f "$certificate"
+          security delete-keychain "$keychain"
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/memory-hub staging/
+          cp README.md staging/
+          cp LICENSE staging/ 2>/dev/null || true
+          cp install.sh staging/
+          tar -czf memory-hub-${{ matrix.target }}.tar.gz -C staging .
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/memory-hub.exe" staging/
+          Copy-Item README.md staging/
+          if (Test-Path LICENSE) { Copy-Item LICENSE staging/ }
+          Compress-Archive -Path staging/* -DestinationPath "memory-hub-${{ matrix.target }}.zip"
+
+      - name: Generate checksum (Unix)
+        if: runner.os != 'Windows'
+        run: shasum -a 256 memory-hub-${{ matrix.target }}.tar.gz >> checksums.txt
+
+      - name: Generate checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "memory-hub-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $archive" | Out-File -Append -Encoding ascii checksums.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-hub-${{ matrix.target }}
+          path: |
+            memory-hub-${{ matrix.target }}.tar.gz
+            memory-hub-${{ matrix.target }}.zip
+            checksums.txt
+
+  sbom:
+    name: sbom / dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-sbom
+      - name: Generate cargo-deny advisories report
+        run: |
+          cargo install cargo-deny --locked --version ^0.16 || true
+          cargo deny check advisories --format json > sbom-advisories.json 2>/dev/null || true
+          cargo deny check licenses --format json > sbom-licenses.json 2>/dev/null || true
+      - name: Generate dependency tree
+        run: cargo tree --workspace --all-features > dependency-tree.txt
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-advisories.json
+            sbom-licenses.json
+            dependency-tree.txt
+
+  contract-test:
+    name: contract / release binary
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-contract
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: memory-hub-x86_64-unknown-linux-gnu
+          path: release-artifacts
+
+      - name: Extract binary
+        run: |
+          mkdir -p bin
+          tar -xzf release-artifacts/memory-hub-x86_64-unknown-linux-gnu.tar.gz -C bin
+          chmod +x bin/memory-hub
+
+      - name: Run contract tests against release binary
+        run: |
+          cargo test --locked -p memory-hub-contract --test release_binary_contract -- --nocapture
+        env:
+          MEMORY_HUB_RELEASE_BINARY: ${{ github.workspace }}/bin/memory-hub
+
+  release:
+    name: publish / github release
+    needs: [build, sbom, contract-test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge checksums
+        run: |
+          find artifacts -name "checksums.txt" -exec cat {} \; | sort -u > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*/memory-hub-*.tar.gz
+            artifacts/*/memory-hub-*.zip
+            checksums.txt
+            artifacts/sbom/sbom-advisories.json
+            artifacts/sbom/sbom-licenses.json
+            artifacts/sbom/dependency-tree.txt
+            install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

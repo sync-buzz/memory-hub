@@ -1,0 +1,33 @@
+[package]
+name = "memory-hub-service"
+description = "Typed use-case layer for Memory Hub, independent of any wire protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+memory-hub-core = { path = "../memory-hub-core" }
+memory-hub-crypto = { path = "../memory-hub-crypto" }
+memory-hub-embed = { path = "../memory-hub-embed" }
+memory-hub-engine = { path = "../memory-hub-engine" }
+memory-hub-folder = { path = "../memory-hub-folder" }
+memory-hub-index = { path = "../memory-hub-index" }
+memory-hub-reconcile = { path = "../memory-hub-reconcile" }
+memory-hub-schema = { path = "../memory-hub-schema" }
+memory-hub-store = { path = "../memory-hub-store" }
+git2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+age.workspace = true
+git2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

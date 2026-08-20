@@ -1,0 +1,24 @@
+[package]
+name = "memory-hub-schema"
+description = "Document type definitions, JSON Schema generation and envelope validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+memory-hub-core = { path = "../memory-hub-core" }
+memory-hub-engine = { path = "../memory-hub-engine" }
+serde.workspace = true
+serde_json.workspace = true
+jsonschema.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+memory-hub-engine = { path = "../memory-hub-engine" }
+
+[lints]
+workspace = true

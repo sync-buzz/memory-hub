@@ -1,0 +1,33 @@
+[package]
+name = "memory-hub-contract"
+description = "Black-box behavioral contract harness for Memory Hub servers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "memory_hub_contract"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memory-hub-contract"
+path = "src/main.rs"
+
+[[bin]]
+name = "memory-hub-contract-fake"
+path = "src/bin/fake.rs"
+
+[dependencies]
+clap.workspace = true
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

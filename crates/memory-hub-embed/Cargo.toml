@@ -1,0 +1,38 @@
+[package]
+name = "memory-hub-embed"
+description = "Embedding provider trait, model registry, llama.cpp backend and batch worker for Memory Hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+memory-hub-core = { path = "../memory-hub-core" }
+futures.workspace = true
+indicatif.workspace = true
+dirs.workspace = true
+llama-cpp-2 = { workspace = true }
+llama-cpp-sys-2 = { workspace = true }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "time", "macros", "rt-multi-thread"] }
+tracing.workspace = true
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+llama-cpp-2 = { workspace = true, features = ["metal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

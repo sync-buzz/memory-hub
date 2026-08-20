@@ -1,0 +1,32 @@
+[package]
+name = "memory-hub-index"
+description = "Recoverable LanceDB projection for Memory Hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+fs2.workspace = true
+futures.workspace = true
+memory-hub-core = { path = "../memory-hub-core" }
+memory-hub-embed = { path = "../memory-hub-embed" }
+memory-hub-engine = { path = "../memory-hub-engine" }
+lancedb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+memory-hub-store = { path = "../memory-hub-store" }
+git2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "memory-hub-mcp"
+description = "Public MCP stdio interface for Memory Hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+memory-hub-core = { path = "../memory-hub-core" }
+memory-hub-crypto = { path = "../memory-hub-crypto" }
+memory-hub-embed = { path = "../memory-hub-embed" }
+memory-hub-engine = { path = "../memory-hub-engine" }
+memory-hub-index = { path = "../memory-hub-index" }
+memory-hub-reconcile = { path = "../memory-hub-reconcile" }
+memory-hub-schema = { path = "../memory-hub-schema" }
+memory-hub-service = { path = "../memory-hub-service" }
+memory-hub-store = { path = "../memory-hub-store" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

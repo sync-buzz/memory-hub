@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/memory-hub",
+    "crates/memory-hub-contract",
+    "crates/memory-hub-core",
+    "crates/memory-hub-crypto",
+    "crates/memory-hub-engine",
+    "crates/memory-hub-embed",
+    "crates/memory-hub-folder",
+    "crates/memory-hub-mcp",
+    "crates/memory-hub-index",
+    "crates/memory-hub-reconcile",
+    "crates/memory-hub-sample-consumer",
+    "crates/memory-hub-schema",
+    "crates/memory-hub-service",
+    "crates/memory-hub-store",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "FSL-1.1-MIT"
+authors = ["Di Arch <owner@sync.buzz>"]
+repository = "https://github.com/sync-buzz/memory-hub"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1"
+age = { version = "0.11", features = ["ssh"] }
+clap = { version = "4.5.46", features = ["derive"] }
+dirs = "5"
+fs2 = "0.4.3"
+getrandom = "0.3"
+arrow-array = "58.4"
+arrow-schema = "58.4"
+futures = "0.3.31"
+git2 = { version = "0.21.0", default-features = false }
+indicatif = "0.17"
+jsonschema = "0.49"
+llama-cpp-2 = { version = "=0.1.154", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.154", default-features = false }
+lancedb = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sha2 = "0.10.9"
+tempfile = "3.21.0"
+thiserror = "2"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

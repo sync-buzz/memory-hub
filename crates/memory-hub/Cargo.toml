@@ -1,0 +1,46 @@
+[package]
+name = "memory-hub"
+description = "Standalone project memory: records in Git objects or in plain files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "memory-hub"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+memory-hub-embed = { path = "../memory-hub-embed" }
+memory-hub-mcp = { path = "../memory-hub-mcp" }
+memory-hub-index = { path = "../memory-hub-index" }
+memory-hub-reconcile = { path = "../memory-hub-reconcile" }
+memory-hub-service = { path = "../memory-hub-service" }
+memory-hub-store = { path = "../memory-hub-store" }
+indicatif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+age.workspace = true
+fs2.workspace = true
+memory-hub-contract = { path = "../memory-hub-contract" }
+memory-hub-core = { path = "../memory-hub-core" }
+memory-hub-crypto = { path = "../memory-hub-crypto" }
+git2.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

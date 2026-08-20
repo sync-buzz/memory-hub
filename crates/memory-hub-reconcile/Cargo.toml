@@ -1,0 +1,25 @@
+[package]
+name = "memory-hub-reconcile"
+description = "Hookless code-history reconciliation for Memory Hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fs2.workspace = true
+memory-hub-core = { path = "../memory-hub-core" }
+memory-hub-store = { path = "../memory-hub-store" }
+git2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true
