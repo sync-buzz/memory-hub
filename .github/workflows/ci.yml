@@ -28,6 +28,13 @@ jobs:
           toolchain: 1.91.0
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      # LanceDB's `lance-encoding` generates its Arrow definitions in a build
+      # script, and prost-build wants a `protoc` on PATH — no runner image ships
+      # one. Pinned, so every platform generates from the same compiler.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check workspace

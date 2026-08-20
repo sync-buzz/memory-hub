@@ -50,6 +50,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      # `lance-encoding` needs a `protoc` on PATH; see the note in ci.yml.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin memory-hub
@@ -174,6 +179,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-contract
+      # `lance-encoding` needs a `protoc` on PATH; see the note in ci.yml.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Linux binary
         uses: actions/download-artifact@v4
