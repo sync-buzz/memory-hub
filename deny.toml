@@ -10,7 +10,20 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # RSA timing sidechannel (Marvin Attack) in `rsa`, which `age` pulls in for
+    # its `ssh` feature. There is no fixed release — the advisory itself says
+    # "No safe upgrade is available!" — and the feature is not optional here:
+    # reusing the SSH key somebody already has is how encrypted projects are
+    # unlocked.
+    #
+    # What it takes to exploit: many timed decryptions of chosen ciphertexts
+    # against one RSA private key. Unlocking happens locally, with a key file
+    # the person running it already holds, and an RSA key is reachable only if
+    # they point `memory_unlock` at one — Memory Hub generates X25519 and
+    # documents ed25519. Revisit when `rsa` publishes a fix.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed release; RSA reachable only through a user-supplied RSA SSH identity" },
+]
 
 [licenses]
 version = 2
@@ -25,6 +38,7 @@ allow = [
     "FSL-1.1-MIT",
     "ISC",
     "MIT",
+    "MIT-0",
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
