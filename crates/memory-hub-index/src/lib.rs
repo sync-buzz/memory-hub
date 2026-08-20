@@ -1880,9 +1880,18 @@ fn try_lock_exclusive_at(root: &Path) -> Result<Option<File>, IndexError> {
     let file = open_lock_file(root)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(file)),
-        // `fs2` reports contention as `WouldBlock` on every platform it
-        // supports; anything else is a real I/O failure.
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        // Contention is not one error across platforms. Unix answers
+        // `EWOULDBLOCK`; Windows answers `ERROR_LOCK_VIOLATION`, which std
+        // does not classify — its `ErrorKind` is indistinguishable from a real
+        // I/O failure, and reading it as one turns "another session is using
+        // this index" into an error a starting session reports. `fs2` names
+        // the value each platform uses, so the raw codes are what to compare.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error.into()),
     }
 }
