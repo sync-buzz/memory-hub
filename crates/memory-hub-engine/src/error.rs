@@ -24,15 +24,7 @@ pub enum StoreErrorKind {
     AuthenticationFailed,
     NamespaceRejected,
     TransportFailed,
-    SignatureInvalid,
-    SigningNotConfigured,
     MergeConflict,
-    /// The storage holds its records under a key nobody has supplied yet.
-    ///
-    /// Separate from `invalid_argument` because it is not about the request:
-    /// the same call succeeds once the store is unlocked, and a client needs
-    /// to tell "ask for a key" apart from "you asked wrongly".
-    Locked,
     /// The backend does not offer the capability that was asked for. Reported
     /// rather than silently ignored, so a caller can tell "this store cannot"
     /// apart from "this store did nothing".

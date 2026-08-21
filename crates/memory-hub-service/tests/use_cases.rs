@@ -12,7 +12,7 @@ use std::path::Path;
 use git2::Repository;
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_index::{SearchFilters, SearchRequest};
-use memory_hub_service::{ListingQuery, ListingSort, MemoryService};
+use memory_hub_service::{ListingQuery, ListingSort, MemoryService, RecordsIn};
 use memory_hub_store::{ExportMode, Operation, RecordId, Revision};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -20,30 +20,8 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn service() -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     Repository::init(project.path())?;
-    declare_storages(project.path())?;
-    let service = MemoryService::open(project.path().to_path_buf());
+    let service = MemoryService::open(project.path().to_path_buf(), RecordsIn::GitMetadata);
     Ok((project, service))
-}
-
-/// The storages these tests' projects declare.
-///
-/// `main` holds the records; `docs` and `handbook` are folders of the working
-/// tree that types can name.
-fn declare_storages(project: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let config = serde_json::json!({
-        "config_version": 1,
-        "storages": {
-            "main": {"kind": "refs", "holds": ["records", "content"]},
-            "docs": {"kind": "repo_folder", "path": "docs", "holds": ["content"]},
-            "handbook": {"kind": "repo_folder", "path": "handbook", "holds": ["content"]},
-        },
-    });
-    std::fs::create_dir_all(project.join(".memory"))?;
-    std::fs::write(
-        project.join(".memory/config.json"),
-        serde_json::to_vec_pretty(&config)?,
-    )?;
-    Ok(())
 }
 
 fn put(key: &str, kind: &str, content: &str) -> Result<Operation, Box<dyn std::error::Error>> {
@@ -145,19 +123,6 @@ fn listing_filters_sorts_and_pages_over_the_whole_corpus() -> TestResult {
 }
 
 #[test]
-fn checkpoints_name_a_state_history_can_walk() -> TestResult {
-    let (_project, service) = service()?;
-    seed(&service, vec![put("note-1", "note", "first")?])?;
-    let checkpoint = service.checkpoint("first milestone")?;
-
-    let history = service.history(10)?;
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].revision, checkpoint.revision);
-    assert_eq!(history[0].message, "first milestone");
-    Ok(())
-}
-
-#[test]
 fn export_and_import_round_trip_a_corpus() -> TestResult {
     let (_source_dir, source) = service()?;
     seed(
@@ -173,7 +138,7 @@ fn export_and_import_round_trip_a_corpus() -> TestResult {
 
     let (_target_dir, target) = service()?;
     let expected = target.current_revision()?;
-    target.import("restore", expected, bundle)?;
+    target.import("restore", expected, &bundle)?;
 
     let listing = target.list_records(&ListingQuery::default(), None)?;
     assert_eq!(listing.total, 2, "both records landed");
@@ -195,7 +160,7 @@ fn import_rejects_a_bundle_from_a_future_schema() -> TestResult {
 
     let expected = service.current_revision()?;
     let error = service
-        .import("restore", expected, bundle)
+        .import("restore", expected, &bundle)
         .expect_err("an unknown bundle version is refused");
     assert_eq!(error.kind, "invalid_argument");
     Ok(())
@@ -227,22 +192,6 @@ fn search_finds_a_record_and_backlinks_find_who_points_at_it() -> TestResult {
 
     let backlinks = service.backlinks("target", None)?;
     assert_eq!(backlinks.entries.len(), 1, "the mention is an inbound link");
-    Ok(())
-}
-
-#[test]
-fn a_plaintext_project_reports_itself_as_plaintext() -> TestResult {
-    let (_project, service) = service()?;
-    assert!(!service.is_encrypted());
-    assert!(
-        !service.encryption_status().is_encrypted(),
-        "nothing to unlock on a plaintext project"
-    );
-
-    let error = service
-        .list_recipients()
-        .expect_err("recipients are an encrypted-project concept");
-    assert_eq!(error.kind, "not_encrypted");
     Ok(())
 }
 
@@ -339,15 +288,6 @@ fn corpus_operations_do_not_depend_on_a_reachable_backend() -> TestResult {
     assert!(
         listing.records.iter().any(|(key, _)| key == "note-1"),
         "listing answers over what Memory holds"
-    );
-
-    let checkpoint = service.checkpoint("with an unreachable place declared")?;
-    assert!(
-        service
-            .history(10)?
-            .iter()
-            .any(|entry| entry.commit == checkpoint.commit),
-        "the checkpoint is in history"
     );
 
     service.export(&service.current_revision()?, ExportMode::Manifest)?;
@@ -606,7 +546,7 @@ fn record_named(bundle: &memory_hub_store::ExportBundle, key: &str) -> Envelope 
             StoredRecord::Plaintext { envelope } if id.display_value() == key => {
                 Some((**envelope).clone())
             }
-            _ => None,
+            StoredRecord::Plaintext { .. } => None,
         })
         .expect("the bundle carries that record")
 }
@@ -632,7 +572,7 @@ fn a_bundle_from_before_the_mode_field_imports_as_a_manifest() -> TestResult {
 
     let (_target_dir, target) = fresh_service()?;
     let expected = target.current_revision()?;
-    target.import("restore", expected, older)?;
+    target.import("restore", expected, &older)?;
     assert_eq!(
         target.list_records(&ListingQuery::default(), None)?.total,
         1
@@ -1729,45 +1669,6 @@ fn a_reference_records_links_live_in_refs_with_everything_else() -> TestResult {
     Ok(())
 }
 
-/// A locked project answers with `locked`, not with nothing found. The two are
-/// the same shape and mean opposite things: one says look elsewhere, the other
-/// says unlock and look again.
-#[test]
-fn a_locked_search_is_not_an_empty_result() -> TestResult {
-    use memory_hub_store::{EncryptedStore, RecipientEntry};
-
-    let project = tempfile::tempdir()?;
-    Repository::init(project.path())?;
-    declare_storages(project.path())?;
-    let identity = age::x25519::Identity::generate();
-    let recipient = identity.to_public();
-    {
-        let mut store = EncryptedStore::open_locked(project.path())?;
-        store.unlock(Box::new(identity))?;
-        let _ = store.init(vec![RecipientEntry {
-            public_key: recipient.to_string(),
-            key_type: "x25519".to_owned(),
-            label: Some("owner".to_owned()),
-        }])?;
-    }
-
-    let service = MemoryService::open(project.path().to_path_buf());
-    assert!(service.is_encrypted() && !service.is_unlocked());
-
-    let error = service
-        .search(&SearchRequest {
-            query: "anything".to_owned(),
-            limit: 10,
-            offset: 0,
-            filters: SearchFilters::default(),
-            revision: service.current_revision()?,
-        })
-        .expect_err("a locked project cannot say what it does not have");
-    assert_eq!(error.kind, "locked");
-    assert_eq!(error.data["recovery_action"], "unlock_with_identity");
-    Ok(())
-}
-
 /// A directory exists on disk with no permission from us, and a tree drawn
 /// from records alone shows none of the ways that can happen.
 #[test]
@@ -2257,7 +2158,7 @@ use memory_hub_service::{Attachment, DocumentSource, FolderSource};
 fn docs_source(project: &std::path::Path) -> FolderSource<'_> {
     FolderSource::new(
         project,
-        Attachment::new("docs".to_owned(), "*.md".to_owned()),
+        Attachment::new("docs".to_owned()),
     )
 }
 
@@ -2442,4 +2343,98 @@ fn a_media_type_comes_from_the_name() {
     // guessing something a viewer would act on.
     assert_eq!(media_type_for("docs/notes.dwg"), None);
     assert_eq!(media_type_for("docs/LICENSE"), None);
+}
+
+// --- Deleting a document, and removing the type over its folder ------------
+
+/// A record owns its body wherever the project put it, so deleting the record
+/// takes the document — and the deletion has to stick.
+///
+/// The bug this pins: leaving the file behind is not a smaller deletion, it is
+/// a deletion that undoes itself. The next scan finds a document belonging to
+/// no record and hands back a record for it, with a key derived from the path
+/// and none of the links the deleted one had.
+#[test]
+fn deleting_a_record_takes_its_document_and_the_scan_does_not_bring_it_back() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc(project.path(), "guide.md", "# Guide\n")?;
+    write_doc(project.path(), "setup.md", "# Setup\n")?;
+    commit_all(project.path(), "the documents")?;
+    service.scan_attachments("attach")?;
+
+    let expected = service.current_revision()?;
+    service.apply_transaction(
+        "remove",
+        expected,
+        vec![Operation::delete(RecordId::plaintext("guide"))],
+    )?;
+
+    assert!(service.get_record("guide", None)?.record.is_none());
+    assert!(
+        !project.path().join("docs/guide.md").exists(),
+        "the document went with its record"
+    );
+    assert!(
+        project.path().join("docs/setup.md").exists(),
+        "and nothing else did"
+    );
+
+    let report = service.scan_attachments("rescan")?;
+    assert!(
+        !report
+            .changes
+            .iter()
+            .any(|change| matches!(change, ScanChange::New { .. })),
+        "the deletion is not undone by the next scan: {:?}",
+        report.changes
+    );
+    assert!(
+        service.get_record("guide", None)?.record.is_none(),
+        "and the record stays gone"
+    );
+    Ok(())
+}
+
+/// Removing a type is the other operation, and the difference is the working
+/// tree.
+///
+/// The records of an attached type describe files the repository had before
+/// Memory did. So the type goes, its records go, the declaration that pointed
+/// at the folder goes — and every file stays exactly where it was.
+#[test]
+fn removing_a_type_over_a_folder_detaches_it_and_keeps_every_file() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc(project.path(), "guide.md", "# Guide\n")?;
+    write_doc(project.path(), "setup.md", "# Setup\n")?;
+    commit_all(project.path(), "the documents")?;
+    service.scan_attachments("attach")?;
+    let before = snapshot_of_folder(project.path())?;
+
+    let removal = service.remove_type("doc", "detach")?;
+
+    assert_eq!(removal.removed, 2, "both records of the type went");
+    assert_eq!(removal.detached.as_deref(), Some("docs"));
+    assert_eq!(
+        snapshot_of_folder(project.path())?,
+        before,
+        "the folder is exactly as it was"
+    );
+    assert!(service.get_record("guide", None)?.record.is_none());
+    assert!(
+        service.schema_registry()?.get("doc").is_none(),
+        "the definition went with them"
+    );
+    // The type that keeps its content in its records is untouched by all of it.
+    assert!(service.schema_registry()?.get("note").is_some());
+    Ok(())
+}
+
+/// A type this project does not hold is a refusal, not a silent success: a
+/// caller that misspelled a kind has not removed anything and should be told.
+#[test]
+fn removing_a_type_the_project_does_not_hold_is_refused() -> TestResult {
+    let (_project, service) = attached_project()?;
+    let failure = service.remove_type("nonesuch", "detach").unwrap_err();
+    assert_eq!(failure.kind, "invalid_argument");
+    Ok(())
 }

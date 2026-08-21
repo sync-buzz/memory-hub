@@ -1,57 +1,58 @@
-//! Which storage a type's records live in.
+//! Where a type keeps its documents.
 //!
-//! A type names a storage the project declared — `docs`, `media`, `main` — and
-//! that is the whole of it. What that name *is* — a folder, refs, a database —
-//! is the project's business, written once where the project declares its
-//! storages, not repeated in every type that uses one.
+//! A type either keeps its bodies in its records, or names a directory of the
+//! working tree and keeps them there as files. The directory is written in the
+//! definition itself — the path, not a label standing for one — so reading a
+//! type answers the question outright instead of sending the reader to a second
+//! place that has to agree with this one.
 //!
-//! The name is checked here for shape only. Whether a storage by that name
-//! exists is a question about the project, and the schema has never seen the
-//! project: it is answered where the declaration is read.
+//! The path is checked here for shape only. Whether the directory exists, and
+//! what is in it, are questions about the working tree, which the schema has
+//! never seen: they are answered where the folder is read.
 
 use crate::{TYPE_KIND, ValidationError, ValidationErrorKind};
 
-/// The storage a type names, or the one it gets by not naming any.
+/// Where a type's documents are.
 ///
-/// Absent means "wherever records live" — the storage the project declared as
-/// holding records. A type that says nothing about storage is a type whose
-/// bodies sit in its records, which is what every type was before storage
-/// became a choice.
+/// Absent means "with the records" — a type that says nothing about storage is
+/// a type whose bodies sit in its records, which is what every type was before
+/// storage became a choice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeStorage {
-    /// Bodies live with the envelopes, in whichever storage holds records.
+    /// Bodies live with the envelopes, wherever the host keeps records.
     WithRecords,
-    /// Bodies live in the named storage.
-    Named(String),
+    /// Bodies are files in this directory of the working tree, relative to the
+    /// project root.
+    Folder(String),
 }
 
 impl TypeStorage {
-    /// The storage name, when the type named one.
+    /// The directory, when the type named one.
     #[must_use]
-    pub fn name(&self) -> Option<&str> {
+    pub fn folder(&self) -> Option<&str> {
         match self {
             Self::WithRecords => None,
-            Self::Named(name) => Some(name),
+            Self::Folder(folder) => Some(folder),
         }
     }
 
     /// Whether the content of this type lives outside its records.
     #[must_use]
     pub const fn is_external(&self) -> bool {
-        matches!(self, Self::Named(_))
+        matches!(self, Self::Folder(_))
     }
 }
 
 /// Resolve what a type declared.
 ///
 /// `kind_name` is needed because the type registry is the one type that cannot
-/// choose: reading a storage name requires reading the registry, and reading
-/// the registry requires already knowing where it is.
+/// choose: reading a storage requires reading the registry, and reading the
+/// registry requires already knowing where it is.
 pub(crate) fn resolve(
     kind_name: &str,
     declared: Option<&str>,
 ) -> Result<TypeStorage, ValidationError> {
-    let Some(name) = declared else {
+    let Some(folder) = declared else {
         return Ok(TypeStorage::WithRecords);
     };
 
@@ -59,52 +60,38 @@ pub(crate) fn resolve(
         return Err(ValidationError::with_data(
             ValidationErrorKind::InvalidTypeDefinition,
             "storage",
-            "`__type__` cannot name a storage: the registry is the load point \
+            "`__type__` cannot name a folder: the registry is the load point \
              and always lives where records live",
             serde_json::json!({"kind_name": kind_name}),
         ));
     }
 
-    check_name(name)?;
-    Ok(TypeStorage::Named(name.to_owned()))
+    check_folder(folder)?;
+    Ok(TypeStorage::Folder(folder.to_owned()))
 }
 
-/// Whether a string is shaped like a storage name.
-///
-/// Public because the rule has two readers: a type naming a storage, and the
-/// project declaring one. Stated twice, the two would drift, and a name
-/// accepted where it is declared and refused where it is used is a project
-/// nobody can fix.
-///
-/// Shape only. A name that is well-formed and points at nothing is a different
-/// failure, reported by whoever holds the project's declaration — and reported
-/// with the list of names that do exist, which this module cannot know.
-#[must_use]
-pub fn is_storage_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-        })
-        && name
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_lowercase())
-}
+/// How a path that fails [`check_folder`] is described.
+pub const STORAGE_FOLDER_RULE: &str = "a type's storage is a normalized, project-relative \
+                                       directory, and not `.git`";
 
-/// How a name that fails [`is_storage_name`] is described, so both readers of
-/// the rule say the same thing about it.
-pub const STORAGE_NAME_RULE: &str = "a storage name starts with a letter and holds only \
-                                     lowercase letters, digits, `-` and `_`";
-
-fn check_name(name: &str) -> Result<(), ValidationError> {
-    if is_storage_name(name) {
+/// A directory of the working tree, said the way a locator says one.
+///
+/// The same rule a `content_ref` path is held to, because a document of this
+/// type is written under this directory and the two would otherwise disagree
+/// about the same string. Two rules on top of it: no trailing slash, so one
+/// directory has one spelling, and not Git's own directory, which is inside the
+/// project without being part of it.
+fn check_folder(folder: &str) -> Result<(), ValidationError> {
+    let well_formed = !folder.ends_with('/')
+        && memory_hub_core::validate_locator("storage", folder).is_ok()
+        && folder.split('/').next() != Some(".git");
+    if well_formed {
         return Ok(());
     }
     Err(ValidationError::with_data(
         ValidationErrorKind::InvalidTypeDefinition,
         "storage",
-        STORAGE_NAME_RULE,
-        serde_json::json!({"storage": name}),
+        STORAGE_FOLDER_RULE,
+        serde_json::json!({"storage": folder}),
     ))
 }

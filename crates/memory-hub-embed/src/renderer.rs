@@ -13,14 +13,11 @@ pub const RENDERER_VERSION: u32 = 1;
 
 /// Render the canonical embedding input text for a record.
 ///
-/// For plaintext records the envelope's `kind`, `title` and `content` are
-/// composed into a single deterministic string. Encrypted records yield an
-/// empty string — they are not embedded.
+/// The envelope's `kind`, `title` and `content`, composed into a single
+/// deterministic string.
 #[must_use]
 pub fn render_envelope(record: &StoredRecord) -> String {
-    let StoredRecord::Plaintext { envelope } = record else {
-        return String::new();
-    };
+    let StoredRecord::Plaintext { envelope } = record;
     render_envelope_inner(envelope)
 }
 
@@ -56,27 +53,6 @@ mod tests {
         let envelope = Envelope::new("key", "note", "body").unwrap();
         let text = render_envelope_inner(&envelope);
         assert_eq!(text, "note — body");
-    }
-
-    #[test]
-    fn encrypted_record_yields_empty() {
-        use memory_hub_core::{CURRENT_ENVELOPE_VERSION, EncryptedRecord, OpaqueStorageId};
-        use std::collections::BTreeMap;
-        let record = StoredRecord::Encrypted {
-            encrypted: EncryptedRecord {
-                envelope_version: CURRENT_ENVELOPE_VERSION,
-                storage_id: OpaqueStorageId::new(
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                )
-                .unwrap(),
-                key_epoch: 1,
-                cipher_suite: "suite".into(),
-                nonce: "nonce".into(),
-                ciphertext: "ct".into(),
-                extensions: BTreeMap::new(),
-            },
-        };
-        assert_eq!(render_envelope(&record), "");
     }
 
     #[test]

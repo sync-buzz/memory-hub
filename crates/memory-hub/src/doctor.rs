@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use memory_hub_reconcile::{ReconcileErrorKind, Reconciler};
-use memory_hub_store::{
-    GitStore, RemoteMemory, probe_remote_memory, read_code_origin_url, read_remote_config,
-};
+use memory_hub_store::{GitStore, MemoryPresence, memory_presence, read_remote_config};
 use serde::Serialize;
 
 use crate::model;
@@ -74,7 +72,6 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
         // that has memory.
         checks.push(presence_check(&requested_project));
         checks.push(reconciliation_check(&requested_project));
-        checks.push(encryption_check(&requested_project));
         checks.push(remote_privacy_check(&requested_project));
     } else {
         checks.push(Check::error(
@@ -91,11 +88,6 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
             "memory.reconciliation",
             "reconciliation_check_skipped",
             "reconciliation check was skipped because a prerequisite failed",
-        ));
-        checks.push(Check::error(
-            "memory.encryption",
-            "encryption_check_skipped",
-            "encryption check was skipped because a prerequisite failed",
         ));
         checks.push(Check::error(
             "memory.remote_privacy",
@@ -123,94 +115,29 @@ pub(crate) fn inspect(project: Option<&Path>) -> Report {
 
 /// Tell "this project has no memory" apart from "its memory is on the remote".
 ///
-/// `git clone` copies no `refs/memory/*`, so from inside a fresh clone the two
-/// states are indistinguishable — and only one of them is a defect the user
-/// can fix. This is the one place where the invisibility of memory stops being
-/// a property and becomes a bug, so the check asks the remote, and only when
-/// there is nothing local to explain the emptiness.
+/// The question belongs to the store rather than to this file — Sync asks it
+/// too, from the flow that opens a project, and two implementations of "is the
+/// memory here" would drift on the one answer neither caller can check by
+/// looking. What is left here is the rendering of it.
 ///
-/// The question is asked without a configured memory remote too: before anyone
-/// configures one, the code `origin` is the only address the repository knows,
-/// and it is the address the memory almost certainly sits next to.
+/// One thing is given up by not asking it here. The three ways the question
+/// could fail to be put — no Git directory, unreadable records, unreadable
+/// configuration — now arrive as one refusal: their `kind` collapses to
+/// `presence_unavailable`, while git's own words stay in the message. None of
+/// the three was ever documented as stable. The three that were —
+/// `memory_not_fetched`, `no_memory_anywhere`, `remote_unreachable` — are
+/// unchanged, and so is every message a person reads.
 fn presence_check(project: &Path) -> Check {
-    let git_dir = match GitStore::discover_git_dir(project) {
-        Ok(dir) => dir,
-        Err(error) => {
-            return Check::ok_with_kind(
-                "memory.presence",
-                "git_dir_unavailable",
-                format!("memory presence check skipped: {error}"),
-                None,
-            );
-        }
-    };
-
-    match local_record_count(project, &git_dir) {
-        Ok(0) => empty_memory_check(&git_dir),
-        Ok(count) => Check::ok(
+    match memory_presence(project) {
+        Ok(MemoryPresence::Present { records }) => Check::ok(
             "memory.presence",
-            format!("memory is present in this repository: {count} record(s)"),
+            format!("memory is present in this repository: {records} record(s)"),
             None,
         ),
-        Err(error) => Check::ok_with_kind(
-            "memory.presence",
-            "records_unavailable",
-            format!("memory presence check skipped: {error}"),
-            None,
-        ),
-    }
-}
-
-/// Count what memory this repository actually holds.
-///
-/// Records, not refs: `refs/memory/staged` is created by the first store that
-/// opens the repository — including a previous `doctor` run — so its presence
-/// says nothing about whether any memory was ever written. Listing the refs
-/// first keeps the common empty case from opening a store at all.
-fn local_record_count(project: &Path, git_dir: &Path) -> Result<usize, String> {
-    let refs = git_output(
-        project,
-        "git for-each-ref refs/memory/",
-        ["for-each-ref", "--format=%(refname)", "refs/memory/"],
-    )?;
-    if refs.is_empty() {
-        return Ok(0);
-    }
-    let store = GitStore::open(git_dir).map_err(|error| error.to_string())?;
-    let view = store.current().map_err(|error| error.to_string())?;
-    view.records()
-        .map(|records| records.len())
-        .map_err(|error| error.to_string())
-}
-
-/// Explain an empty memory by asking the remote whether it has one.
-fn empty_memory_check(git_dir: &Path) -> Check {
-    let (url, configured) = match read_remote_config(git_dir) {
-        Ok(Some(remote)) => (Some(remote.url), true),
-        Ok(None) => (read_code_origin_url(git_dir).ok().flatten(), false),
-        Err(error) => {
-            return Check::ok_with_kind(
-                "memory.presence",
-                "config_unavailable",
-                format!("memory presence check skipped: {error}"),
-                None,
-            );
-        }
-    };
-
-    let Some(url) = url else {
-        return Check::ok_with_kind(
-            "memory.presence",
-            "no_memory_anywhere",
-            "this repository has no memory and no remote to ask about one — \
-             memory begins with the first record written through `memory-hub mcp`"
-                .to_string(),
-            None,
-        );
-    };
-
-    match probe_remote_memory(git_dir, &url) {
-        Ok(RemoteMemory::Present) if configured => Check::error(
+        Ok(MemoryPresence::NotFetched {
+            url,
+            configured: true,
+        }) => Check::error(
             "memory.presence",
             "memory_not_fetched",
             format!(
@@ -218,7 +145,10 @@ fn empty_memory_check(git_dir: &Path) -> Check {
                  does not copy refs/memory/* — run `memory-hub fetch`"
             ),
         ),
-        Ok(RemoteMemory::Present) => Check::error(
+        Ok(MemoryPresence::NotFetched {
+            url,
+            configured: false,
+        }) => Check::error(
             "memory.presence",
             "memory_not_fetched",
             format!(
@@ -227,7 +157,7 @@ fn empty_memory_check(git_dir: &Path) -> Check {
                  `memory-hub remote add {url}`, then `memory-hub fetch`"
             ),
         ),
-        Ok(RemoteMemory::Absent) => Check::ok_with_kind(
+        Ok(MemoryPresence::Absent { url: Some(url) }) => Check::ok_with_kind(
             "memory.presence",
             "no_memory_anywhere",
             format!(
@@ -236,14 +166,28 @@ fn empty_memory_check(git_dir: &Path) -> Check {
             ),
             None,
         ),
-        Err(error) => Check::ok_with_kind(
+        Ok(MemoryPresence::Absent { url: None }) => Check::ok_with_kind(
+            "memory.presence",
+            "no_memory_anywhere",
+            "this repository has no memory and no remote to ask about one — \
+             memory begins with the first record written through `memory-hub mcp`"
+                .to_string(),
+            None,
+        ),
+        Ok(MemoryPresence::Unreachable { url, reason }) => Check::ok_with_kind(
             "memory.presence",
             "remote_unreachable",
             format!(
                 "this repository has no memory and {url} could not be asked \
-                 whether it has any ({error}) — memory does not arrive with \
+                 whether it has any ({reason}) — memory does not arrive with \
                  `git clone`, so run `memory-hub fetch` once the remote answers"
             ),
+            None,
+        ),
+        Err(error) => Check::ok_with_kind(
+            "memory.presence",
+            "presence_unavailable",
+            format!("memory presence check skipped: {error}"),
             None,
         ),
     }
@@ -296,68 +240,6 @@ const fn reconcile_kind(kind: ReconcileErrorKind) -> &'static str {
         ReconcileErrorKind::Cursor => "cursor_error",
         ReconcileErrorKind::Diverged => "code_history_diverged",
         ReconcileErrorKind::Store => "store_error",
-    }
-}
-
-fn encryption_check(project: &Path) -> Check {
-    let store = match GitStore::open(project) {
-        Ok(store) => store,
-        Err(error) => {
-            return Check::ok_with_kind(
-                "memory.encryption",
-                "store_unavailable",
-                format!("encrypted-mode check skipped: {error}"),
-                None,
-            );
-        }
-    };
-    let snapshot = match store.current() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return Check::ok_with_kind(
-                "memory.encryption",
-                "snapshot_unavailable",
-                format!("encrypted-mode check skipped: {error}"),
-                None,
-            );
-        }
-    };
-    let encrypted = match store.has_encrypted_records(snapshot.revision()) {
-        Ok(encrypted) => encrypted,
-        Err(error) => {
-            return Check::ok_with_kind(
-                "memory.encryption",
-                "records_unavailable",
-                format!("encrypted-mode check skipped: {error}"),
-                None,
-            );
-        }
-    };
-
-    if encrypted {
-        Check::ok_with_kind(
-            "memory.encryption",
-            "rotation_limitation",
-            "encrypted mode is active: recipient rotation (add/remove) \
-             re-encrypts future snapshots only — already-downloaded plaintext, \
-             exported records, and old Git history remain readable by former \
-             recipients. Old SSH/X25519 keys are not revoked; rotate keys at \
-             the provider if compromise is suspected."
-                .to_string(),
-            None,
-        )
-    } else {
-        Check::ok_with_kind(
-            "memory.encryption",
-            "plaintext_history_is_permanent",
-            "encrypted mode is not active; records are stored in plaintext. \
-             Turning encryption on later protects future writes only — the \
-             plaintext blobs already in Git history stay readable to anyone \
-             with the repository, so treat it as changing what happens next, \
-             never as making the past private."
-                .to_string(),
-            None,
-        )
     }
 }
 

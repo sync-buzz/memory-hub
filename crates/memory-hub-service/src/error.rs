@@ -35,22 +35,6 @@ impl ServiceError {
         Self::new("invalid_argument", message, json!({"field": field}))
     }
 
-    /// The project is encrypted and the store has not been unlocked.
-    #[must_use]
-    pub fn locked() -> Self {
-        Self::new(
-            "locked",
-            "encrypted store is locked — unlock it with an identity first",
-            json!({"recovery_action": "unlock_with_identity"}),
-        )
-    }
-
-    /// The operation only means something on an encrypted project.
-    #[must_use]
-    pub fn not_encrypted(message: impl Into<String>) -> Self {
-        Self::new("not_encrypted", message, json!({}))
-    }
-
     #[must_use]
     pub fn store(error: StoreError) -> Self {
         Self::new(store_kind(error.kind), error.message, error.data)
@@ -89,11 +73,7 @@ const fn store_kind(kind: StoreErrorKind) -> &'static str {
         StoreErrorKind::AuthenticationFailed => "authentication_failed",
         StoreErrorKind::NamespaceRejected => "namespace_rejected",
         StoreErrorKind::TransportFailed => "transport_failed",
-        StoreErrorKind::SignatureInvalid => "signature_invalid",
-        StoreErrorKind::SigningNotConfigured => "signing_not_configured",
         StoreErrorKind::MergeConflict => "merge_conflict",
-        // The vocabulary a client already branches on for a locked project.
-        StoreErrorKind::Locked => "locked",
         StoreErrorKind::Unsupported => "unsupported",
     }
 }

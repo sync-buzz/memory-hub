@@ -13,121 +13,98 @@
 //! plaintext and encrypted projects, which lives here once.
 
 mod attach;
-mod config;
 mod error;
 mod listing;
 mod policy;
+mod records;
 
 pub use attach::{
     Attachment, DocumentSource, FolderSource, KnownRecord, RENAME_THRESHOLD, RenameCandidate,
     ScanChange, SourceCapabilities, SourceDocument, directory_rename, media_type_for, unique_key,
-};
-pub use config::{
-    CONFIG_PATH, DEFAULT_NEW_FILES, DEFAULT_RECORDS_PATH, Holds, ProjectConfig, StorageConfig,
-    StorageKind,
 };
 pub use error::ServiceError;
 pub use listing::{
     FolderEntry, Listing, ListingCounts, ListingQuery, ListingSort, PresenceFilter, folder_in_scope,
 };
 pub use policy::{SchemaPolicy, load_registry};
+pub use records::{DEFAULT_RECORDS_PATH, RecordsIn};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use memory_hub_core::{ContentHash, ContentRef, Envelope, FreshnessState, Presence, StoredRecord};
-use memory_hub_crypto::load_identity;
 use memory_hub_embed::{EmbeddingProvider, ModelRuntime, ModelStatus, ModelStatusBuilder};
 use memory_hub_folder::FolderStore;
 use memory_hub_index::{
     BacklinkEntry, ContentResolver, Projection, ProjectionStatus, ResolvedContent, SearchRequest,
-    SearchResult, SilentDestroy,
+    SearchResult,
 };
 use memory_hub_reconcile::{DivergenceMode, ReconcileReport, Reconciler};
 use memory_hub_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition, TypeStorage};
 use memory_hub_store::{
-    ApplyResult, Capability, Checkpoint, EncryptedStore, ExportBundle, ExportMode, FetchResult,
-    GitStore, MemoryRemote, Operation, PushPolicyResult, RecipientEntry, RecordChange, RecordId,
+    ApplyResult, ExportBundle, ExportMode, FetchResult, GitStore,
+    MemoryRemote, Operation, PushPolicyResult, RecordChange, RecordId,
     RecordStore, Revision, StoreDescription, StoreView, Transaction, TransactionPolicy,
 };
 
 /// Result alias for every use case.
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
-/// A store to work through, however this service came by it.
+/// A store to work through, opened for the call that asked for it.
 ///
-/// Two cases, and they differ in who owns the store rather than in what a
-/// caller does with it: a plaintext store is opened per call and handed over,
-/// while an encrypted one is held by the service because it carries the
-/// unlocked identity. `Deref` is what keeps that difference from reaching
-/// every call site.
-pub enum StoreHandle<'a> {
-    Owned(Box<dyn RecordStore + 'a>),
-    Borrowed(&'a dyn RecordStore),
+/// A wrapper rather than a bare box so that callers keep saying `&*store` and
+/// nothing else has to know how the store was come by.
+pub struct StoreHandle<'a>(Box<dyn RecordStore + 'a>);
+
+impl<'a> StoreHandle<'a> {
+    fn new(store: Box<dyn RecordStore + 'a>) -> Self {
+        Self(store)
+    }
 }
 
 impl<'a> std::ops::Deref for StoreHandle<'a> {
     type Target = dyn RecordStore + 'a;
 
     fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(store) => &**store,
-            Self::Borrowed(store) => *store,
-        }
+        &*self.0
     }
 }
 
 /// One project's Memory, driven through typed use cases.
 ///
-/// A service is bound to a project directory for its lifetime and owns the
-/// encrypted store's lock state, so unlocking once is visible to every
-/// subsequent call.
+/// A service is bound to a project directory for its lifetime.
 pub struct MemoryService {
     project: PathBuf,
-    /// The project's storage declaration, read once. Not read in `open`
-    /// because a project may not have one yet — `init` is what creates it, and
-    /// a service that refused to exist until then could not run `init`.
-    config: OnceLock<ProjectConfig>,
-    encrypted_store: Option<EncryptedStore>,
+    /// Where this project's records are, as the host named them when it
+    /// opened. There is no default and nothing to read: an engine that guessed
+    /// would be deciding for the product that embedded it.
+    records: RecordsIn,
     /// Resolved on first use. `None` inside the cell means "no model on disk",
     /// which is a valid, cached answer — search then runs FTS-only.
     embed_provider: OnceLock<Option<Arc<dyn EmbeddingProvider>>>,
 }
 
 impl MemoryService {
-    /// Bind to a project.
+    /// Bind to a project whose records are where `records` says.
     ///
-    /// An encrypted project's index is ephemeral: it exists only while a live
-    /// session holds it unlocked. If a previous process was killed before it
-    /// could be destroyed, plaintext index files may still be on disk, so they
-    /// are wiped here — unless another live session holds the projection lock,
-    /// in which case that index belongs to that session.
+    /// Nothing is read or created here. The storage is prepared by the first
+    /// call that needs it — opening it is what creates it — so a host may bind
+    /// to a project that has never held memory and find out from an ordinary
+    /// read rather than from a separate ceremony.
     #[must_use]
-    pub fn open(project: PathBuf) -> Self {
-        let encrypted_store = memory_hub_store::is_encrypted_project(&project)
-            .unwrap_or(false)
-            .then(|| EncryptedStore::open_locked(&project).ok())
-            .flatten();
-        if encrypted_store.is_some()
-            && let Ok(git_store) = GitStore::open(&project)
-        {
-            match Projection::destroy_store_silent(&git_store) {
-                Ok(SilentDestroy::Wiped) => {}
-                Ok(SilentDestroy::HeldByLiveSession) => eprintln!(
-                    "memory-hub: another session holds the search index for this project — leaving it in place"
-                ),
-                Err(error) => {
-                    eprintln!("memory-hub: could not clear the ephemeral search index: {error}");
-                }
-            }
-        }
+    pub const fn open(project: PathBuf, records: RecordsIn) -> Self {
         Self {
             project,
-            config: OnceLock::new(),
-            encrypted_store,
+            records,
             embed_provider: OnceLock::new(),
         }
+    }
+
+    /// Where this project's records are.
+    #[must_use]
+    pub const fn records(&self) -> &RecordsIn {
+        &self.records
     }
 
     /// Use `provider` for the vector channel instead of whatever model this
@@ -150,18 +127,6 @@ impl MemoryService {
     #[must_use]
     pub fn project(&self) -> &Path {
         &self.project
-    }
-
-    #[must_use]
-    pub fn is_encrypted(&self) -> bool {
-        self.encrypted_store.is_some()
-    }
-
-    #[must_use]
-    pub fn is_unlocked(&self) -> bool {
-        self.encrypted_store
-            .as_ref()
-            .is_some_and(EncryptedStore::is_unlocked)
     }
 
     /// Reads what a record's locator points at, for the index.
@@ -189,83 +154,74 @@ impl MemoryService {
             .clone()
     }
 
-    /// Declare this project's storages and prepare the one that holds records.
+    /// Remove a type from the project, and detach the folder it was over.
     ///
-    /// There is no default. memory-hub is an engine something else embeds, and
-    /// a default here would be the engine deciding for the product that
-    /// embedded it — which is exactly the decision the product exists to make.
-    /// A caller that does not care still has to say so out loud.
+    /// An operation of its own rather than a delete per record, and the
+    /// difference is what it does to the working tree. Deleting a record takes
+    /// its document, because a record owns its body wherever the project put
+    /// it. A type over an attached folder owns nothing: its records are what
+    /// Memory knows about files that were in the repository before it was
+    /// asked, and were written and reviewed by people who need not have heard
+    /// of it. So the definition goes, the records that mirror the folder go,
+    /// and every file stays exactly where it is.
+    ///
+    /// For a type whose documents *are* its records there is nothing to
+    /// detach, and its records go with it because they are its content.
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError`] when the declaration does not hold together,
-    /// when the project already has one, or when the storage that holds
-    /// records cannot be prepared.
-    pub fn init(
-        project: &Path,
-        storages: BTreeMap<String, StorageConfig>,
-    ) -> Result<ProjectConfig> {
-        let config = ProjectConfig::new(storages)?;
-        // Prepared before the declaration is written: a project that says it
-        // keeps records somewhere unusable is worse than one that says nothing,
-        // because the second is honest about needing `init`.
-        let (_, records) = config.record_storage()?;
-        match records.kind {
-            StorageKind::Refs => {
-                GitStore::open(project).map_err(ServiceError::store)?;
-            }
-            StorageKind::Folder => {
-                let path = records.path.as_deref().unwrap_or(DEFAULT_RECORDS_PATH);
-                FolderStore::open(project.join(path)).map_err(ServiceError::store)?;
-            }
-            StorageKind::RepoFolder => {
-                return Err(ServiceError::invalid_argument(
-                    "storages",
-                    "a folder of somebody else's documents cannot hold records",
-                ));
-            }
+    /// Returns [`ServiceError`] when the project holds no such type, or when
+    /// the records cannot be read or written.
+    pub fn remove_type(&self, kind: &str, transaction_id: &str) -> Result<TypeRemoval> {
+        let registry = self.schema_registry()?;
+        if registry.get(kind).is_none() {
+            return Err(ServiceError::invalid_argument(
+                "kind",
+                format!("this project holds no type `{kind}`"),
+            ));
         }
-        config.save_new(project)?;
-        Ok(config)
-    }
+        let storage = registry.storage_for(kind).map_err(|error| {
+            ServiceError::invalid_argument("kind", format!("type `{kind}`: {}", error.message))
+        })?;
+        let detached = attachment_for(&storage).map(|attachment| attachment.folder);
 
-    /// Declare another storage for this project.
-    ///
-    /// Separate from `init` because the two are different questions: `init`
-    /// asks where a project's memory lives, and this asks where one more kind
-    /// of content does. A project that could only be told once would send
-    /// people to edit the file by hand.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project has no declaration yet, the
-    /// name is taken, or the result does not hold together.
-    pub fn declare_storage(&mut self, name: &str, storage: StorageConfig) -> Result<ProjectConfig> {
-        let updated = self.config()?.declare(name, storage)?;
-        updated.save(&self.project)?;
-        // The cached declaration is now the old one. Taking `&mut self` is
-        // what makes this expressible: a reader holding a `&ProjectConfig`
-        // cannot be looking at it while it is replaced.
-        self.config = OnceLock::from(updated.clone());
-        Ok(updated)
-    }
-
-    /// The project's storage declaration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] with kind `not_initialised` when the project
-    /// has none, which is the honest answer for a project nobody has run
-    /// `init` in.
-    pub fn config(&self) -> Result<&ProjectConfig> {
-        if let Some(config) = self.config.get() {
-            return Ok(config);
+        let (revision, envelopes) = self.corpus(None)?;
+        let mut removed = 0;
+        let mut operations = Vec::new();
+        for (key, envelope) in &envelopes {
+            // The definition is found by what it says it is, not by a key
+            // derived here: the key a definition was written under belongs to
+            // whoever wrote it, and a second opinion about its shape is how a
+            // type comes to be deleted except for the record that declares it.
+            let is_definition = envelope.kind == TYPE_KIND
+                && TypeDefinition::from_content(&envelope.content)
+                    .is_ok_and(|definition| definition.kind_name == kind);
+            if envelope.kind == kind {
+                removed += 1;
+            } else if !is_definition {
+                continue;
+            }
+            operations.push(Operation::delete(RecordId::plaintext(key)));
         }
-        let loaded = ProjectConfig::load(&self.project)?;
-        // Success is cached; failure is not. A project can be initialised
-        // while a service is alive, and a service that remembered the absence
-        // would keep reporting it afterwards.
-        Ok(self.config.get_or_init(|| loaded))
+
+        // Straight to the store, because these deletions are the one kind that
+        // must not take documents with them — see the doc comment. Going
+        // through `apply_transaction` here is how "delete the type" would come
+        // to mean "delete the team's documentation folder".
+        let result = self
+            .record_store()?
+            .apply(&Transaction {
+                id: transaction_id.to_owned(),
+                expected_revision: revision,
+                operations,
+            })
+            .map_err(ServiceError::store)?;
+
+        Ok(TypeRemoval {
+            revision: result.revision,
+            removed,
+            detached,
+        })
     }
 
     /// Open the storage this project keeps its records in.
@@ -280,42 +236,18 @@ impl MemoryService {
     /// Returns [`ServiceError`] when the project has no declaration or the
     /// storage cannot be opened.
     pub fn record_store(&self) -> Result<StoreHandle<'_>> {
-        // Read first, and for every project. "This project has said where its
-        // records live" is what `init` establishes, and a gate that let an
-        // encrypted project through would make the answer depend on something
-        // the caller never asked about — while `git_store`, one method away,
-        // still refused.
-        let config = self.config()?;
-        // An encrypted project's store is the one this service is holding
-        // open: it carries the unlocked identity, and a second one built here
-        // would be locked no matter how many times somebody unlocked the
-        // first.
-        if let Some(store) = self.encrypted_store.as_ref() {
-            return Ok(StoreHandle::Borrowed(store));
-        }
-        let policy: Arc<dyn TransactionPolicy> =
-            Arc::new(SchemaPolicy::default().with_config(config.clone()));
-        let (_, storage) = config.record_storage()?;
-        match storage.kind {
-            StorageKind::Refs => Ok(StoreHandle::Owned(Box::new(
+        let policy: Arc<dyn TransactionPolicy> = Arc::new(SchemaPolicy::default());
+        match &self.records {
+            RecordsIn::GitMetadata => Ok(StoreHandle::new(Box::new(
                 GitStore::open(&self.project)
                     .map_err(ServiceError::store)?
                     .with_policy(policy),
             ))),
-            StorageKind::Folder => {
-                let path = storage.path.as_deref().unwrap_or(DEFAULT_RECORDS_PATH);
-                Ok(StoreHandle::Owned(Box::new(
-                    FolderStore::open(self.project.join(path))
-                        .map_err(ServiceError::store)?
-                        .with_policy(policy),
-                )))
-            }
-            // A validated declaration never routes records here; this is the
-            // path for one that reached the project some other way.
-            StorageKind::RepoFolder => Err(ServiceError::invalid_argument(
-                "storages",
-                "a folder of somebody else's documents cannot hold records",
-            )),
+            RecordsIn::Directory(path) => Ok(StoreHandle::new(Box::new(
+                FolderStore::open(self.project.join(path))
+                    .map_err(ServiceError::store)?
+                    .with_policy(policy),
+            ))),
         }
     }
 
@@ -332,36 +264,16 @@ impl MemoryService {
     /// Returns [`ServiceError`] with kind `unsupported` when this project's
     /// records do not live in Git, or when the repository cannot be opened.
     pub fn git_store(&self) -> Result<GitStore> {
-        let (name, storage) = self.config()?.record_storage()?;
-        if storage.kind != StorageKind::Refs {
+        let RecordsIn::GitMetadata = &self.records else {
             return Err(ServiceError::new(
                 "unsupported",
                 "this project keeps its records outside Git, so it has no Git store",
-                serde_json::json!({
-                    "storage": name,
-                    "kind": storage.kind,
-                }),
+                serde_json::json!({"records": "directory"}),
             ));
-        }
-        let policy = SchemaPolicy::default().with_config(self.config()?.clone());
-        GitStore::open(&self.project)
-            .map(|store| store.with_policy(Arc::new(policy)))
-            .map_err(ServiceError::store)
-    }
-
-    /// What kind of storage a type names, as the project declared it.
-    ///
-    /// `None` when the type names none — its content lives with its records.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the type names a storage the project has
-    /// not declared.
-    fn declared_kind(&self, storage: &TypeStorage) -> Result<Option<StorageKind>> {
-        let Some(name) = storage.name() else {
-            return Ok(None);
         };
-        Ok(Some(self.config()?.storage(name)?.kind))
+        GitStore::open(&self.project)
+            .map(|store| store.with_policy(Arc::new(SchemaPolicy::default())))
+            .map_err(ServiceError::store)
     }
 
     /// The source holding a type's documents.
@@ -369,60 +281,18 @@ impl MemoryService {
     /// # Errors
     ///
     /// Returns [`ServiceError`] when the type keeps its content in its records
-    /// — there is no source to reach — or names a storage the project has not
-    /// declared.
+    /// — there is no source to reach.
     fn source_for_kind(&self, kind: &str) -> Result<FolderSource<'_>> {
         let storage = self.schema_registry()?.storage_for(kind).map_err(|error| {
             ServiceError::invalid_argument("kind", format!("type `{kind}`: {}", error.message))
         })?;
-        let attachment = self.attachment_for(&storage)?.ok_or_else(|| {
+        let attachment = attachment_for(&storage).ok_or_else(|| {
             ServiceError::invalid_argument(
                 "key",
                 format!("type `{kind}` keeps its content in its records"),
             )
         })?;
         Ok(FolderSource::new(&self.project, attachment))
-    }
-
-    /// Where a type's documents are, when they are files in the working tree.
-    ///
-    /// `None` means "the bodies sit in the records" — either because the type
-    /// named no storage, or because it named the one that holds records, which
-    /// is the same place said out loud.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the type names a storage the project has
-    /// not declared, or one that cannot hold the body of a type. The second is
-    /// `unsupported` rather than a quiet `None`: answering "with the records"
-    /// for a storage that is not the records would put content somewhere
-    /// nobody asked for, and a migration would report it as done.
-    fn attachment_for(&self, storage: &TypeStorage) -> Result<Option<Attachment>> {
-        let Some(name) = storage.name() else {
-            return Ok(None);
-        };
-        let config = self.config()?;
-        let declared = config.storage(name)?;
-        if declared.kind != StorageKind::RepoFolder {
-            let (records_name, _) = config.record_storage()?;
-            if name == records_name {
-                return Ok(None);
-            }
-            return Err(ServiceError::new(
-                "unsupported",
-                format!("storage `{name}` cannot hold the bodies of a type"),
-                serde_json::json!({
-                    "field": "storage",
-                    "storage": name,
-                    "kind": declared.kind,
-                    "records_storage": records_name,
-                }),
-            ));
-        }
-        Ok(declared
-            .path
-            .as_ref()
-            .map(|folder| Attachment::new(folder.clone(), declared.new_files().to_owned())))
     }
 
     /// What the backend says about itself.
@@ -439,55 +309,19 @@ impl MemoryService {
         Ok(self.record_store()?.describe())
     }
 
-    /// The encrypted store, or a `locked` / `not_encrypted` failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is plaintext or still locked.
-    pub fn unlocked_encrypted(&self) -> Result<&EncryptedStore> {
-        let store = self
-            .encrypted_store
-            .as_ref()
-            .ok_or_else(|| ServiceError::not_encrypted("project is not encrypted"))?;
-        if store.is_unlocked() {
-            Ok(store)
-        } else {
-            Err(ServiceError::locked())
-        }
-    }
-
-    /// Bring the search index in line with the store: from decrypted records
-    /// for an unlocked encrypted project, from the Git snapshot otherwise.
+    /// Bring the search index in line with the store.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError`] when the index cannot be rebuilt.
     pub fn sync_index(&self) -> Result<()> {
-        let provider = self.provider();
-        if let Some(store) = self.encrypted_store.as_ref()
-            && store.is_unlocked()
-        {
-            let records = store.list().map_err(ServiceError::store)?;
-            let revision = store.current_revision().map_err(ServiceError::store)?;
-            let git_store = self.record_store()?;
-            Projection::rebuild_from_envelopes_store_with(
-                &*git_store,
-                &records,
-                &revision,
-                provider,
-                Some(self.content_resolver()),
-            )
+        let store = self.record_store()?;
+        Projection::synchronize_store_with(&*store, self.provider(), Some(self.content_resolver()))
             .map_err(|error| ServiceError::index(&error))?;
-        } else {
-            let store = self.record_store()?;
-            Projection::synchronize_store_with(&*store, provider, Some(self.content_resolver()))
-                .map_err(|error| ServiceError::index(&error))?;
-        }
         Ok(())
     }
 
-    /// The corpus a read operates on: decrypted envelopes for an encrypted
-    /// project, the plaintext records of a snapshot otherwise.
+    /// The corpus a read operates on: the records of a snapshot.
     ///
     /// # Errors
     ///
@@ -507,25 +341,17 @@ impl MemoryService {
             .records()
             .map_err(ServiceError::store)?
             .into_iter()
-            .filter_map(|(id, record)| match record {
-                StoredRecord::Plaintext { envelope } => Some((id.display_value(), *envelope)),
-                StoredRecord::Encrypted { .. } => None,
-            })
+            .map(|(id, StoredRecord::Plaintext { envelope })| (id.display_value(), *envelope))
             .collect();
         Ok((revision, envelopes))
     }
 
-    /// The revision every read serves by default: the staged one.
+    /// The revision every read serves by default: the current one.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError`] when the store cannot be read.
     pub fn current_revision(&self) -> Result<Revision> {
-        if let Some(store) = self.encrypted_store.as_ref()
-            && store.is_unlocked()
-        {
-            return store.current_revision().map_err(ServiceError::store);
-        }
         self.record_store()?
             .current_revision()
             .map_err(ServiceError::store)
@@ -567,6 +393,17 @@ impl MemoryService {
                 "a transaction needs at least one operation",
             ));
         }
+        // A deletion takes the record's document with it, when the record has
+        // one. Documents first, records second, for the same reason writing
+        // does it in that order — see [`Self::write_reference_content`]: an
+        // interruption between the two has to leave something a scan can see
+        // and repair. A file removed without its record is a record reporting
+        // its document as gone, which `doctor` raises and a person settles. The
+        // other order leaves a document belonging to no record, which the next
+        // scan hands back as a *new* record — a deletion that undoes itself,
+        // with a new key and none of the links the old one had.
+        self.remove_deleted_documents(&operations)?;
+
         // Every envelope lives in the storage that holds records — that is
         // what "holds records" means. Where a type's *content* lives is a
         // separate question, and not one a transaction has to answer.
@@ -583,6 +420,62 @@ impl MemoryService {
             .map_err(ServiceError::store)
     }
 
+    /// Take the documents of the records a transaction deletes.
+    ///
+    /// Deleting is one operation whatever the storage: what differs is how
+    /// much of the record there is to take. A record that keeps its body in
+    /// itself is gone when its envelope is; a record whose body is a document
+    /// owns that document, and leaving the file behind would be a deletion the
+    /// next scan reverses. The caller says `delete` either way — where the
+    /// content lives is the project's own declaration and never a parameter of
+    /// the operation.
+    ///
+    /// Records this transaction is *writing* are untouched, including the ones
+    /// it writes over: a `put` is not a deletion, and a document only moves
+    /// when the scan says its file did.
+    fn remove_deleted_documents(&self, operations: &[Operation]) -> Result<()> {
+        let deleted: Vec<&RecordId> = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Delete { id } => Some(id),
+                Operation::Put { .. } => None,
+            })
+            .collect();
+        if deleted.is_empty() {
+            return Ok(());
+        }
+
+        let store = self.record_store()?;
+        let snapshot = StoreView::current(&*store).map_err(ServiceError::store)?;
+        // One registry read for the batch: a cascade deletes several records of
+        // the same type, and each of them would otherwise re-read the schema.
+        let registry = self.schema_registry()?;
+
+        for id in deleted {
+            let Some(StoredRecord::Plaintext { envelope }) =
+                snapshot.get(id).map_err(ServiceError::store)?
+            else {
+                // Already not here. The transaction will say so itself.
+                continue;
+            };
+            let Some(reference) = &envelope.content_ref else {
+                continue;
+            };
+            // A type whose declaration this project no longer holds, or one
+            // whose storage is the records: there is no source to ask, and a
+            // path guessed from the locator would be this layer deciding what a
+            // locator means. The record goes; the file is left where it is.
+            let Ok(storage) = registry.storage_for(&envelope.kind) else {
+                continue;
+            };
+            let Some(attachment) = attachment_for(&storage) else {
+                continue;
+            };
+            FolderSource::new(&self.project, attachment).remove(&reference.path)?;
+        }
+        Ok(())
+    }
+
     /// Read a record's body, following its locator when it has one.
     ///
     /// # Errors
@@ -593,13 +486,7 @@ impl MemoryService {
     pub fn resolve_content(&self, key: &str) -> Result<ContentResolution> {
         let view = self.get_record(key, None)?;
         let envelope = match view.record {
-            // A plaintext project hands over the stored envelope; an unlocked
-            // encrypted one hands over the decrypted envelope. Same value to
-            // read a body from.
             Some(StoredRecord::Plaintext { envelope }) => *envelope,
-            // Ciphertext reaching this layer means the store handed over what
-            // it could not decrypt — it is locked.
-            Some(StoredRecord::Encrypted { .. }) => return Err(ServiceError::locked()),
             None => return Err(ServiceError::invalid_argument("key", "no such record")),
         };
         let Some(reference) = &envelope.content_ref else {
@@ -733,7 +620,7 @@ impl MemoryService {
             let Ok(storage) = definition.storage() else {
                 continue;
             };
-            let Some(attachment) = self.attachment_for(&storage)? else {
+            let Some(attachment) = attachment_for(&storage) else {
                 continue;
             };
             let source = FolderSource::new(&self.project, attachment.clone());
@@ -1010,22 +897,16 @@ impl MemoryService {
             .map(|envelope| envelope.key.clone())
             .collect();
 
-        // Asked before a plan is drawn, not while it is carried out: a plan
-        // naming a destination the migration will then refuse is a dry run
-        // that answers a different question than the run it stands in for.
-        self.attachment_for(&to)?;
-
-        // What each side is, as the project declared it. A name alone does
-        // not say whether a move puts content in front of the whole team.
-        let from_kind = self.declared_kind(&from)?;
-        let to_kind = self.declared_kind(&to)?;
-        let visible = |kind: Option<StorageKind>| kind == Some(StorageKind::RepoFolder);
+        // Visible to the whole team: a directory of the repository, which is
+        // what a type naming a folder keeps its documents in. The other side
+        // of the choice is the records, which nobody sees in a diff.
+        let visible = TypeStorage::is_external;
 
         let mut warnings = Vec::new();
-        // Two folders are two storages, even though both are folders. Saying
-        // so is what keeps this from looking like a setting nobody has to
-        // think about.
-        if visible(from_kind) && visible(to_kind) && from != to {
+        // Two folders are two places, even though both are folders. Saying so
+        // is what keeps this from looking like a setting nobody has to think
+        // about.
+        if visible(&from) && visible(&to) && from != to {
             warnings.push(MigrationWarning {
                 code: "files_are_left_in_place",
                 message: "the content is written into the new folder and the files in the old \
@@ -1034,7 +915,7 @@ impl MemoryService {
                     .to_owned(),
             });
         }
-        if !visible(from_kind) && visible(to_kind) {
+        if !visible(&from) && visible(&to) {
             warnings.push(MigrationWarning {
                 code: "content_becomes_visible",
                 message: "the content of every record of this type will be written into the \
@@ -1043,7 +924,7 @@ impl MemoryService {
                     .to_owned(),
             });
         }
-        if visible(from_kind) && !visible(to_kind) {
+        if visible(&from) && !visible(&to) {
             warnings.push(MigrationWarning {
                 code: "does_not_hide_published_history",
                 message: "moving content out of the working tree does not hide what was \
@@ -1063,8 +944,8 @@ impl MemoryService {
 
         Ok(MigrationPlan {
             kind: kind.to_owned(),
-            from: from.name().map(str::to_owned),
-            to: to.name().map(str::to_owned),
+            from: from.folder().map(str::to_owned),
+            to: to.folder().map(str::to_owned),
             unchanged: from == to,
             keys: subjects,
             warnings,
@@ -1134,7 +1015,7 @@ impl MemoryService {
             .map_err(|error| ServiceError::invalid_argument("storage", error.message.clone()))?;
 
         let (revision, records) = self.envelopes()?;
-        let attachment = self.attachment_for(&storage)?;
+        let attachment = attachment_for(&storage);
         let mut operations = Vec::new();
         for envelope in &records {
             if envelope.kind != kind {
@@ -1210,14 +1091,10 @@ impl MemoryService {
         };
 
         // Into the working tree. The locator is checked before anything is
-        // written: it is built by putting the record's key into the mask, keys
-        // are arbitrary strings, and the envelope validator that would catch a
-        // bad one runs after the file is already on disk.
-        let locator = format!(
-            "{}/{}",
-            attachment.folder,
-            file_name_for(&attachment.new_files, &envelope.key)
-        );
+        // written: it is the record's key under the folder, keys are arbitrary
+        // strings, and the envelope validator that would catch a bad one runs
+        // after the file is already on disk.
+        let locator = format!("{}/{}{NEW_DOCUMENT_SUFFIX}", attachment.folder, envelope.key);
         memory_hub_core::validate_locator("content_ref.path", &locator).map_err(|error| {
             ServiceError::invalid_argument(
                 "key",
@@ -1505,33 +1382,11 @@ impl MemoryService {
             let Ok(storage) = definition.storage() else {
                 continue;
             };
-            if let Some(attachment) = self.attachment_for(&storage)? {
+            if let Some(attachment) = attachment_for(&storage) {
                 attachments.push(attachment);
             }
         }
         Ok(attachments)
-    }
-
-    /// Promote the staged revision to a named canonical checkpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the checkpoint cannot be written.
-    pub fn checkpoint(&self, message: &str) -> Result<Checkpoint> {
-        self.git_store()?
-            .checkpoint(message)
-            .map_err(ServiceError::store)
-    }
-
-    /// List canonical checkpoints, newest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when history cannot be read.
-    pub fn history(&self, limit: usize) -> Result<Vec<Checkpoint>> {
-        self.git_store()?
-            .history(limit.min(HISTORY_MAX))
-            .map_err(ServiceError::store)
     }
 
     /// Compare two revisions.
@@ -1547,50 +1402,11 @@ impl MemoryService {
 
     /// Export a deterministic record bundle.
     ///
-    /// An encrypted project decrypts on the way out — the tree holds
-    /// ciphertext, so a raw export would produce a bundle nobody can import —
-    /// and only its current revision can be exported.
-    ///
     /// # Errors
     ///
-    /// Returns [`ServiceError`] when the store is locked, the revision is not
-    /// exportable, or the bundle cannot be read.
+    /// Returns [`ServiceError`] when the revision is not exportable or the
+    /// bundle cannot be read.
     pub fn export(&self, revision: &Revision, mode: ExportMode) -> Result<ExportView> {
-        if self.is_encrypted() {
-            let store = self.unlocked_encrypted()?;
-            let current = store.current_revision().map_err(ServiceError::store)?;
-            if *revision != current {
-                return Err(ServiceError::new(
-                    "unsupported_revision",
-                    "encrypted projects can only export the current revision",
-                    serde_json::json!({
-                        "requested": revision,
-                        "current": current,
-                        "recovery_action": "export_current_revision",
-                    }),
-                ));
-            }
-            let records = store.list().map_err(ServiceError::store)?;
-            let bundle = ExportBundle {
-                schema_version: memory_hub_store::EXPORT_SCHEMA_VERSION,
-                mode,
-                records: records
-                    .into_iter()
-                    .map(|(key, envelope)| {
-                        (
-                            RecordId::plaintext(&key),
-                            StoredRecord::Plaintext {
-                                envelope: Box::new(envelope),
-                            },
-                        )
-                    })
-                    .collect(),
-            };
-            return Ok(ExportView {
-                revision: current,
-                bundle,
-            });
-        }
         let store = self.record_store()?;
         let mut records = store.read_records(revision).map_err(ServiceError::store)?;
         if mode == ExportMode::Snapshot {
@@ -1615,9 +1431,7 @@ impl MemoryService {
     /// carries what it could read; it does not fail the whole export over one
     /// document somebody moved, and it does not invent an empty body for it.
     fn inline_resolved_content(&self, record: &mut StoredRecord) {
-        let StoredRecord::Plaintext { envelope } = record else {
-            return;
-        };
+        let StoredRecord::Plaintext { envelope } = record;
         let Some(reference) = envelope.content_ref.clone() else {
             return;
         };
@@ -1644,7 +1458,7 @@ impl MemoryService {
         &self,
         transaction_id: &str,
         expected_revision: Revision,
-        bundle: ExportBundle,
+        bundle: &ExportBundle,
     ) -> Result<ApplyResult> {
         // Version 1 is accepted as what it is: a bundle from before content
         // could live outside a record, which is a manifest by construction.
@@ -1660,59 +1474,19 @@ impl MemoryService {
                 }),
             ));
         }
-        if !self.is_encrypted() {
-            let bytes = serde_json::to_vec(&bundle).map_err(|error| {
-                ServiceError::invalid_argument(
-                    "bundle",
-                    format!("bundle is not encodable: {error}"),
-                )
-            })?;
-            let store = self.record_store()?;
-            let portable = store.portable().ok_or_else(|| {
-                ServiceError::new(
-                    "unsupported",
-                    "this project's storage cannot take an imported bundle",
-                    serde_json::json!({"backend": store.describe().backend}),
-                )
-            })?;
-            return portable
-                .import(transaction_id, expected_revision, &bytes)
-                .map_err(ServiceError::store);
-        }
-        let store = self.unlocked_encrypted()?;
-        let mut puts: Vec<(String, Envelope)> = Vec::with_capacity(bundle.records.len());
-        for (id, record) in bundle.records {
-            let StoredRecord::Plaintext { envelope } = record else {
-                return Err(ServiceError::invalid_argument(
-                    "bundle",
-                    "encrypted projects import plaintext envelopes only — the store encrypts them",
-                ));
-            };
-            if id != RecordId::plaintext(&envelope.key) {
-                return Err(ServiceError::new(
-                    "invalid_record",
-                    "import record id does not match its payload",
-                    serde_json::json!({"record": id.display_value()}),
-                ));
-            }
-            puts.push((envelope.key.clone(), *envelope));
-        }
-        let imported: std::collections::BTreeSet<&str> =
-            puts.iter().map(|(key, _)| key.as_str()).collect();
-        let deletes: Vec<String> = store
-            .list()
-            .map_err(ServiceError::store)?
-            .into_iter()
-            .map(|(key, _)| key)
-            .filter(|key| !imported.contains(key.as_str()))
-            .collect();
-        let put_refs: Vec<(&str, Envelope)> = puts
-            .iter()
-            .map(|(key, envelope)| (key.as_str(), envelope.clone()))
-            .collect();
-        let delete_refs: Vec<&str> = deletes.iter().map(String::as_str).collect();
-        store
-            .apply(transaction_id, expected_revision, &put_refs, &delete_refs)
+        let bytes = serde_json::to_vec(bundle).map_err(|error| {
+            ServiceError::invalid_argument("bundle", format!("bundle is not encodable: {error}"))
+        })?;
+        let store = self.record_store()?;
+        let portable = store.portable().ok_or_else(|| {
+            ServiceError::new(
+                "unsupported",
+                "this project's storage cannot take an imported bundle",
+                serde_json::json!({"backend": store.describe().backend}),
+            )
+        })?;
+        portable
+            .import(transaction_id, expected_revision, &bytes)
             .map_err(ServiceError::store)
     }
 
@@ -1726,34 +1500,6 @@ impl MemoryService {
     pub fn reindex(&self) -> Result<ProjectionStatus> {
         let provider = self.provider();
         let store = self.record_store()?;
-        // A store that encrypts cannot be synchronized incrementally: the
-        // changes its history reports are between opaque ids, and the index
-        // keys everything by the semantic key those ids hide. So it is rebuilt
-        // from the envelopes it hands over decrypted.
-        //
-        // Asked as a capability rather than as "is this project encrypted",
-        // because the reason is the capability: any future storage that hides
-        // its own record identities has the same problem.
-        if store.capabilities().has(Capability::Encryption) {
-            let revision = store.current_revision().map_err(ServiceError::store)?;
-            let records = store
-                .read_records(&revision)
-                .map_err(ServiceError::store)?
-                .into_iter()
-                .filter_map(|(id, record)| match record {
-                    StoredRecord::Plaintext { envelope } => Some((id.display_value(), *envelope)),
-                    StoredRecord::Encrypted { .. } => None,
-                })
-                .collect::<Vec<_>>();
-            return Projection::rebuild_from_envelopes_store_with(
-                &*store,
-                &records,
-                &revision,
-                provider,
-                Some(self.content_resolver()),
-            )
-            .map_err(|error| ServiceError::index(&error));
-        }
         Projection::synchronize_store_with(&*store, provider, Some(self.content_resolver()))
             .map_err(|error| ServiceError::index(&error))
     }
@@ -1763,16 +1509,8 @@ impl MemoryService {
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError`] when the project is locked or the index fails.
+    /// Returns [`ServiceError`] when the index fails.
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
-        // The ephemeral index only exists while the store is unlocked, and
-        // asking the store for its revision does not catch that: a revision is
-        // a commit id, readable with no key at all. So the readiness of the
-        // store is checked here, or a locked project reports an opaque index
-        // error instead of the documented `locked` failure.
-        if self.is_encrypted() {
-            self.unlocked_encrypted()?;
-        }
         let store = self.record_store()?;
         let provider = self.provider();
         // Mutations synchronize the index, but two cases still need work here:
@@ -1800,20 +1538,8 @@ impl MemoryService {
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError`] when the project is locked or unreadable.
+    /// Returns [`ServiceError`] when the project is unreadable.
     pub fn backlinks(&self, key: &str, revision: Option<&Revision>) -> Result<BacklinksView> {
-        if self.is_encrypted() {
-            // The canonical snapshot holds ciphertext, so backlinks must be
-            // computed from decrypted envelopes.
-            let store = self.unlocked_encrypted()?;
-            let records = store.list().map_err(ServiceError::store)?;
-            let revision = store.current_revision().map_err(ServiceError::store)?;
-            return Ok(BacklinksView {
-                key: key.to_owned(),
-                revision,
-                entries: memory_hub_index::compute_backlinks_from_envelopes(&records, key),
-            });
-        }
         let revision = match revision {
             Some(revision) => revision.clone(),
             None => self.current_revision()?,
@@ -1835,21 +1561,11 @@ impl MemoryService {
     /// Returns [`ServiceError`] when the repository diverged and `mode` says to
     /// report rather than rebuild, or when the cursor cannot be advanced.
     pub fn reconcile(&self, mode: DivergenceMode) -> Result<ReconcileReport> {
-        // With the declaration whenever there is one: a policy that cannot see
-        // where storages are cannot tell retargeting a type from editing it,
-        // and would wave through the silent move `record_store`'s policy
-        // refuses.
-        //
-        // Whenever, not always. Reconciliation runs during the handshake, and
-        // the handshake is how a client reaches `memory_init` — refusing here
-        // would put the declaration behind a door it unlocks. A project with
-        // no declaration also has no records for the rules to protect.
-        let mut policy = SchemaPolicy::default();
-        if let Ok(config) = self.config() {
-            policy = policy.with_config(config.clone());
-        }
+        // The same rules the record store applies, for the same reason: a
+        // policy that cannot tell retargeting a type from editing it would wave
+        // through the silent move `record_store`'s policy refuses.
         Reconciler::open(&self.project)
-            .map(|reconciler| reconciler.with_policy(Arc::new(policy)))
+            .map(|reconciler| reconciler.with_policy(Arc::new(SchemaPolicy::default())))
             .and_then(|reconciler| reconciler.reconcile(mode))
             .map_err(ServiceError::reconcile)
     }
@@ -1941,7 +1657,7 @@ impl MemoryService {
             let Ok(storage) = definition.storage() else {
                 continue;
             };
-            let Some(attachment) = self.attachment_for(&storage)? else {
+            let Some(attachment) = attachment_for(&storage) else {
                 continue;
             };
             let known = known_records(records, kind);
@@ -2013,26 +1729,6 @@ impl MemoryService {
     ///
     /// Returns [`ServiceError`] when the registry cannot be read.
     pub fn schema_registry(&self) -> Result<SchemaRegistry> {
-        if self.is_encrypted() {
-            // Reading the registry is reading records, so it answers
-            // `not_initialised` on the same terms as every other read. The
-            // plaintext path below gets this from `record_store`.
-            self.config()?;
-            let store = self.unlocked_encrypted()?;
-            let records = store.list().map_err(ServiceError::store)?;
-            let definitions = records
-                .iter()
-                .filter(|(_, envelope)| envelope.kind == TYPE_KIND)
-                .filter_map(|(_, envelope)| TypeDefinition::from_content(&envelope.content).ok())
-                .collect::<Vec<_>>();
-            return SchemaRegistry::from_type_definitions(definitions).map_err(|error| {
-                ServiceError::new(
-                    "invalid_record",
-                    "schema registry could not be built",
-                    serde_json::json!({"field": error.field, "reason": error.message}),
-                )
-            });
-        }
         let store = self.record_store()?;
         let snapshot = StoreView::current(&*store).map_err(ServiceError::store)?;
         policy::load_registry(&*store, snapshot.revision()).map_err(ServiceError::store)
@@ -2047,30 +1743,24 @@ impl MemoryService {
         let mut summaries = Vec::new();
         for (_, definition) in self.schema_registry()?.iter() {
             let storage = definition.storage().ok();
-            let name = storage.as_ref().and_then(|storage| storage.name());
+            let folder = storage.as_ref().and_then(|storage| storage.folder());
             // A type keeping its content in its records is written by writing
-            // a record, which is always possible — including when it says so
-            // by naming the storage that holds records. A type pointing at a
-            // folder is only as writable as that folder, and a storage this
-            // build cannot reach answers no rather than throwing.
-            let writable = match &storage {
-                None | Some(TypeStorage::WithRecords) => true,
-                Some(storage) => match self.attachment_for(storage) {
-                    Ok(None) => true,
-                    Ok(Some(attachment)) => {
-                        FolderSource::new(&self.project, attachment)
-                            .capabilities()
-                            .writable
-                    }
-                    Err(_) => false,
-                },
+            // a record, which is always possible. A type pointing at a folder
+            // is only as writable as that folder.
+            let writable = match storage.as_ref().and_then(attachment_for) {
+                None => true,
+                Some(attachment) => {
+                    FolderSource::new(&self.project, attachment)
+                        .capabilities()
+                        .writable
+                }
             };
             summaries.push(TypeSummary {
                 kind_name: definition.kind_name.clone(),
                 description: definition.description.clone(),
                 field_count: definition.fields.len(),
                 relationship_count: definition.relationships.len(),
-                storage: name.map(str::to_owned),
+                storage: folder.map(str::to_owned),
                 writable,
             });
         }
@@ -2152,6 +1842,72 @@ impl MemoryService {
         memory_hub_store::read_remote_config(store.git_dir()).map_err(ServiceError::store)
     }
 
+    /// The code `origin`, which is not the memory remote and is only ever
+    /// asked, never published to.
+    ///
+    /// A caller offering to configure a memory remote has one sensible
+    /// suggestion to make, and this is it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the repository or its configuration
+    /// cannot be read.
+    pub fn code_origin_url(&self) -> Result<Option<String>> {
+        let git_dir = self.memory_git_dir()?;
+        memory_hub_store::read_code_origin_url(&git_dir).map_err(ServiceError::store)
+    }
+
+    /// Whether this repository's memory is here, elsewhere, or nowhere.
+    ///
+    /// Deliberately independent of the project's storage declaration: the
+    /// question is asked precisely by a caller that has just opened a fresh
+    /// clone and does not yet know whether declaring anything would be
+    /// describing a project that already exists somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the repository cannot be read. A remote
+    /// that cannot be reached is an answer rather than an error.
+    pub fn presence(&self) -> Result<memory_hub_store::MemoryPresence> {
+        memory_hub_store::memory_presence(&self.project).map_err(ServiceError::store)
+    }
+
+    /// Configure the memory remote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the URL or the refspec is one Git would
+    /// read as something other than a location, or when the configuration
+    /// cannot be written.
+    pub fn set_remote(&self, url: String, refspec: Option<String>) -> Result<MemoryRemote> {
+        let git_dir = self.memory_git_dir()?;
+        let remote = MemoryRemote { url, refspec };
+        memory_hub_store::write_remote_config(&git_dir, &remote).map_err(ServiceError::store)?;
+        Ok(remote)
+    }
+
+    /// Forget the memory remote. Publishing nothing is the default state, and
+    /// returning to it is not a failure when there was none configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the configuration cannot be written.
+    pub fn remove_remote(&self) -> Result<()> {
+        let git_dir = self.memory_git_dir()?;
+        memory_hub_store::remove_remote_config(&git_dir).map_err(ServiceError::store)
+    }
+
+    /// The Git directory, found without opening a store.
+    ///
+    /// `git_store()` would answer this too, and would refuse for a project
+    /// that has not declared a storage yet — which is the project every one of
+    /// the callers above is about. Opening a store also creates
+    /// `refs/memory/staged`, and a repository that has been *asked* about its
+    /// memory must not come away looking like one that has some.
+    fn memory_git_dir(&self) -> Result<std::path::PathBuf> {
+        memory_hub_store::GitStore::discover_git_dir(&self.project).map_err(ServiceError::store)
+    }
+
     /// Fetch memory refs from the remote and merge them.
     ///
     /// Verification is fail-closed: with no allowed signer known, the store
@@ -2164,16 +1920,7 @@ impl MemoryService {
     pub fn fetch(&self) -> Result<FetchResult> {
         let store = self.git_store()?;
         let remote = Self::require_remote(&store)?;
-        // Encrypted projects merge at the decrypted envelope level and derive
-        // their allowed signers from the manifest recipients; the plaintext
-        // path would collide on the manifest blob and verify against nothing.
-        if self.is_encrypted() {
-            let encrypted = self.unlocked_encrypted()?;
-            return encrypted
-                .fetch_and_merge(&remote, &[])
-                .map_err(ServiceError::store);
-        }
-        memory_hub_store::fetch_and_merge(&store, &remote, &[]).map_err(ServiceError::store)
+        memory_hub_store::fetch_and_merge(&store, &remote).map_err(ServiceError::store)
     }
 
     /// Push memory refs to the remote, subject to the stale-record policy.
@@ -2219,143 +1966,13 @@ impl MemoryService {
             })
     }
 
-    // ── Encryption ──────────────────────────────────────────────────────────
-
-    /// Whether the project is encrypted, and whether it is currently readable.
-    #[must_use]
-    pub fn encryption_status(&self) -> EncryptionStatus {
-        match (self.is_encrypted(), self.is_unlocked()) {
-            (false, _) => EncryptionStatus::Plaintext,
-            (true, true) => EncryptionStatus::Unlocked,
-            (true, false) => EncryptionStatus::Locked,
-        }
-    }
-
-    /// Unlock an encrypted project with an identity file and rebuild the
-    /// ephemeral index from the decrypted records.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is not encrypted, the identity
-    /// cannot be loaded or does not decrypt the manifest, or the index cannot
-    /// be rebuilt.
-    pub fn unlock(&mut self, identity_path: &Path) -> Result<Revision> {
-        let identity = load_identity(identity_path).map_err(|error| {
-            ServiceError::new(
-                "identity_load_failed",
-                error.to_string(),
-                serde_json::json!({"path": identity_path}),
-            )
-        })?;
-        let store = self.encrypted_store.as_mut().ok_or_else(|| {
-            ServiceError::not_encrypted("project is not encrypted — nothing to unlock")
-        })?;
-        store.unlock(identity).map_err(ServiceError::store)?;
-        let revision = store.current_revision().map_err(ServiceError::store)?;
-        self.sync_index()?;
-        Ok(revision)
-    }
-
-    /// Lock the store and destroy the ephemeral index, so no plaintext is left
-    /// on disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is not encrypted or the index
-    /// cannot be destroyed.
-    pub fn lock(&mut self) -> Result<()> {
-        let store = self.encrypted_store.as_mut().ok_or_else(|| {
-            ServiceError::not_encrypted("project is not encrypted — nothing to lock")
-        })?;
-        store.lock();
-        let git_store = GitStore::open(&self.project).map_err(ServiceError::store)?;
-        Projection::destroy_store(&git_store).map_err(|error| ServiceError::index(&error))
-    }
-
-    /// Initialise encryption for a project, returning the backup identity.
-    ///
-    /// The backup identity is issued once and never stored: it is the recovery
-    /// path when the everyday key is lost, and it belongs outside the
-    /// repository.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is not encrypted, the identity
-    /// cannot be loaded, or initialisation fails.
-    pub fn init_encrypted(
-        &mut self,
-        identity_path: &Path,
-        recipient: RecipientEntry,
-    ) -> Result<String> {
-        let identity = load_identity(identity_path).map_err(|error| {
-            ServiceError::new(
-                "identity_load_failed",
-                error.to_string(),
-                serde_json::json!({"path": identity_path}),
-            )
-        })?;
-        let store = self.encrypted_store.as_mut().ok_or_else(|| {
-            ServiceError::not_encrypted("project is not encrypted — nothing to init")
-        })?;
-        // Unlock first: this handles both a fresh project without a manifest
-        // and an existing one, where unlocking verifies the identity.
-        store.unlock(identity).map_err(ServiceError::store)?;
-        let result = store.init(vec![recipient]).map_err(ServiceError::store)?;
-        Ok(result.backup_identity)
-    }
-
-    /// Who can decrypt this project.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is locked or plaintext.
-    pub fn list_recipients(&self) -> Result<Vec<RecipientEntry>> {
-        self.unlocked_encrypted()?
-            .list_recipients()
-            .map_err(ServiceError::store)
-    }
-
-    /// Add a recipient. Every record is re-encrypted, so the index is rebuilt.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is locked, the recipient is
-    /// unusable, or the index cannot be rebuilt.
-    pub fn add_recipient(&self, recipient: RecipientEntry) -> Result<()> {
-        self.unlocked_encrypted()?
-            .add_recipient(recipient)
-            .map_err(ServiceError::store)?;
-        self.sync_index()
-    }
-
-    /// Remove a recipient. Every record is re-encrypted, so the index is
-    /// rebuilt.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError`] when the project is locked, the recipient is
-    /// the last one, or the index cannot be rebuilt.
-    pub fn remove_recipient(&self, public_key: &str) -> Result<()> {
-        self.unlocked_encrypted()?
-            .remove_recipient(public_key)
-            .map_err(ServiceError::store)?;
-        self.sync_index()
-    }
 }
-
-/// Highest number of checkpoints a single history call returns.
-const HISTORY_MAX: usize = 1_000;
 
 /// One record as of a revision.
 #[derive(Clone, Debug)]
 pub struct RecordView {
     pub revision: Revision,
     /// The record, in the one shape every storage answers in.
-    ///
-    /// There used to be two — one for plaintext projects and one for
-    /// encrypted — and a client had to know which project it was talking to in
-    /// order to parse the answer. An encrypted store decrypts on the way out,
-    /// so there was never a second shape, only a second name for it.
     pub record: Option<StoredRecord>,
 }
 
@@ -2454,6 +2071,20 @@ pub struct MigrationWarning {
     /// Stable, and what an acknowledgement names.
     pub code: &'static str,
     pub message: String,
+}
+
+/// What removing a type took with it.
+#[derive(Clone, Debug)]
+pub struct TypeRemoval {
+    /// The revision after the removal.
+    pub revision: Revision,
+    /// How many records of the type went with the definition.
+    pub removed: usize,
+    /// The folder that stopped being attached, for a type that had one.
+    ///
+    /// `None` for a type whose documents were its own records: nothing was
+    /// detached, because nothing outside the records was ever involved.
+    pub detached: Option<String>,
 }
 
 /// What a scan of the attached folders found and did.
@@ -2570,24 +2201,6 @@ pub struct PushOutcome {
     pub policy: PushPolicyResult,
 }
 
-/// Encryption mode and lock state as one value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EncryptionStatus {
-    /// Not an encrypted project.
-    Plaintext,
-    /// Encrypted and readable.
-    Unlocked,
-    /// Encrypted; reads, writes and searches answer `locked`.
-    Locked,
-}
-
-impl EncryptionStatus {
-    #[must_use]
-    pub const fn is_encrypted(self) -> bool {
-        !matches!(self, Self::Plaintext)
-    }
-}
-
 /// The wire spelling of a freshness state.
 #[must_use]
 pub const fn freshness_str(state: FreshnessState) -> &'static str {
@@ -2624,15 +2237,25 @@ fn find_envelope(records: &[Envelope], key: &str) -> Option<Envelope> {
 
 /// A file name for a record being published into a folder.
 ///
-/// The mask says what the folder's files are called; the key says which record
-/// this is. `*.md` and a key of `guide` gives `guide.md`. A mask without a `*`
-/// is refused when the type is declared, so the fallback here is unreachable
-/// and exists only to keep the function total.
-fn file_name_for(pattern: &str, key: &str) -> String {
-    match pattern.split_once('*') {
-        Some((before, after)) => format!("{before}{key}{after}"),
-        None => pattern.to_owned(),
-    }
+/// What a document Memory writes into a folder is called, after the key.
+///
+/// A folder of documents is read whatever its files are called — there is no
+/// mask, deliberately, because a person who put a diagram in their
+/// documentation folder should see the diagram in Memory. This is only what to
+/// call a file nobody has named yet, and prose is what Memory writes.
+const NEW_DOCUMENT_SUFFIX: &str = ".md";
+
+/// Where a type's documents are, when they are files in the working tree.
+///
+/// `None` means the bodies sit in the records. Nothing is resolved and nothing
+/// can fail: the folder is written in the definition, so a type that names one
+/// has already said everything there is to know about where it keeps its
+/// documents.
+#[must_use]
+fn attachment_for(storage: &TypeStorage) -> Option<Attachment> {
+    storage
+        .folder()
+        .map(|folder| Attachment::new(folder.to_owned()))
 }
 
 /// Reads a repository-relative locator out of the working tree.

@@ -83,7 +83,7 @@ id applied twice is applied once.
   context. A host that has one must not call the service on a thread it needs
   to keep free — index work and embedding are the expensive parts.
 - **The failures.** `ServiceError` carries the same stable `kind` the wire
-  promises (`not_initialised`, `locked`, `conflict`, `unsupported`, …), so a
+  promises (`locked`, `conflict`, `unsupported`, …), so a
   host that switches between linking and spawning handles one set of names.
 - **The interface version.** Linking pins it at compile time: the crate a host
   builds against is the interface it gets, and there is no handshake to fail.

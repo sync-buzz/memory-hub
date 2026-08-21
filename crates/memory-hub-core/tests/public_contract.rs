@@ -58,26 +58,6 @@ fn independent_consumer_can_rebuild_from_the_public_envelope()
 }
 
 #[test]
-fn encrypted_wire_rejects_an_incompatible_major_before_storage() {
-    let value = json!({
-        "representation": "encrypted",
-        "encrypted": {
-            "envelope_version": {"major": 2, "minor": 0},
-            "storage_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "key_epoch": 1,
-            "cipher_suite": "reserved-suite",
-            "nonce": "reserved-nonce",
-            "ciphertext": "opaque"
-        }
-    });
-
-    let Err(error) = serde_json::from_value::<memory_hub_core::StoredRecord>(value) else {
-        panic!("an incompatible encrypted envelope must fail during decode");
-    };
-    assert!(error.to_string().contains("unsupported major version 2"));
-}
-
-#[test]
 fn policy_wire_accepts_only_declared_modes_and_reports_the_source()
 -> Result<(), Box<dyn std::error::Error>> {
     let project: PolicyConfig = serde_json::from_value(json!({
@@ -136,19 +116,5 @@ fn debug_output_redacts_record_payloads() -> Result<(), Box<dyn std::error::Erro
     let debug = format!("{record:?}");
     assert!(!debug.contains("do-not-log-plaintext"));
 
-    let encrypted: memory_hub_core::StoredRecord = serde_json::from_value(json!({
-        "representation": "encrypted",
-        "encrypted": {
-            "envelope_version": {"major": 1, "minor": 0},
-            "storage_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "key_epoch": 1,
-            "cipher_suite": "reserved-suite",
-            "nonce": "do-not-log-nonce",
-            "ciphertext": "do-not-log-ciphertext"
-        }
-    }))?;
-    let debug = format!("{encrypted:?}");
-    assert!(!debug.contains("do-not-log-nonce"));
-    assert!(!debug.contains("do-not-log-ciphertext"));
     Ok(())
 }

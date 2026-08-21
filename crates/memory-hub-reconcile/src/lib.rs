@@ -14,7 +14,7 @@ use fs2::FileExt;
 use git2::{ErrorCode, Oid, Repository, Sort};
 use memory_hub_core::{Envelope, FreshnessState, StoredRecord};
 use memory_hub_store::{
-    Checkpoint, GitStore, Operation, RecordId, StoreError, Transaction, TransactionPolicy,
+    GitStore, Operation, RecordId, StoreError, Transaction, TransactionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -60,7 +60,6 @@ pub struct ReconciledCommit {
     pub code_revision: String,
     pub changed_paths: Vec<String>,
     pub stale_keys: Vec<String>,
-    pub checkpoint: Checkpoint,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -227,9 +226,6 @@ impl Reconciler {
         let store = self.open_store()?;
 
         let Some(cursor) = cursor else {
-            let checkpoint = store
-                .checkpoint_code(&head_text, &format!("code {head_text}"))
-                .map_err(store_error)?;
             save_cursor(&cursor_path, head)?;
             return Ok(report(
                 None,
@@ -240,7 +236,6 @@ impl Reconciler {
                     code_revision: head_text,
                     changed_paths: Vec::new(),
                     stale_keys: Vec::new(),
-                    checkpoint,
                 }],
             ));
         };
@@ -276,15 +271,11 @@ impl Reconciler {
             let changed_paths = changed_paths(&repository, oid)?;
             let stale_keys = catalog.mark_stale(&store, oid, &changed_paths)?;
             let code_revision = oid.to_string();
-            let checkpoint = store
-                .checkpoint_code(&code_revision, &format!("code {code_revision}"))
-                .map_err(store_error)?;
             save_cursor(&cursor_path, oid)?;
             processed.push(ReconciledCommit {
                 code_revision,
                 changed_paths,
                 stale_keys,
-                checkpoint,
             });
         }
         Ok(report(
@@ -408,7 +399,7 @@ impl PathCatalog {
                 {
                     Some(*envelope)
                 }
-                _ => None,
+                StoredRecord::Plaintext { .. } => None,
             })
             .collect();
         Ok(Self { candidates })
@@ -505,9 +496,7 @@ fn rebuild_after_divergence(
     let mut operations = Vec::new();
     let mut stale_keys = Vec::new();
     for (_, mut record) in snapshot.records().map_err(store_error)? {
-        let StoredRecord::Plaintext { envelope } = &mut record else {
-            continue;
-        };
+        let StoredRecord::Plaintext { envelope } = &mut record;
         envelope.freshness.state = FreshnessState::Unverified;
         envelope.freshness.code_revision = None;
         envelope.freshness.reason = Some("code_history_diverged".to_owned());
@@ -525,9 +514,6 @@ fn rebuild_after_divergence(
     }
     stale_keys.sort();
     let head_text = head.to_string();
-    let checkpoint = store
-        .checkpoint_code(&head_text, &format!("code {head_text} after full rebuild"))
-        .map_err(store_error)?;
     save_cursor(cursor_path, head)?;
     Ok(report(
         Some(old_cursor.to_string()),
@@ -538,7 +524,6 @@ fn rebuild_after_divergence(
             code_revision: head_text,
             changed_paths: Vec::new(),
             stale_keys,
-            checkpoint,
         }],
     ))
 }

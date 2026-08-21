@@ -207,9 +207,6 @@ fn collect(
 fn content_digest(record: &StoredRecord) -> String {
     match record {
         StoredRecord::Plaintext { envelope } => envelope.content_hash.as_str().to_owned(),
-        StoredRecord::Encrypted { encrypted } => blake3::hash(encrypted.ciphertext.as_bytes())
-            .to_hex()
-            .to_string(),
     }
 }
 

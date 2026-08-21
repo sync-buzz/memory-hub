@@ -64,7 +64,7 @@ Reading a document's body is `memory_read_content` and writing one is
 and a client that only understands text sees an encoding it does not recognise
 rather than a string of replacement characters. Reading is the one operation that goes outside, and the
 one that can answer `missing: true`; every other operation — listing, search,
-export, checkpoints — works from what Memory itself holds, so an unreachable
+export, diff — works from what Memory itself holds, so an unreachable
 folder can never make one of them quietly return less.
 
 A record whose file is gone stays `missing` indefinitely and is removed only by
@@ -72,6 +72,35 @@ an explicit deletion. Deleted, on another branch, and not pulled are
 indistinguishable at the moment of looking, and two of the three are routine —
 switching branches would otherwise destroy a feature branch's documentation
 records every time.
+
+## Deleting one
+
+Deleting is one operation whatever the storage; what differs is how much of the
+record there is to take. A record that keeps its body in itself is gone when its
+envelope is. A record whose body is a document **owns that document**, so the
+delete takes the file too — the file first, then the record, so an interruption
+leaves a record reporting its document as gone, which `doctor` raises and a
+person settles.
+
+The caller says `delete` either way. Where the content lives is the project's
+own declaration and never a parameter of the operation:
+
+```json
+{ "op": "delete", "key": "guide" }
+```
+
+Leaving the file would not be a smaller deletion, it would be a deletion that
+undoes itself: the next scan finds a document belonging to no record and hands
+back a record for it, with a key derived from the path and none of the links the
+old one had.
+
+**Removing a type is the other operation, and the difference is the working
+tree.** `memory_delete_type` takes a type's definition, every record of it, and
+— for a type whose content lived in a declared directory — that declaration.
+Every file stays where it is: those documents were in the repository before
+Memory was asked about them, and the type was only what Memory knew. Deleting
+the records one at a time is not the same thing, and it is not how a type is
+removed.
 
 ## Folders
 

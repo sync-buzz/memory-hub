@@ -5,7 +5,7 @@ use std::thread;
 use git2::{Repository, Signature};
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_store::{
-    ChangeKind, GitStore, MAIN_REF, Operation, RecordId, Revision, STAGED_REF, StoreErrorKind,
+    ChangeKind, GitStore, MAIN_REF, Operation, RecordId, Revision, StoreErrorKind,
     Transaction,
 };
 
@@ -64,7 +64,7 @@ fn atomic_batch_preserves_old_snapshot_and_code_state() -> Result<(), Box<dyn st
     );
     let git = Repository::open(directory.path())?;
     assert_eq!(
-        git.find_reference(STAGED_REF)?.target(),
+        git.find_reference(MAIN_REF)?.target(),
         result.revision.as_str().parse().ok()
     );
     let current_commit = git.find_commit(result.revision.as_str().parse()?)?;
@@ -95,13 +95,7 @@ fn atomic_batch_preserves_old_snapshot_and_code_state() -> Result<(), Box<dyn st
         store.snapshot(&unrelated).err().map(|error| error.kind),
         Some(StoreErrorKind::RevisionNotFound)
     );
-    assert!(git.find_reference(MAIN_REF).is_err());
-    git.reference(
-        STAGED_REF,
-        unrelated_tree,
-        true,
-        "test: corrupt staged target",
-    )?;
+    git.reference(MAIN_REF, unrelated_tree, true, "test: corrupt the memory ref")?;
     assert_eq!(
         store.current().err().map(|error| error.kind),
         Some(StoreErrorKind::RevisionNotFound)
@@ -275,7 +269,7 @@ fn retry_is_idempotent_and_reuse_with_other_input_is_rejected()
 }
 
 #[test]
-fn checkpoint_history_diff_and_export_import_are_stable() -> Result<(), Box<dyn std::error::Error>>
+fn diff_and_export_import_are_stable() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_directory, store) = repository()?;
     let empty = store.current()?.revision().clone();
@@ -284,7 +278,6 @@ fn checkpoint_history_diff_and_export_import_are_stable() -> Result<(), Box<dyn 
         "first",
         vec![Operation::put(record("one", "version one")?)],
     )?)?;
-    let checkpoint_one = store.checkpoint("first checkpoint")?;
     let second = store.apply(&Transaction {
         id: "second".into(),
         expected_revision: first.revision.clone(),
@@ -293,7 +286,6 @@ fn checkpoint_history_diff_and_export_import_are_stable() -> Result<(), Box<dyn 
             Operation::put(record("two", "another")?),
         ],
     })?;
-    let checkpoint_two = store.checkpoint("second checkpoint")?;
 
     let changes = store.diff(&empty, &second.revision)?;
     assert_eq!(changes.len(), 2);
@@ -307,10 +299,6 @@ fn checkpoint_history_diff_and_export_import_are_stable() -> Result<(), Box<dyn 
     assert!(modified.iter().any(|change| {
         change.id == RecordId::plaintext("one") && change.kind == ChangeKind::Modified
     }));
-    let history = store.history(10)?;
-    assert_eq!(history[0].commit, checkpoint_two.commit);
-    assert_eq!(history[1].commit, checkpoint_one.commit);
-
     let bytes = store.export(&second.revision)?;
     let (other_directory, other) = repository()?;
     let imported = other.import("import", other.current()?.revision().clone(), &bytes)?;
@@ -352,10 +340,8 @@ fn ordinary_clone_and_heads_only_push_do_not_publish_memory_refs()
         "memory",
         vec![Operation::put(record("private/decision", "secret")?)],
     )?)?;
-    store.checkpoint("private memory checkpoint")?;
 
     let source = Repository::open(source_directory.path())?;
-    assert!(source.find_reference(STAGED_REF).is_ok());
     assert!(source.find_reference(MAIN_REF).is_ok());
     let signature = Signature::now("Test", "test@example.invalid")?;
     let tree_oid = source.treebuilder(None)?.write()?;
@@ -377,7 +363,6 @@ fn ordinary_clone_and_heads_only_push_do_not_publish_memory_refs()
         source_directory.path().to_str().ok_or("utf8 path")?,
         &clone_path,
     )?;
-    assert!(clone.find_reference(STAGED_REF).is_err());
     assert!(clone.find_reference(MAIN_REF).is_err());
 
     let remote_directory = tempfile::tempdir()?;
@@ -389,7 +374,6 @@ fn ordinary_clone_and_heads_only_push_do_not_publish_memory_refs()
     remote.push(&["refs/heads/main:refs/heads/main"], None)?;
     let remote_repository = Repository::open_bare(remote_directory.path())?;
     assert!(remote_repository.find_reference("refs/heads/main").is_ok());
-    assert!(remote_repository.find_reference(STAGED_REF).is_err());
     assert!(remote_repository.find_reference(MAIN_REF).is_err());
     Ok(())
 }

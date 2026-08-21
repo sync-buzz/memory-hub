@@ -27,25 +27,41 @@ struct Cli {
     command: Command,
 }
 
-/// Where a new project keeps its records.
+/// Where a project keeps its records.
+///
+/// The engine will not guess: a host is the one that knows, and for this one
+/// the host is a command line. Left unsaid, it is answered from the project —
+/// see [`records_in`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum RecordsIn {
-    /// A folder of files beside the project.
-    Folder,
-    /// Git objects under private refs.
-    Refs,
+    /// A directory of record files beside the project.
+    Directory,
+    /// Git's own metadata: objects under private refs.
+    GitMetadata,
 }
 
-/// What a declared storage is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum StorageSort {
-    /// A directory of the working tree, holding documents people edit.
-    RepoFolder,
-    /// A directory of record files.
-    Folder,
-    /// Git objects under private refs.
-    Refs,
+/// Where this project's records are, as this command line answers it.
+///
+/// Unsaid means Git's metadata for a repository and a directory for anything
+/// else. Derived rather than defaulted, because the answer has to be the same
+/// every time the same project is opened: a fixed default would have `mcp` in a
+/// repository reading a folder that `reconcile` never wrote.
+fn records_in(project: &std::path::Path, records: Option<RecordsIn>) -> memory_hub_service::RecordsIn {
+    let chosen = records.unwrap_or_else(|| {
+        if GitStore::discover_git_dir(project).is_ok() {
+            RecordsIn::GitMetadata
+        } else {
+            RecordsIn::Directory
+        }
+    });
+    match chosen {
+        RecordsIn::GitMetadata => memory_hub_service::RecordsIn::GitMetadata,
+        RecordsIn::Directory => memory_hub_service::RecordsIn::directory(),
+    }
 }
+
+/// The flag every command that opens a project carries.
+const RECORDS_HELP: &str = "Where this project's records are. Defaults to `git-metadata` in a                             repository and `directory` anywhere else.";
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -54,47 +70,9 @@ enum Command {
         /// Repository or Git directory. Defaults to the current directory.
         #[arg(long, value_name = "PATH")]
         project: Option<PathBuf>,
-    },
 
-    /// Declare where this project keeps its memory.
-    Init {
-        /// Repository or a path inside it. Defaults to the current directory.
-        #[arg(long, value_name = "PATH")]
-        project: Option<PathBuf>,
-
-        /// Where records live. Defaults to a folder beside the project, which
-        /// needs no Git and can be read with any editor. Choose `refs` to keep
-        /// them in Git objects instead: versioned, pushable, and invisible in
-        /// the working tree.
-        #[arg(long, value_enum, default_value_t = RecordsIn::Folder)]
-        records: RecordsIn,
-
-        /// Select human-readable or stable JSON output.
-        #[arg(long, value_enum, default_value_t = Output::Human)]
-        output: Output,
-    },
-
-    /// Declare another storage this project can keep content in.
-    DeclareStorage {
-        /// The name a type will use to point at it.
-        name: String,
-
-        /// What it is.
-        #[arg(long, value_enum)]
-        kind: StorageSort,
-
-        /// Where it is, relative to the project. Required by every kind that
-        /// has a location.
-        #[arg(long, value_name = "PATH")]
-        path: Option<PathBuf>,
-
-        /// Repository or a path inside it. Defaults to the current directory.
-        #[arg(long, value_name = "PATH")]
-        project: Option<PathBuf>,
-
-        /// Select human-readable or stable JSON output.
-        #[arg(long, value_enum, default_value_t = Output::Human)]
-        output: Output,
+        #[arg(long, value_enum, help = RECORDS_HELP)]
+        records: Option<RecordsIn>,
     },
 
     /// Check whether Memory Hub can operate in a repository.
@@ -122,6 +100,9 @@ enum Command {
         /// Degrades to FTS-only with a warning when no model is downloaded.
         #[arg(long)]
         embed: bool,
+
+        #[arg(long, value_enum, help = RECORDS_HELP)]
+        records: Option<RecordsIn>,
 
         /// Select human-readable or stable JSON output.
         #[arg(long, value_enum, default_value_t = Output::Human)]
@@ -326,7 +307,7 @@ where
     };
 
     match cli.command {
-        Command::Mcp { project } => {
+        Command::Mcp { project, records } => {
             let project = match project.map_or_else(std::env::current_dir, Ok) {
                 Ok(project) => project,
                 Err(error) => {
@@ -342,117 +323,11 @@ where
                 );
                 eprintln!();
             }
-            if let Err(error) = memory_hub_mcp::serve(&project) {
+            if let Err(error) = memory_hub_mcp::serve(&project, records_in(&project, records)) {
                 eprintln!("memory-hub: MCP server failed: {error}");
                 return Code::Internal;
             }
             Code::Success
-        }
-        Command::Init {
-            project,
-            records,
-            output,
-        } => {
-            let Some(project) = absolute_project(project) else {
-                eprintln!("memory-hub: unable to resolve current directory");
-                return Code::Internal;
-            };
-            let storages = std::collections::BTreeMap::from([(
-                "main".to_owned(),
-                match records {
-                    RecordsIn::Folder => memory_hub_service::StorageConfig::folder(
-                        memory_hub_service::DEFAULT_RECORDS_PATH,
-                    ),
-                    RecordsIn::Refs => memory_hub_service::StorageConfig::refs(),
-                },
-            )]);
-            match memory_hub_service::MemoryService::init(&project, storages) {
-                Ok(config) => {
-                    let (name, storage) = match config.record_storage() {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            eprintln!("memory-hub: {}", error.message);
-                            return Code::Internal;
-                        }
-                    };
-                    match output {
-                        Output::Json => println!(
-                            "{}",
-                            serde_json::json!({
-                                "initialised": true,
-                                "records_storage": name,
-                                "kind": storage.kind,
-                                "path": storage.path,
-                            })
-                        ),
-                        Output::Human => println!(
-                            "Memory initialised. Records live in `{name}`{}.",
-                            storage
-                                .path
-                                .as_ref()
-                                .map_or_else(String::new, |path| format!(" at `{path}`"))
-                        ),
-                    }
-                    Code::Success
-                }
-                Err(error) => {
-                    eprintln!("memory-hub: {}", error.message);
-                    Code::Internal
-                }
-            }
-        }
-        Command::DeclareStorage {
-            name,
-            kind,
-            path,
-            project,
-            output,
-        } => {
-            let Some(project) = absolute_project(project) else {
-                eprintln!("memory-hub: unable to resolve current directory");
-                return Code::Internal;
-            };
-            let path = path.map(|path| path.to_string_lossy().into_owned());
-            let storage = match (kind, path) {
-                (StorageSort::Refs, _) => memory_hub_service::StorageConfig::refs(),
-                (StorageSort::RepoFolder, Some(path)) => {
-                    memory_hub_service::StorageConfig::repo_folder(path)
-                }
-                (StorageSort::Folder, Some(path)) => {
-                    memory_hub_service::StorageConfig::folder(path)
-                }
-                (_, None) => {
-                    eprintln!("memory-hub: this kind of storage must say where it is (--path)");
-                    return Code::Usage;
-                }
-            };
-            let mut service = memory_hub_service::MemoryService::open(project);
-            match service.declare_storage(&name, storage) {
-                Ok(config) => {
-                    match output {
-                        Output::Json => println!(
-                            "{}",
-                            serde_json::json!({
-                                "declared": config.storages.keys().collect::<Vec<_>>(),
-                            })
-                        ),
-                        Output::Human => println!(
-                            "Storage `{name}` declared. This project now has: {}.",
-                            config
-                                .storages
-                                .keys()
-                                .map(String::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    }
-                    Code::Success
-                }
-                Err(error) => {
-                    eprintln!("memory-hub: {}", error.message);
-                    Code::Internal
-                }
-            }
         }
         Command::Doctor { project, output } => {
             let report = doctor::inspect(project.as_deref());
@@ -476,6 +351,7 @@ where
             project,
             full_rebuild,
             embed,
+            records,
             output,
         } => {
             let Some(project) = absolute_project(project) else {
@@ -488,11 +364,12 @@ where
                 DivergenceMode::Report
             };
             // Through the service rather than a `Reconciler` assembled here:
-            // the policy that decides what a record may say needs the
-            // project's storage declaration, and the service is what holds it.
-            // Built by hand, this reconcile validated records against rules
-            // that could not see where storages are.
-            let service = memory_hub_service::MemoryService::open(project.clone());
+            // the service is what knows where this project's records are, and
+            // the reader for content that lives outside them.
+            let service = memory_hub_service::MemoryService::open(
+                project.clone(),
+                records_in(&project, records),
+            );
             match service.reconcile(mode) {
                 Ok(report) => {
                     let provider = if embed {
@@ -653,7 +530,7 @@ where
                     return Code::Internal;
                 }
             };
-            match fetch_and_merge(&store, &remote, &[]) {
+            match fetch_and_merge(&store, &remote) {
                 Ok(result) => {
                     match output {
                         Output::Json => println!(
@@ -788,9 +665,9 @@ where
 
 fn store_error_to_code(kind: StoreErrorKind) -> Code {
     match kind {
-        StoreErrorKind::TransportFailed
-        | StoreErrorKind::SignatureInvalid
-        | StoreErrorKind::NamespaceRejected => Code::TransportFailed,
+        StoreErrorKind::TransportFailed | StoreErrorKind::NamespaceRejected => {
+            Code::TransportFailed
+        }
         StoreErrorKind::FastForwardRequired
         | StoreErrorKind::Diverged
         | StoreErrorKind::MergeConflict => Code::NonFastForward,

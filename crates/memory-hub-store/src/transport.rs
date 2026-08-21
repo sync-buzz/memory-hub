@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::GitStoreError;
 use crate::types::GitRevision;
 use crate::{
-    GitStore, Operation, RecordId, Revision, STAGED_REF, StoreError, StoreErrorKind, Transaction,
+    GitStore, MAIN_REF, Operation, RecordId, Revision, StoreError, StoreErrorKind, Transaction,
 };
 
 const FETCH_TEMP_REF: &str = "refs/memory/tmp-fetch";
@@ -348,8 +348,94 @@ pub fn read_code_origin_url(git_dir: &Path) -> Result<Option<String>, StoreError
     }
 }
 
+/// What memory this repository has, and where it is when it is not here.
+///
+/// `git clone` copies no `refs/memory/*`, so from inside a fresh clone "this
+/// project never had memory" and "its memory is still on the remote" look
+/// identical — and only one of them is something a person can fix. This is the
+/// one place where memory being invisible in the working tree stops being a
+/// property and becomes a defect.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MemoryPresence {
+    /// This repository holds memory of its own.
+    Present { records: usize },
+    /// Nothing here, and `url` carries memory.
+    ///
+    /// `configured` tells the memory remote apart from the code `origin` that
+    /// was asked in its absence, because only the second case has to have a
+    /// remote configured before anything can be fetched.
+    NotFetched { url: String, configured: bool },
+    /// Nothing here and nothing there. An empty project is a normal state
+    /// rather than a failure, and `url` is `None` when there was no address to
+    /// ask at all.
+    Absent { url: Option<String> },
+    /// Nothing here, and the remote could not be asked — which is not the same
+    /// answer as "there is none".
+    Unreachable { url: String, reason: String },
+}
+
+/// Ask whether this repository's memory is here, elsewhere, or nowhere.
+///
+/// The question is asked of the remote without a configured memory remote too:
+/// before anyone configures one, the code `origin` is the only address the
+/// repository knows, and it is the address the memory almost certainly sits
+/// next to.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the repository or its configuration cannot be
+/// read. A remote that cannot be reached is an answer
+/// ([`MemoryPresence::Unreachable`]) rather than an error: the caller has to
+/// tell "there is no memory" from "nobody could say", and an `Err` collapses
+/// the two.
+pub fn memory_presence(project: &Path) -> Result<MemoryPresence, StoreError> {
+    let git_dir = GitStore::discover_git_dir(project)?;
+    let records = local_record_count(&git_dir)?;
+    if records > 0 {
+        return Ok(MemoryPresence::Present { records });
+    }
+
+    let (url, configured) = match read_remote_config(&git_dir)? {
+        Some(remote) => (Some(remote.url), true),
+        None => (read_code_origin_url(&git_dir)?, false),
+    };
+    let Some(url) = url else {
+        return Ok(MemoryPresence::Absent { url: None });
+    };
+
+    match probe_remote_memory(&git_dir, &url) {
+        Ok(RemoteMemory::Present) => Ok(MemoryPresence::NotFetched { url, configured }),
+        Ok(RemoteMemory::Absent) => Ok(MemoryPresence::Absent { url: Some(url) }),
+        Err(error) => Ok(MemoryPresence::Unreachable {
+            reason: error.to_string(),
+            url,
+        }),
+    }
+}
+
+/// How much memory this repository actually holds.
+///
+/// Records, not refs: `refs/memory/staged` is created by the first store that
+/// opens the repository — including a previous call to this function — so the
+/// presence of a ref says nothing about whether any memory was ever written.
+/// Listing the refs first keeps the common empty case from opening a store at
+/// all, which is what stops the question from answering itself.
+fn local_record_count(git_dir: &Path) -> Result<usize, StoreError> {
+    let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
+    let mut refs = repo
+        .references_glob("refs/memory/*")
+        .map_err(|e| StoreError::repository("list memory refs", e))?;
+    if refs.next().is_none() {
+        return Ok(0);
+    }
+    drop(refs);
+    let store = GitStore::open(git_dir)?;
+    Ok(store.current()?.records()?.len())
+}
+
 /// Fetch from the configured memory remote into a temporary ref and return
-/// the remote revision. Does NOT merge or update `refs/memory/staged`.
+/// the remote revision. Does NOT merge or update `refs/memory/main`.
 ///
 /// The caller is responsible for calling [`cleanup_temp_ref_pub`] after
 /// processing the fetched data.
@@ -357,17 +443,13 @@ pub fn read_code_origin_url(git_dir: &Path) -> Result<Option<String>, StoreError
 /// # Errors
 ///
 /// Returns [`StoreError`] with kind `TransportFailed`, `AuthenticationFailed`,
-/// `NamespaceRejected`, or `SignatureInvalid`.
+/// or `NamespaceRejected`.
 pub fn fetch_remote_revision(
     store: &GitStore,
     remote: &MemoryRemote,
-    allowed_signers: &[String],
 ) -> Result<(Revision, Revision), StoreError> {
     let git_dir = store.git_dir();
     let local_before = store.current()?.revision().clone();
-    // Resolved before the network call: an unverifiable fetch must fail
-    // without importing anything.
-    let signers = resolve_verification_signers(git_dir, allowed_signers)?;
 
     fetch_to_temp_ref(git_dir, remote)?;
 
@@ -383,53 +465,14 @@ pub fn fetch_remote_revision(
         Err(e) if e.code() == git2::ErrorCode::NotFound => {
             return Err(StoreError::new(
                 StoreErrorKind::TransportFailed,
-                "remote has no refs/memory/staged — the remote store is not initialized",
+                "remote has no refs/memory/main — the remote store is not initialized",
                 serde_json::json!({"remote": remote.url}),
             ));
         }
         Err(e) => return Err(StoreError::repository("read fetch temp ref", e)),
     };
 
-    if !signers.is_empty() {
-        verify_fetched_signatures(&repo, local_before.oid()?, remote_oid, &signers)?;
-    }
-
     Ok((local_before, Revision::from_oid(remote_oid)))
-}
-
-/// Resolve the public keys a fetch verifies against, and enforce the
-/// fail-closed policy.
-///
-/// `refs/memory/*` carries no server-side protection, so accepting whatever a
-/// remote sends is only acceptable as a deliberate choice. Callers pass the
-/// signers they know about (for encrypted projects: the manifest recipients);
-/// the repository config contributes the rest. When nothing is known and
-/// `memory-hub.signing.verify` is `required` (the default), the fetch fails
-/// instead of importing unverified history.
-fn resolve_verification_signers(
-    git_dir: &Path,
-    caller_supplied: &[String],
-) -> Result<Vec<String>, StoreError> {
-    let config = crate::read_signing_config(git_dir)?;
-    let mut signers = caller_supplied.to_vec();
-    for key in config.allowed_signers {
-        if !signers.contains(&key) {
-            signers.push(key);
-        }
-    }
-    if signers.is_empty() && config.verify == crate::VerifyMode::Required {
-        return Err(StoreError::new(
-            StoreErrorKind::SigningNotConfigured,
-            "fetch cannot verify memory refs: no allowed signer is configured",
-            serde_json::json!({
-                "recovery_action": "configure_allowed_signers_or_disable_verification",
-                "config_allowed_signer": "memory-hub.signing.allowedSigner",
-                "config_allowed_signers_file": "memory-hub.signing.allowedSignersFile",
-                "config_verify": "memory-hub.signing.verify",
-            }),
-        ));
-    }
-    Ok(signers)
 }
 
 /// Delete the temporary fetch ref if it exists.
@@ -442,8 +485,8 @@ pub fn cleanup_temp_ref_pub(git_dir: &Path) -> Result<(), StoreError> {
     cleanup_temp_ref(&repo)
 }
 
-/// Fast-forward `refs/memory/staged` to the given revision (which must be
-/// the fetched temp ref revision or a descendant of the current staged tip).
+/// Fast-forward `refs/memory/main` to the given revision (which must be
+/// the fetched temp ref revision or a descendant of the current tip).
 ///
 /// # Errors
 ///
@@ -452,7 +495,7 @@ pub fn fast_forward_to(git_dir: &Path, remote_revision: &Revision) -> Result<(),
     let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
     let remote_oid = remote_revision.oid()?;
     repo.reference(
-        STAGED_REF,
+        MAIN_REF,
         remote_oid,
         true,
         "memory-hub: fetch fast-forward",
@@ -517,26 +560,21 @@ impl TempRefGuard<'_> {
 
 /// Fetch from the configured memory remote and merge.
 ///
-/// Downloads `refs/memory/staged` from the remote into a temporary ref,
-/// verifies SSH signatures on new commits (when a signer is configured),
-/// then either fast-forwards or performs a record-level merge.
+/// Downloads `refs/memory/main` from the remote into a temporary ref, then
+/// either fast-forwards or performs a record-level merge.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError`] with kind `TransportFailed`, `AuthenticationFailed`,
-/// `NamespaceRejected`, `FastForwardRequired`, `Diverged`, or `SignatureInvalid`.
+/// `NamespaceRejected`, `FastForwardRequired`, or `Diverged`.
 pub fn fetch_and_merge(
     store: &GitStore,
     remote: &MemoryRemote,
-    allowed_signers: &[String],
 ) -> Result<FetchResult, StoreError> {
     let git_dir = store.git_dir();
     let local_before = store.current()?.revision().clone();
-    // Step 0: Resolve verification before the network call — an unverifiable
-    // fetch must fail without importing anything.
-    let signers = resolve_verification_signers(git_dir, allowed_signers)?;
 
-    // Step 1: Fetch remote refs/memory/staged to a temp ref.
+    // Step 1: Fetch remote refs/memory/main to a temp ref.
     fetch_to_temp_ref(git_dir, remote)?;
 
     // Step 2: Read the fetched revision.
@@ -557,19 +595,14 @@ pub fn fetch_and_merge(
         Err(e) if e.code() == git2::ErrorCode::NotFound => {
             return Err(StoreError::new(
                 StoreErrorKind::TransportFailed,
-                "remote has no refs/memory/staged — the remote store is not initialized",
+                "remote has no refs/memory/main — the remote store is not initialized",
                 serde_json::json!({"remote": remote.url}),
             ));
         }
         Err(e) => return Err(StoreError::repository("read fetch temp ref", e)),
     };
 
-    // Step 3: Verify SSH signatures on new commits.
-    if !signers.is_empty() {
-        verify_fetched_signatures(&repo, local_before.oid()?, remote_oid, &signers)?;
-    }
-
-    // Step 4: Determine fast-forward vs divergence.
+    // Step 3: Determine fast-forward vs divergence.
     let local_oid = local_before.oid()?;
     if remote_oid == local_oid {
         // Already up to date.
@@ -592,7 +625,7 @@ pub fn fetch_and_merge(
     if is_ff {
         // Fast-forward: remote is ahead of local.
         repo.reference(
-            STAGED_REF,
+            MAIN_REF,
             remote_oid,
             true,
             "memory-hub: fetch fast-forward",
@@ -614,7 +647,7 @@ pub fn fetch_and_merge(
         let local_records = store.read_records(&local_before)?;
         if local_records.is_empty() {
             repo.reference(
-                STAGED_REF,
+                MAIN_REF,
                 remote_oid,
                 true,
                 "memory-hub: fetch fast-forward from empty",
@@ -678,21 +711,6 @@ pub fn check_push_policy(store: &GitStore) -> Result<PushPolicyResult, StoreErro
     let revision = store.current()?.revision().clone();
     let records = store.read_records_pub(&revision)?;
 
-    // Check if there are encrypted records — if so, we can't check freshness.
-    let has_encrypted = records
-        .iter()
-        .any(|(_, r)| matches!(r, StoredRecord::Encrypted { .. }));
-
-    if has_encrypted {
-        return Ok(PushPolicyResult {
-            allowed: true,
-            warnings: vec![
-                "encrypted records detected — freshness policy cannot be checked without unlocking the store".to_owned(),
-            ],
-            stale_count: 0,
-        });
-    }
-
     let stale_keys: Vec<String> = records
         .iter()
         .filter_map(|(id, record)| match record {
@@ -706,7 +724,6 @@ pub fn check_push_policy(store: &GitStore) -> Result<PushPolicyResult, StoreErro
                     None
                 }
             }
-            StoredRecord::Encrypted { .. } => None,
         })
         .collect();
 
@@ -732,7 +749,7 @@ pub fn check_push_policy(store: &GitStore) -> Result<PushPolicyResult, StoreErro
 
 /// Push memory refs to the configured remote.
 ///
-/// Only `refs/memory/staged` and `refs/memory/main` are pushed (when they
+/// Only `refs/memory/main` and `refs/memory/main` are pushed (when they
 /// exist). Code branches are never touched. Push is always explicit — the
 /// caller must invoke this function; no automatic push occurs.
 ///
@@ -754,24 +771,15 @@ pub fn push_to_remote(
         custom.split_whitespace().map(str::to_owned).collect()
     } else {
         let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
-        let mut specs = Vec::new();
-        for (local, remote_ref) in [
-            ("refs/memory/staged", "refs/memory/staged"),
-            ("refs/memory/main", "refs/memory/main"),
-        ] {
-            if repo.find_reference(local).is_ok() {
-                let prefix = if force { "+" } else { "" };
-                specs.push(format!("{prefix}{local}:{remote_ref}"));
-            }
-        }
-        if specs.is_empty() {
+        if repo.find_reference(MAIN_REF).is_err() {
             return Err(StoreError::new(
                 StoreErrorKind::TransportFailed,
-                "no memory refs to push — the store is not initialized",
+                "no memory ref to push — the store is not initialized",
                 serde_json::json!({}),
             ));
         }
-        specs
+        let prefix = if force { "+" } else { "" };
+        vec![format!("{prefix}{MAIN_REF}:{MAIN_REF}")]
     };
 
     let output = Command::new("git")
@@ -805,13 +813,13 @@ pub fn push_to_remote(
     Err(classify_push_error(exit_code, &stderr))
 }
 
-/// Fetch remote refs/memory/staged into a temporary ref.
+/// Fetch remote refs/memory/main into a temporary ref.
 fn fetch_to_temp_ref(git_dir: &Path, remote: &MemoryRemote) -> Result<(), StoreError> {
     // Clean up any stale temp ref first.
     let _ = cleanup_temp_ref_by_path(git_dir);
 
     validate_remote_url(&remote.url)?;
-    let refspec = format!("+refs/memory/staged:{FETCH_TEMP_REF}");
+    let refspec = format!("+refs/memory/main:{FETCH_TEMP_REF}");
     let output = Command::new("git")
         .arg("-C")
         .arg(git_dir)
@@ -921,158 +929,6 @@ fn classify_push_error(exit_code: i32, stderr: &str) -> StoreError {
     )
 }
 
-/// Walk commits from `remote_oid` back to `local_oid` and verify SSH
-/// signatures on each new commit against the allowed signers list.
-fn verify_fetched_signatures(
-    repo: &Repository,
-    local_oid: git2::Oid,
-    remote_oid: git2::Oid,
-    allowed_signers: &[String],
-) -> Result<(), StoreError> {
-    let mut revwalk = repo
-        .revwalk()
-        .map_err(|e| StoreError::repository("create revwalk", e))?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .map_err(|e| StoreError::repository("set revwalk sort", e))?;
-    revwalk
-        .push(remote_oid)
-        .map_err(|e| StoreError::repository("push revwalk start", e))?;
-    // Hide the local commits we already have.
-    revwalk
-        .hide(local_oid)
-        .map_err(|e| StoreError::repository("hide revwalk base", e))?;
-
-    for oid_result in &mut revwalk {
-        let oid = oid_result.map_err(|e| StoreError::repository("revwalk next", e))?;
-        let commit = repo
-            .find_commit(oid)
-            .map_err(|e| StoreError::repository("find commit for verification", e))?;
-
-        // Read raw commit bytes (without gpgsig) for verification.
-        let raw = read_raw_commit(repo, oid)?;
-        let (commit_without_sig, signature_opt) = extract_gpgsig(&raw);
-
-        let Some(signature) = signature_opt else {
-            // Unsigned commit in the memory namespace — reject.
-            return Err(StoreError::new(
-                StoreErrorKind::SignatureInvalid,
-                "fetched commit is unsigned",
-                serde_json::json!({
-                    "commit": oid.to_string(),
-                    "author": commit.author().to_string(),
-                }),
-            ));
-        };
-
-        // Verify against any allowed signer.
-        let mut verified = false;
-        for signer_key in allowed_signers {
-            if memory_hub_crypto::verify_ssh_signature(&commit_without_sig, &signature, signer_key)
-                .is_ok()
-            {
-                verified = true;
-                break;
-            }
-        }
-
-        if !verified {
-            return Err(StoreError::new(
-                StoreErrorKind::SignatureInvalid,
-                "commit signature is not from an authorized recipient",
-                serde_json::json!({
-                    "commit": oid.to_string(),
-                    "author": commit.author().to_string(),
-                }),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Read the raw commit object bytes.
-fn read_raw_commit(repo: &Repository, oid: git2::Oid) -> Result<Vec<u8>, StoreError> {
-    let odb = repo
-        .odb()
-        .map_err(|e| StoreError::repository("open odb", e))?;
-    let object = odb
-        .read(oid)
-        .map_err(|e| StoreError::repository("read raw commit", e))?;
-    Ok(object.data().to_vec())
-}
-
-/// Extract the `gpgsig` header from a raw commit object.
-///
-/// Git stores the `gpgsig` header in the commit object as:
-///
-/// ```text
-/// gpgsig -----BEGIN SSH SIGNATURE-----
-///  <base64 line 1>
-///  <base64 line 2>
-///  -----END SSH SIGNATURE-----
-/// ```
-///
-/// The first line of the value follows `gpgsig ` directly (no leading
-/// space). Continuation lines are prefixed with a single space. This
-/// function collects the first line + all continuation lines, joins them
-/// with `\n`, and returns the reconstructed commit without the `gpgsig`
-/// header.
-///
-/// Returns `(commit_without_gpgsig, signature_option)`.
-fn extract_gpgsig(raw: &[u8]) -> (Vec<u8>, Option<String>) {
-    const HEADER: &[u8] = b"\ngpgsig ";
-    // A commit object is untrusted input: it arrives from a remote. All
-    // offsets are computed over the raw bytes, never over a lossy UTF-8 copy
-    // whose byte lengths differ from the original, and a truncated or
-    // unterminated header yields `None` instead of an out-of-bounds slice.
-    let Some(start) = find_subslice(raw, HEADER) else {
-        return (raw.to_vec(), None);
-    };
-    let mut cursor = start + HEADER.len();
-
-    // First line: the value that follows `gpgsig ` on the same line.
-    let Some(relative_end) = raw[cursor..].iter().position(|byte| *byte == b'\n') else {
-        return (raw.to_vec(), None);
-    };
-    let mut sig_lines: Vec<&[u8]> = vec![&raw[cursor..cursor + relative_end]];
-    cursor += relative_end + 1;
-    let mut after_signature = cursor;
-
-    // Continuation lines: each is prefixed with a single space.
-    while let Some(rest) = raw.get(cursor..) {
-        let Some(body) = rest.strip_prefix(b" ") else {
-            break;
-        };
-        let Some(relative_end) = body.iter().position(|byte| *byte == b'\n') else {
-            break;
-        };
-        sig_lines.push(&body[..relative_end]);
-        // +1 for the stripped space, +1 for the newline.
-        cursor += relative_end + 2;
-        after_signature = cursor;
-    }
-
-    let Ok(signature) = String::from_utf8(sig_lines.join(&b'\n')) else {
-        return (raw.to_vec(), None);
-    };
-    if !signature.contains("SSH SIGNATURE") {
-        return (raw.to_vec(), None);
-    }
-
-    // Reconstruct the commit without gpgsig: everything before the `\n` that
-    // precedes `gpgsig `, then everything after the signature lines.
-    let mut result = raw[..start].to_vec();
-    result.push(b'\n'); // restore the \n that separated gpgsig from the previous header
-    result.extend_from_slice(&raw[after_signature..]);
-    (result, Some(signature))
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 /// Perform a record-level merge between local and remote snapshots.
 ///
 /// Different keys are merged automatically. Same-key conflicts are collected
@@ -1177,9 +1033,8 @@ fn merge_records(
 /// and the scan at project open settles it.
 fn without_foreign_presence(record: &StoredRecord) -> StoredRecord {
     let mut record = record.clone();
-    if let StoredRecord::Plaintext { envelope } = &mut record
-        && let Some(reference) = &mut envelope.content_ref
-    {
+    let StoredRecord::Plaintext { envelope } = &mut record;
+    if let Some(reference) = &mut envelope.content_ref {
         reference.presence = memory_hub_core::Presence::Present;
     }
     record
@@ -1196,10 +1051,6 @@ fn records_equal(a: &StoredRecord, b: &StoredRecord) -> bool {
         (StoredRecord::Plaintext { envelope: ea }, StoredRecord::Plaintext { envelope: eb }) => {
             ea.content_hash == eb.content_hash
         }
-        (StoredRecord::Encrypted { encrypted: ea }, StoredRecord::Encrypted { encrypted: eb }) => {
-            ea.storage_id == eb.storage_id && ea.ciphertext == eb.ciphertext
-        }
-        _ => false,
     }
 }
 
@@ -1207,7 +1058,6 @@ fn records_equal(a: &StoredRecord, b: &StoredRecord) -> bool {
 fn content_hash_of(record: &StoredRecord) -> String {
     match record {
         StoredRecord::Plaintext { envelope } => envelope.content_hash.as_str().to_owned(),
-        StoredRecord::Encrypted { encrypted } => encrypted.storage_id.as_str().to_owned(),
     }
 }
 
@@ -1229,8 +1079,24 @@ fn cleanup_temp_ref_by_path(git_dir: &Path) -> Result<(), StoreError> {
     cleanup_temp_ref(&repo)
 }
 
+/// A suffix that makes a merge's transaction id its own.
+///
+/// Transaction ids may not be reused, and two merges in the same second are
+/// ordinary, so this is random rather than derived from the clock. A machine
+/// whose CSPRNG refuses is a machine with larger problems than a merge: the
+/// id falls back to a fixed word, and the reuse check refuses the second one.
 fn random_suffix() -> String {
-    memory_hub_crypto::generate_storage_id().unwrap_or_else(|_| "unknown".into())
+    use std::fmt::Write;
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        return "unknown".to_owned();
+    }
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
 }
 
 use git2::Repository;
@@ -1239,76 +1105,9 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{check_push_policy, extract_gpgsig};
+    use super::check_push_policy;
     use crate::{GitStore, Operation, Transaction};
     use memory_hub_core::StoredRecord;
-
-    #[test]
-    fn extract_gpgsig_finds_ssh_signature() {
-        let raw = b"tree 0123456789abcdef0123456789abcdef01234567\nparent 0123456789abcdef0123456789abcdef01234567\nauthor Test <test@example.com> 1700000000 +0000\ncommitter Test <test@example.com> 1700000000 +0000\ngpgsig -----BEGIN SSH SIGNATURE-----\n U1NIU0lHbmF0dXJlAAEAdXNlci1zdHJpbmc=\n -----END SSH SIGNATURE-----\n\nCommit message\n";
-
-        let (without_sig, sig_opt) = extract_gpgsig(raw);
-        let sig = sig_opt.expect("signature should be extracted");
-        assert!(sig.contains("BEGIN SSH SIGNATURE"));
-        assert!(sig.contains("END SSH SIGNATURE"));
-        assert!(sig.contains("U1NIU0lH"));
-        // The reconstructed commit must NOT contain gpgsig.
-        let without = String::from_utf8_lossy(&without_sig);
-        assert!(!without.contains("gpgsig"));
-        assert!(without.contains("Commit message"));
-    }
-
-    #[test]
-    fn extract_gpgsig_returns_none_without_signature() {
-        let raw = b"tree 0123456789abcdef0123456789abcdef01234567\nauthor Test <test@example.com> 1700000000 +0000\ncommitter Test <test@example.com> 1700000000 +0000\n\nCommit message\n";
-
-        let (without_sig, sig_opt) = extract_gpgsig(raw);
-        assert!(sig_opt.is_none());
-        assert_eq!(without_sig.as_slice(), raw);
-    }
-
-    #[test]
-    fn extract_gpgsig_preserves_other_headers() {
-        let raw = b"tree abcdef0000000000000000000000000000000000\nparent 1234560000000000000000000000000000000000\nauthor A <a@b.c> 1700000000 +0000\ncommitter A <a@b.c> 1700000000 +0000\ngpgsig -----BEGIN SSH SIGNATURE-----\n dGVzdA==\n -----END SSH SIGNATURE-----\n\nMsg\n";
-
-        let (without, sig) = extract_gpgsig(raw);
-        let s = String::from_utf8_lossy(&without);
-        assert!(sig.is_some());
-        assert!(s.contains("tree abcdef"));
-        assert!(s.contains("parent 123456"));
-        assert!(s.contains("author A"));
-        assert!(s.contains("Msg"));
-        assert!(!s.contains("gpgsig"));
-    }
-
-    #[test]
-    fn extract_gpgsig_survives_a_truncated_header() {
-        // The header is the last thing in the object: there is no value line.
-        let raw = b"tree abcdef0000000000000000000000000000000000\ngpgsig ";
-        let (without, sig) = extract_gpgsig(raw);
-        assert!(sig.is_none());
-        assert_eq!(without.as_slice(), raw.as_slice());
-    }
-
-    #[test]
-    fn extract_gpgsig_survives_an_unterminated_continuation() {
-        let raw = b"tree abcdef0000000000000000000000000000000000\ngpgsig -----BEGIN SSH SIGNATURE-----\n dGVzdA==";
-        let (without, sig) = extract_gpgsig(raw);
-        // The signature never closes, but the parser must not panic and must
-        // leave the reconstructed commit slice in bounds.
-        assert!(without.len() <= raw.len() + 1);
-        assert!(sig.is_none() || sig.is_some());
-    }
-
-    #[test]
-    fn extract_gpgsig_survives_non_utf8_bytes() {
-        let mut raw = b"tree abcdef0000000000000000000000000000000000\ngpgsig -----BEGIN SSH SIGNATURE-----\n ".to_vec();
-        raw.extend_from_slice(&[0xff, 0xfe, 0xfd]);
-        raw.extend_from_slice(b"\n\nMsg\n");
-        let (without, sig) = extract_gpgsig(&raw);
-        assert!(sig.is_none());
-        assert_eq!(without, raw);
-    }
 
     #[test]
     fn remote_urls_that_look_like_options_are_rejected() {
@@ -1340,17 +1139,17 @@ mod tests {
     #[test]
     fn refspecs_outside_the_memory_namespace_are_rejected() {
         assert!(super::validate_refspec("+refs/heads/main:refs/heads/main").is_err());
-        assert!(super::validate_refspec("refs/memory/staged:refs/heads/main").is_err());
+        assert!(super::validate_refspec("refs/memory/main:refs/heads/main").is_err());
         assert!(super::validate_refspec("--receive-pack=/bin/sh").is_err());
         assert!(super::validate_refspec("").is_err());
     }
 
     #[test]
     fn memory_namespace_refspecs_are_accepted() {
-        assert!(super::validate_refspec("+refs/memory/staged:refs/memory/staged").is_ok());
+        assert!(super::validate_refspec("+refs/memory/main:refs/memory/main").is_ok());
         assert!(
             super::validate_refspec(
-                "refs/memory/staged:refs/memory/staged refs/memory/main:refs/memory/main"
+                "refs/memory/main:refs/memory/main refs/memory/main:refs/memory/main"
             )
             .is_ok()
         );

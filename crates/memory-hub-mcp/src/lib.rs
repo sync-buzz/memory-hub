@@ -10,19 +10,30 @@
 
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use memory_hub_core::{
     CURRENT_ENVELOPE_VERSION, ContentHash, Envelope, PolicyResolver, StoredRecord,
 };
+/// The vector channel, and the machine's answer about it. Re-exported for a
+/// host that opens several sessions in one process: resolving the provider once
+/// and handing the same `Arc` to each is what keeps one model in memory rather
+/// than one per project.
+pub use memory_hub_embed::EmbeddingProvider;
+pub use memory_hub_embed::active::resolve_active_provider;
 use memory_hub_engine::{ExportMode, Operation, RecordId, Revision};
 use memory_hub_index::{SearchFilters, SearchRequest};
 use memory_hub_reconcile::DivergenceMode;
 use memory_hub_schema::SchemaRegistry;
+/// Where a project's records go — said by whoever opens the session, because
+/// the engine will not guess. Re-exported so a host that links this crate names
+/// one crate rather than two.
+pub use memory_hub_service::RecordsIn;
 use memory_hub_service::{
-    Content, ContentResolution, EncryptionStatus, ListingQuery, ListingSort, MemoryService,
-    PresenceFilter, RenameCandidate, ScanChange, ServiceError, Unresolved, freshness_str,
+    Content, ContentResolution, ListingQuery, ListingSort, MemoryService, PresenceFilter,
+    RenameCandidate, ScanChange, ServiceError, Unresolved, freshness_str,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -51,12 +62,13 @@ pub const MEMORY_INTERFACE_MINOR: u16 = 0;
 /// getting exactly what it got before.
 pub const RECORDS_CHANGED: &str = "memory://records/changed";
 
-/// Run one MCP session until stdin reaches EOF.
+/// Run one MCP session until stdin reaches EOF, over a project whose records
+/// are where `records` says.
 ///
 /// # Errors
 ///
 /// Returns an I/O error when a request or response cannot cross stdio.
-pub fn serve(project: &Path) -> io::Result<()> {
+pub fn serve(project: &Path, records: RecordsIn) -> io::Result<()> {
     let project = if project.is_absolute() {
         project.to_path_buf()
     } else {
@@ -65,11 +77,16 @@ pub fn serve(project: &Path) -> io::Result<()> {
     let project = project.canonicalize().unwrap_or(project);
     let stdin = io::stdin();
     let stdout = io::stdout();
-    serve_io(project, stdin.lock(), stdout.lock())
+    serve_io(project, records, stdin.lock(), stdout.lock())
 }
 
-fn serve_io(project: PathBuf, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
-    let mut session = Session::new(project);
+fn serve_io(
+    project: PathBuf,
+    records: RecordsIn,
+    mut input: impl BufRead,
+    mut output: impl Write,
+) -> io::Result<()> {
+    let mut session = Session::new(project, records);
     let mut line = String::new();
     loop {
         line.clear();
@@ -133,14 +150,42 @@ pub struct Session {
 
 impl Session {
     #[must_use]
-    pub fn new(project: PathBuf) -> Self {
+    pub fn new(project: PathBuf, records: RecordsIn) -> Self {
         Self {
             initialized: false,
             revision_subscribed: false,
             records_subscribed: false,
             reconciliation: json!({"status": "pending"}),
             attachments: json!({"status": "pending"}),
-            service: MemoryService::open(project),
+            service: MemoryService::open(project, records),
+        }
+    }
+
+    /// Open a session that uses `provider` for the vector channel instead of
+    /// resolving one from this machine.
+    ///
+    /// For a host that keeps several projects open at once. Resolved per
+    /// session, the model is loaded per session — five projects in one process
+    /// mean five copies of the same weights — and the model is by far the
+    /// largest thing either side holds. Resolve once with
+    /// [`resolve_active_provider`], hand the same `Arc` to every session.
+    ///
+    /// `None` says this machine has no model, and is a real answer rather than
+    /// a missing one: search then runs FTS-only, and the session will not go
+    /// looking for a GGUF of its own afterwards.
+    #[must_use]
+    pub fn with_provider(
+        project: PathBuf,
+        records: RecordsIn,
+        provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
+        Self {
+            initialized: false,
+            revision_subscribed: false,
+            records_subscribed: false,
+            reconciliation: json!({"status": "pending"}),
+            attachments: json!({"status": "pending"}),
+            service: MemoryService::open(project, records).with_provider(provider),
         }
     }
 
@@ -277,29 +322,16 @@ impl Session {
                 "kind": error.kind, "message": error.message
             }}),
         };
-        // Encrypted projects use an ephemeral index rebuilt only on `unlock`.
-        // When locked, there is no plaintext to index — skip synchronization so
-        // we don't recreate an empty LanceDB directory that `Session::new`
-        // just wiped as part of crash recovery.
-        //
-        // An empty store is skipped as well: creating the LanceDB catalog and
+        // An empty store is skipped: creating the LanceDB catalog and
         // its three FTS indices dominates session start-up, and `search` and
         // every mutation synchronize on demand, so nothing observes a missing
         // projection for a store that has nothing to project.
-        //
-        // A project with no declaration is skipped too, and the session still
-        // opens: `memory_init` is the tool that fixes that, and a handshake
-        // that refused to complete would put it out of reach.
-        if self.service.config().is_ok()
-            && (!self.service.is_encrypted() || self.service.is_unlocked())
-            && !self.store_is_empty()?
-        {
+        if !self.store_is_empty()? {
             self.service.sync_index().map_err(RpcFailure::service)?;
         }
         let handshake = self.handshake();
         self.initialized = true;
-        let encryption_mode = encryption_mode_name(self.service.encryption_status());
-        let instructions = self.composed_instructions(encryption_mode);
+        let instructions = self.composed_instructions();
         Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {
@@ -332,7 +364,6 @@ impl Session {
                 memory_hub_embed::Fingerprint::from_provider(&*provider, provider.model_id())
                     .digest()
             }),
-            "encryptionMode": encryption_mode_name(self.service.encryption_status()),
             "installationId": installation_id,
             "projectId": project_id,
             "projectPath": canonical,
@@ -357,8 +388,8 @@ impl Session {
     /// Loads the schema registry from the current revision. When type records
     /// exist, appends a `## Document Types` section after the built-in
     /// conductor. When the registry is empty, only the built-in text is sent.
-    fn composed_instructions(&self, encryption_mode: &str) -> String {
-        let mut text = builtin_instructions(encryption_mode);
+    fn composed_instructions(&self) -> String {
+        let mut text = builtin_instructions();
         if let Ok(registry) = self.load_schema_registry() {
             let schema_text = schema_instructions::schema_instructions(&registry);
             if !schema_text.is_empty() {
@@ -412,8 +443,8 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`RpcFailure`] for an unknown URI, a locked encrypted store, or
-    /// an unreadable store or index.
+    /// Returns [`RpcFailure`] for an unknown URI, or an unreadable store or
+    /// index.
     pub fn read_resource(&self, params: &Value) -> Result<Value, RpcFailure> {
         let uri = required_string(params, "uri")?;
         let content = match uri {
@@ -437,7 +468,6 @@ impl Session {
             }
             "memory://model/status" => self.build_model_status(),
             "memory://policy/effective" => policy_resource(),
-            "memory://encryption/status" => self.encryption_status(),
             "memory://records/summary" => self.records_summary()?,
             "memory://schema" => {
                 let registry = self.load_schema_registry()?;
@@ -590,8 +620,6 @@ impl Session {
             "memory_list_records" => self.list_records(arguments),
             "memory_list_folders" => self.list_folders(arguments),
             "memory_rename_folder" => self.rename_folder(arguments),
-            "memory_checkpoint" => self.checkpoint(arguments),
-            "memory_history" => self.history(arguments),
             "memory_diff" => self.diff(arguments),
             "memory_export" => self.export(arguments),
             "memory_import" => self.import(arguments),
@@ -605,18 +633,13 @@ impl Session {
             "memory_search" => self.search(arguments),
             "memory_backlinks" => self.backlinks(arguments),
             "memory_transport_status" => self.transport_status(),
+            "memory_presence" => self.presence(),
+            "memory_remote_set" => self.remote_set(arguments),
+            "memory_remote_remove" => self.remote_remove(),
             "memory_fetch" => self.fetch(arguments),
             "memory_push" => self.push(arguments),
             "memory_model_status" => Ok(self.model_status()),
-            "memory_encryption_status" => Ok(ToolOutcome::read(self.encryption_status())),
-            "memory_unlock" => self.unlock_store(arguments),
-            "memory_lock" => self.lock_store(),
-            "memory_init" => self.init_project(arguments),
-            "memory_declare_storage" => self.declare_storage(arguments),
-            "memory_init_encrypted" => self.init_encrypted(arguments),
-            "memory_list_recipients" => self.list_recipients(),
-            "memory_add_recipient" => self.add_recipient(arguments),
-            "memory_remove_recipient" => self.remove_recipient(arguments),
+            "memory_delete_type" => self.delete_type(arguments),
             "memory_list_types" => self.list_types(),
             "memory_schema_status" => self.schema_status(),
             _ => Err(ToolCallFailure::Rpc(RpcFailure::new(
@@ -625,25 +648,6 @@ impl Session {
                 json!({"kind": "tool_not_found", "name": name}),
             ))),
         }
-    }
-
-    fn encryption_status(&self) -> Value {
-        let status = self.service.encryption_status();
-        let encrypted = status.is_encrypted();
-        let unlocked = status == EncryptionStatus::Unlocked;
-        json!({
-            "schemaVersion": 1,
-            "mode": encryption_mode_name(status),
-            "state": match status {
-                EncryptionStatus::Plaintext => "plaintext",
-                EncryptionStatus::Unlocked => "unlocked",
-                EncryptionStatus::Locked => "locked",
-            },
-            "available": true,
-            "encryptedStoreAvailable": encrypted,
-            "encryptedIndexAvailable": encrypted && unlocked,
-            "ephemeralIndex": encrypted
-        })
     }
 
     fn records_summary(&self) -> Result<Value, RpcFailure> {
@@ -682,9 +686,9 @@ impl Session {
                     "writable": summary.writable,
                 });
                 // Absent, as the tool's description promises — not `null`.
-                // "This type names no storage" and "this type names a storage
-                // called nothing" are different claims, and only the first is
-                // one this can make.
+                // "This type keeps its documents in its records" and "this type
+                // keeps them in a folder called nothing" are different claims,
+                // and only the first is one this can make.
                 if let Some(storage) = &summary.storage
                     && let Some(object) = rendered.as_object_mut()
                 {
@@ -779,13 +783,7 @@ impl Session {
 
     fn get_record(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         let key = required_string(arguments, "key")?;
-        // A plaintext read is pinned to a revision the caller names; an
-        // encrypted project only serves its current one.
-        let revision: Option<Revision> = if self.service.is_encrypted() {
-            None
-        } else {
-            Some(parse_field(arguments, "revision")?)
-        };
+        let revision: Option<Revision> = Some(parse_field(arguments, "revision")?);
         let view = self
             .service
             .get_record(key, revision.as_ref())
@@ -869,25 +867,6 @@ impl Session {
         Ok(ToolOutcome::changing(json!(result), changed))
     }
 
-    fn checkpoint(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let message = required_string(arguments, "message")?;
-        let checkpoint = self
-            .service
-            .checkpoint(message)
-            .map_err(ToolFailure::service)?;
-        Ok(ToolOutcome::read(json!(checkpoint)))
-    }
-
-    fn history(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(100);
-        let limit = usize::try_from(limit).unwrap_or(100);
-        let history = self.service.history(limit).map_err(ToolFailure::service)?;
-        Ok(ToolOutcome::read(json!({"checkpoints": history})))
-    }
-
     fn diff(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         let from: Revision = parse_field(arguments, "from_revision")?;
         let to: Revision = parse_field(arguments, "to_revision")?;
@@ -930,7 +909,7 @@ impl Session {
             .map_err(|_| RpcFailure::invalid_argument("bundle"))?;
         let result = self
             .service
-            .import(transaction_id, expected_revision, bundle)
+            .import(transaction_id, expected_revision, &bundle)
             .map_err(ToolFailure::service)?;
         let changed = result
             .changed_keys
@@ -1098,12 +1077,12 @@ impl Session {
 
     fn migrate_storage(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         let kind = required_string(arguments, "kind")?.to_owned();
-        // The name of a storage the project declared, or `null` to bring the
-        // content back in with the records. Absent is not the same as null: one
-        // is a caller who forgot to say, the other is a caller who said "here".
+        // A directory of the working tree, or `null` to bring the content back
+        // in with the records. Absent is not the same as null: one is a caller
+        // who forgot to say, the other is a caller who said "here".
         let storage: Option<String> = match arguments.get("storage") {
             Some(Value::Null) => None,
-            Some(Value::String(name)) => Some(name.clone()),
+            Some(Value::String(folder)) => Some(folder.clone()),
             // Absent or of the wrong type. Absent is a caller who forgot to
             // say; null is a caller who said "back in with the records".
             _ => return Err(RpcFailure::invalid_argument("storage").into()),
@@ -1287,11 +1266,46 @@ impl Session {
             .service
             .transport_status()
             .map_err(ToolFailure::service)?;
+        // The code origin travels with the answer because the only thing a
+        // caller does with an unconfigured remote is offer to configure one,
+        // and this is the single address it can sensibly suggest. Asking for
+        // it separately would be a second round trip for half a question.
+        let code_origin = self.service.code_origin_url().unwrap_or_default();
         Ok(ToolOutcome::read(json!({
             "remoteConfigured": remote.is_some(),
             "remoteUrl": remote.as_ref().map(|remote| remote.url.clone()),
             "refspec": remote.as_ref().and_then(|remote| remote.refspec.clone()),
+            "codeOriginUrl": code_origin,
         })))
+    }
+
+    fn presence(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        let presence = self.service.presence().map_err(ToolFailure::service)?;
+        Ok(ToolOutcome::read(
+            serde_json::to_value(presence).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn remote_set(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let url = required_string(arguments, "url")?;
+        let refspec = arguments
+            .get("refspec")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let remote = self
+            .service
+            .set_remote(url.to_owned(), refspec)
+            .map_err(ToolFailure::service)?;
+        Ok(ToolOutcome::read(json!({
+            "remoteConfigured": true,
+            "remoteUrl": remote.url,
+            "refspec": remote.refspec,
+        })))
+    }
+
+    fn remote_remove(&self) -> Result<ToolOutcome, ToolCallFailure> {
+        self.service.remove_remote().map_err(ToolFailure::service)?;
+        Ok(ToolOutcome::read(json!({"remoteConfigured": false})))
     }
 
     fn fetch(&self, _arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
@@ -1338,129 +1352,36 @@ impl Session {
         })))
     }
 
-    fn unlock_store(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let identity_path = required_string(arguments, "identity_path")?.to_owned();
-        let revision = self
+    /// Remove a type, and detach the folder it was over.
+    ///
+    /// Not expressible as a batch of deletions, which is why it is a tool of
+    /// its own: deleting a record takes its document, and the records of an
+    /// attached type describe files the repository had before Memory did.
+    fn delete_type(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let kind = required_string(arguments, "kind")?.to_owned();
+        let transaction_id = required_string(arguments, "transaction_id")?.to_owned();
+
+        let removal = self
             .service
-            .unlock(Path::new(&identity_path))
-            .map_err(|error| identity_safe_failure(error, &identity_path))?;
-        Ok(ToolOutcome::read(json!({
-            "unlocked": true,
-            "revision": revision,
-            "indexRebuilt": true,
-        })))
-    }
-
-    fn lock_store(&mut self) -> Result<ToolOutcome, ToolCallFailure> {
-        self.service.lock().map_err(ToolFailure::service)?;
-        Ok(ToolOutcome::read(json!({
-            "locked": true,
-            "indexDestroyed": true,
-        })))
-    }
-
-    fn init_project(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        // No default. A product that embeds this engine is the one that knows
-        // whether its users want their memory in Git or in a folder they can
-        // open, and answering for it would be the engine deciding.
-        let records = required_string(arguments, "records")?;
-        let path = arguments.get("path").and_then(Value::as_str);
-        let storage = match records {
-            "refs" => {
-                if path.is_some() {
-                    return Err(RpcFailure::invalid_argument("path").into());
-                }
-                memory_hub_service::StorageConfig::refs()
-            }
-            "folder" => memory_hub_service::StorageConfig::folder(
-                path.unwrap_or(memory_hub_service::DEFAULT_RECORDS_PATH),
-            ),
-            _ => return Err(RpcFailure::invalid_argument("records").into()),
-        };
-
-        let config = MemoryService::init(
-            self.service.project(),
-            std::collections::BTreeMap::from([("main".to_owned(), storage)]),
-        )
-        .map_err(ToolFailure::service)?;
-        let (name, records) = config.record_storage().map_err(ToolFailure::service)?;
-
-        Ok(ToolOutcome::read(json!({
-            "schemaVersion": 1,
-            "recordsStorage": name,
-            "kind": records.kind,
-            "path": records.path,
-        })))
-    }
-
-    fn declare_storage(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let name = required_string(arguments, "name")?.to_owned();
-        let kind = required_string(arguments, "kind")?;
-        let path = arguments.get("path").and_then(Value::as_str);
-        let storage = match kind {
-            "repo_folder" => memory_hub_service::StorageConfig::repo_folder(
-                path.ok_or_else(|| RpcFailure::invalid_argument("path"))?,
-            ),
-            "folder" => memory_hub_service::StorageConfig::folder(
-                path.ok_or_else(|| RpcFailure::invalid_argument("path"))?,
-            ),
-            "refs" => memory_hub_service::StorageConfig::refs(),
-            _ => return Err(RpcFailure::invalid_argument("kind").into()),
-        };
-
-        let config = self
-            .service
-            .declare_storage(&name, storage)
+            .remove_type(&kind, &transaction_id)
             .map_err(ToolFailure::service)?;
 
-        Ok(ToolOutcome::read(json!({
-            "schemaVersion": 1,
-            "declared": config.storages.keys().collect::<Vec<_>>(),
-        })))
-    }
-
-    fn init_encrypted(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let identity_path = required_string(arguments, "identity_path")?.to_owned();
-        let recipient = recipient_from_arguments(arguments, "recipient_public_key")?;
-        let backup_identity = self
-            .service
-            .init_encrypted(Path::new(&identity_path), recipient)
-            .map_err(|error| identity_safe_failure(error, &identity_path))?;
-        Ok(ToolOutcome::read(json!({
-            "initialized": true,
-            "backupIdentity": backup_identity,
-            "warning": "persist the backup identity in a safe location outside the repository — it is the recovery path if you lose your SSH key",
-        })))
-    }
-
-    fn list_recipients(&self) -> Result<ToolOutcome, ToolCallFailure> {
-        let recipients = self
-            .service
-            .list_recipients()
-            .map_err(ToolFailure::service)?;
-        Ok(ToolOutcome::read(json!({"recipients": recipients})))
-    }
-
-    fn add_recipient(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let recipient = recipient_from_arguments(arguments, "public_key")?;
-        self.service
-            .add_recipient(recipient)
-            .map_err(ToolFailure::service)?;
-        Ok(ToolOutcome::read(json!({
-            "added": true,
-            "indexRebuilt": true,
-        })))
-    }
-
-    fn remove_recipient(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
-        let public_key = required_string(arguments, "public_key")?;
-        self.service
-            .remove_recipient(public_key)
-            .map_err(ToolFailure::service)?;
-        Ok(ToolOutcome::read(json!({
-            "removed": true,
-            "indexRebuilt": true,
-        })))
+        Ok(ToolOutcome::changing(
+            json!({
+                "schemaVersion": 1,
+                "revision": removal.revision,
+                "removed": removal.removed,
+                "detached": removal.detached,
+            }),
+            // The definition and its records are gone by name, and the client
+            // is told how many rather than which: a type with ten thousand
+            // records would answer with a list nobody reads. The one notice
+            // says the schema moved, which is what a client re-reads.
+            vec![RecordNotice::keyed(
+                memory_hub_schema::type_key(&kind),
+                "deleted",
+            )],
+        ))
     }
 }
 
@@ -1579,51 +1500,6 @@ const fn index_minor() -> u16 {
     minor
 }
 
-fn recipient_from_arguments(
-    arguments: &Value,
-    key_field: &str,
-) -> Result<memory_hub_store::RecipientEntry, RpcFailure> {
-    Ok(memory_hub_store::RecipientEntry {
-        public_key: required_string(arguments, key_field)?.to_owned(),
-        key_type: arguments
-            .get("key_type")
-            .and_then(Value::as_str)
-            .unwrap_or("ssh")
-            .to_owned(),
-        label: arguments
-            .get("label")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    })
-}
-
-/// Answer an identity failure without saying why it failed.
-///
-/// Distinguishing "no such file" from "not a key" would turn unlock into a
-/// filesystem probe for anything that can reach this interface. The cause goes
-/// to stderr, which belongs to the operator running the process rather than to
-/// the protocol.
-fn identity_safe_failure(error: ServiceError, identity_path: &str) -> ToolCallFailure {
-    if error.kind != "identity_load_failed" {
-        return ToolFailure::service(error).into();
-    }
-    eprintln!("memory-hub: identity load failed for {identity_path}: {error}");
-    ToolFailure {
-        kind: "identity_load_failed".to_owned(),
-        message: "failed to load an identity from the given path".to_owned(),
-        data: json!({"path": identity_path}),
-    }
-    .into()
-}
-
-const fn encryption_mode_name(status: EncryptionStatus) -> &'static str {
-    if status.is_encrypted() {
-        "encrypted"
-    } else {
-        "plaintext"
-    }
-}
-
 fn string_array(arguments: &Value, field: &str) -> Vec<String> {
     arguments
         .get(field)
@@ -1692,7 +1568,6 @@ pub fn list_resources() -> Value {
         ("Index status", "memory://index/status"),
         ("Model status", "memory://model/status"),
         ("Effective policy", "memory://policy/effective"),
-        ("Encryption status", "memory://encryption/status"),
         ("Records summary", "memory://records/summary"),
         ("Document type schema", "memory://schema"),
     ]
@@ -1709,7 +1584,7 @@ pub fn list_resource_templates() -> Value {
             "name": "Memory record",
             "uriTemplate": "memory://records/{key}",
             "mimeType": "application/json",
-            "description": "Current record identified by its plaintext key, as of the staged revision"
+            "description": "Current record identified by its plaintext key, as of the current revision"
         },
         {
             "name": "Document type definition",
@@ -1720,12 +1595,11 @@ pub fn list_resource_templates() -> Value {
     ]})
 }
 
-/// Built-in agent instructions — describes the storage layer tools, the
-/// revision model, and the encryption lifecycle. Updated with each Memory Hub
-/// version. Composed with project-specific schema instructions (from
+/// Built-in agent instructions — describes the storage layer tools and the
+/// revision model. Updated with each Memory Hub version. Composed with project-specific schema instructions (from
 /// `__type__` records) when schema is implemented.
 #[allow(clippy::too_many_lines)] // One prose block; splitting it would scatter the text.
-fn builtin_instructions(encryption_mode: &str) -> String {
+fn builtin_instructions() -> String {
     let mut s = String::new();
     s.push_str("# Memory Hub — Persistent Knowledge Store\n\n");
     s.push_str("You are connected to a Memory Hub store. Records persist in Git objects ");
@@ -1775,17 +1649,12 @@ fn builtin_instructions(encryption_mode: &str) -> String {
 
     // ── Revision model ──
     s.push_str("## Revision Model\n\n");
-    s.push_str("Memory uses a two-revision model:\n");
-    s.push_str("- **Staged** (`refs/memory/staged`): pending changes, not yet permanent.\n");
-    s.push_str("- **Canonical** (`refs/memory/main`): committed snapshots.\n\n");
-    s.push_str("`apply_transaction` writes to staged. `checkpoint` promotes staged to ");
-    s.push_str("canonical. Read operations (`get_record`, `list_records`, `search`) ");
-    s.push_str("serve the staged revision, so a record is readable the moment it is ");
-    s.push_str("written — no checkpoint required. Canonical is what checkpoints name ");
-    s.push_str("and what `memory_history` walks; reach it explicitly through ");
-    s.push_str("`memory_history` and `memory_diff`.\n\n");
-    s.push_str("Every mutation returns the new staged revision, and that value is what ");
-    s.push_str("`expected_revision` expects: the last staged revision you observed. ");
+    s.push_str("Memory lives on one ref, `refs/memory/main`: every transaction is a ");
+    s.push_str("commit on it, and every past state is one of its parents. A record is ");
+    s.push_str("readable the moment it is written, and `memory_diff` compares any two ");
+    s.push_str("revisions.\n\n");
+    s.push_str("Every mutation returns the new revision, and that value is what ");
+    s.push_str("`expected_revision` expects: the last revision you observed. ");
     s.push_str("After mutations, the index is synchronised automatically — no manual ");
     s.push_str("reindex needed for normal operations.\n\n");
 
@@ -1825,19 +1694,16 @@ fn builtin_instructions(encryption_mode: &str) -> String {
     s.push_str("the write then applies only while the record's content still hashes to ");
     s.push_str("that value, and returns `conflict` otherwise. Omit it for the ");
     s.push_str("unconditional write.\n");
-    s.push_str("- **memory_checkpoint** (`message`): Promote staged to canonical. ");
-    s.push_str("Creates a permanent Git commit with a message.\n");
 
     s.push_str("\n### History & Reconciliation\n\n");
-    s.push_str("- **memory_history**: List checkpoints (canonical commits).\n");
     s.push_str("- **memory_diff**: Compare two revisions.\n");
     s.push_str("- **memory_reconcile**: Sync Memory with code history. ");
-    s.push_str("Code commits since the last Memory checkpoint are processed; ");
+    s.push_str("Code commits since the last reconciled one are processed; ");
     s.push_str("freshness of records is updated based on path overlap.\n");
 
     s.push_str("\n### Search Index\n\n");
     s.push_str("- **memory_reindex**: Rebuild the LanceDB index from the current ");
-    s.push_str("(staged) revision. ");
+    s.push_str("revision. ");
     s.push_str("Use after corruption or manual Git operations.\n");
     s.push_str("- **memory_doctor**: Validate repository and index health.\n");
 
@@ -1857,25 +1723,6 @@ fn builtin_instructions(encryption_mode: &str) -> String {
         "- **memory_import** (`bundle`): Import records from a bundle in one transaction.\n",
     );
 
-    // ── Encryption ──
-    if encryption_mode == "encrypted" {
-        s.push_str("\n## Encryption\n\n");
-        s.push_str("This project uses encrypted storage. Records are encrypted with age ");
-        s.push_str("(SSH keys) before writing to Git. The search index is ephemeral: ");
-        s.push_str("it exists only in memory while unlocked.\n\n");
-        s.push_str("- **memory_unlock** (`identity_path`): Decrypt the store with an SSH key. ");
-        s.push_str("Rebuilds the search index from decrypted records. ");
-        s.push_str("Required before any read/write/search operation.\n");
-        s.push_str("- **memory_lock**: Lock the store and destroy the index. ");
-        s.push_str("No plaintext persists on disk while locked.\n");
-        s.push_str("- **memory_encryption_status**: Check current lock state.\n");
-        s.push_str("- **memory_list_recipients** / **memory_add_recipient** / ");
-        s.push_str("**memory_remove_recipient**: Manage who can decrypt. ");
-        s.push_str("Adding/removing a recipient re-encrypts all records.\n");
-        s.push_str("\nWhile locked, read/write/search operations return a `locked` error. ");
-        s.push_str("Call `memory_unlock` first.\n");
-    }
-
     // ── Resources ──
     s.push_str("\n## Resources\n\n");
     s.push_str("- `memory://project`: Project handshake (versions, backend, reconciliation). Backend-specific facts such as `gitDir` are present only for the backends that have them.\n");
@@ -1885,12 +1732,11 @@ fn builtin_instructions(encryption_mode: &str) -> String {
     s.push_str("`content_returned`, `freshness_changed` or `needs_attention`. Re-read the named ");
     s.push_str("records rather than invalidating everything. It also fires when a scan finds ");
     s.push_str("something without writing anything, which the revision cannot report.\n");
-    s.push_str("- `memory://revision/current`: Current staged revision — the one reads ");
+    s.push_str("- `memory://revision/current`: The current revision — the one reads ");
     s.push_str("serve and `expected_revision` compares against.\n");
     s.push_str("- `memory://index/status`: LanceDB index state.\n");
     s.push_str("- `memory://model/status`: Embedding model status.\n");
     s.push_str("- `memory://policy/effective`: Effective transport policy.\n");
-    s.push_str("- `memory://encryption/status`: Encryption mode and lock state.\n");
     s.push_str("- `memory://records/summary`: Document counts by kind, freshness, archived. ");
     s.push_str("Type definitions are counted apart, in `service`.\n");
     s.push_str("- `memory://records/{key}`: Full record by key.\n\n");
@@ -1901,11 +1747,9 @@ fn builtin_instructions(encryption_mode: &str) -> String {
     s.push_str("to get the current `expected_revision` before `apply_transaction`.\n");
     s.push_str("2. **One transaction, one logical change**: Batch related puts/deletes ");
     s.push_str("in a single transaction for atomicity.\n");
-    s.push_str("3. **Checkpoint after significant changes**: Use `memory_checkpoint` ");
-    s.push_str("with a descriptive message after a logical group of transactions.\n");
-    s.push_str("4. **Use metadata_only for lists**: When listing records for display, ");
+    s.push_str("3. **Use metadata_only for lists**: When listing records for display, ");
     s.push_str("set `metadata_only: true` to avoid transferring full content.\n");
-    s.push_str("5. **After resource update notifications**: Re-read ");
+    s.push_str("4. **After resource update notifications**: Re-read ");
     s.push_str("`memory://revision/current` to stay in sync.\n");
 
     s
@@ -1994,22 +1838,6 @@ pub fn list_tools() -> Value {
                     ("transaction_id", string_schema()),
                 ],
                 &["from", "to", "transaction_id"],
-            ),
-        ),
-        tool(
-            "memory_checkpoint",
-            "Checkpoint the current staged revision",
-            object_schema(&[("message", string_schema())], &["message"]),
-        ),
-        tool(
-            "memory_history",
-            "List checkpoint history newest first",
-            object_schema(
-                &[(
-                    "limit",
-                    json!({"type":"integer","minimum":0,"maximum":1000}),
-                )],
-                &[],
             ),
         ),
         tool(
@@ -2103,11 +1931,11 @@ pub fn list_tools() -> Value {
         ),
         tool(
             "memory_migrate_storage",
-            "Move a type's records to another storage. `dry_run: true` returns the plan — how              many records move, in which direction, and what must be accepted — without writing              anything. Every warning code the plan lists has to be echoed in `acknowledge`              before it will run. Editing a type's `storage` field directly is refused while the              kind has records.",
+            "Move a type's documents to another folder of the working tree, or back in with              the records. `dry_run: true` returns the plan — how many records move, in which              direction, and what must be accepted — without writing anything. Every warning              code the plan lists has to be echoed in `acknowledge` before it will run. Editing              a type's `storage` field directly is refused while the kind has records.",
             object_schema(
                 &[
                     ("kind", string_schema()),
-                    // A declared storage's name, or `null` to bring the
+                    // A project-relative directory, or `null` to bring the
                     // content back in with the records.
                     ("storage", json!({"type": ["string", "null"]})),
                     (
@@ -2153,16 +1981,36 @@ pub fn list_tools() -> Value {
                 &["key", "content", "transaction_id"],
             ),
         ),
-        tool(
-            "memory_encryption_status",
-            "Report the active encryption mode",
-            object_schema(&[], &[]),
-        ),
     ];
-    tools.push(tool("memory_reindex", "Rebuild the LanceDB search index from the current (staged) revision. Use after corruption or manual Git operations.", object_schema(&[], &[])));
+    tools.push(tool("memory_reindex", "Rebuild the LanceDB search index from the current revision. Use after corruption or manual Git operations.", object_schema(&[], &[])));
     tools.push(tool(
         "memory_transport_status",
         "Check if a memory remote is configured and report sync status.",
+        object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_presence",
+        "Say whether this repository's memory is here, still on a remote, or nowhere yet. \
+         `git clone` copies no refs/memory/*, so a fresh clone and a project that never had \
+         memory look identical from inside — this is what tells them apart.",
+        object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_remote_set",
+        "Configure the memory remote, which is separate from the code `origin` and is the only \
+         address memory is ever published to.",
+        object_schema(
+            &[
+                ("url", json!({"type": "string"})),
+                ("refspec", json!({"type": "string"})),
+            ],
+            &["url"],
+        ),
+    ));
+    tools.push(tool(
+        "memory_remote_remove",
+        "Forget the memory remote. Memory stays where it is; nothing is published until one is \
+         configured again.",
         object_schema(&[], &[]),
     ));
     tools.push(tool(
@@ -2184,87 +2032,19 @@ pub fn list_tools() -> Value {
         object_schema(&[], &[]),
     ));
     tools.push(tool(
-        "memory_unlock",
-        "Unlock the encrypted store with an SSH identity and rebuild the ephemeral index",
-        object_schema(&[("identity_path", string_schema())], &["identity_path"]),
-    ));
-    tools.push(tool(
-        "memory_lock",
-        "Lock the encrypted store and destroy the ephemeral index (no plaintext persists on disk)",
-        object_schema(&[], &[]),
-    ));
-    tools.push(tool(
-        "memory_init",
-        "Declare where this project keeps its memory, and prepare it. There is no default: say \
-         `refs` to keep records in Git objects — versioned, pushable, invisible in the working \
-         tree — or `folder` to keep them as files, which needs no Git and can be read with any \
-         editor. Refuses a project that already has a declaration.",
+        "memory_delete_type",
+        "Remove a type from this project: its definition and every record of it. The files of a \
+         type whose documents live in a folder of the working tree are left exactly where they \
+         are: they are the repository's documents, and this type was only what Memory knew about \
+         them. Deleting the records one by one is not the same operation, because deleting a \
+         record takes its document with it.",
         object_schema(
             &[
-                (
-                    "records",
-                    json!({"type": "string", "enum": ["refs", "folder"]}),
-                ),
-                ("path", string_schema()),
+                ("kind", string_schema()),
+                ("transaction_id", string_schema()),
             ],
-            &["records"],
+            &["kind", "transaction_id"],
         ),
-    ));
-    tools.push(tool(
-        "memory_declare_storage",
-        "Declare another storage this project can keep content in, so a type may name it. \
-         `repo_folder` is a directory of the working tree holding documents people edit; \
-         `folder` is a directory of record files; `refs` is Git objects. Refuses a name the \
-         project already uses.",
-        object_schema(
-            &[
-                ("name", string_schema()),
-                (
-                    "kind",
-                    json!({"type": "string", "enum": ["repo_folder", "folder", "refs"]}),
-                ),
-                ("path", string_schema()),
-            ],
-            &["name", "kind"],
-        ),
-    ));
-    tools.push(tool(
-        "memory_init_encrypted",
-        "Initialize the encrypted store with the first recipient. Pass both your SSH private key path (to unlock) and your public key (as recipient). Creates a backup identity — persist it outside the repo.",
-        object_schema(
-            &[
-                ("identity_path", string_schema()),
-                ("recipient_public_key", string_schema()),
-                ("key_type", json!({"type":"string","enum":["ssh","x25519"],"default":"ssh"})),
-                ("label", string_schema()),
-            ],
-            &["identity_path", "recipient_public_key"],
-        ),
-    ));
-    tools.push(tool(
-        "memory_list_recipients",
-        "List all recipients in the encrypted manifest",
-        object_schema(&[], &[]),
-    ));
-    tools.push(tool(
-        "memory_add_recipient",
-        "Add a recipient and re-encrypt all records (requires unlock)",
-        object_schema(
-            &[
-                ("public_key", string_schema()),
-                (
-                    "key_type",
-                    json!({"type":"string","enum":["ssh","x25519"],"default":"ssh"}),
-                ),
-                ("label", string_schema()),
-            ],
-            &["public_key"],
-        ),
-    ));
-    tools.push(tool(
-        "memory_remove_recipient",
-        "Remove a recipient, re-encrypt all records, and rebuild the index",
-        object_schema(&[("public_key", string_schema())], &["public_key"]),
     ));
     tools.push(tool(
         "memory_list_types",
@@ -2731,7 +2511,7 @@ fn unresolved_json(unresolved: &Unresolved) -> Value {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{MCP_PROTOCOL_VERSION, MEMORY_INTERFACE_MAJOR, Session, serve_io};
+    use super::{MCP_PROTOCOL_VERSION, MEMORY_INTERFACE_MAJOR, RecordsIn, Session, serve_io};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
@@ -2750,13 +2530,19 @@ mod tests {
             })
         );
         let mut output = Vec::new();
-        serve_io(project.path().to_path_buf(), input.as_bytes(), &mut output).unwrap();
+        serve_io(
+            project.path().to_path_buf(),
+            RecordsIn::GitMetadata,
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
             response.pointer("/error/data/kind").and_then(Value::as_str),
             Some("incompatible_memory_interface")
         );
-        assert!(!project.path().join(".git/refs/memory/staged").exists());
+        assert!(!project.path().join(".git/refs/memory/main").exists());
     }
 
     /// The handshake publishes what the backend says about itself. Today that
@@ -2770,7 +2556,7 @@ mod tests {
     fn a_subscriber_is_told_which_records_changed() {
         let project = tempfile::tempdir().unwrap();
         git2_for_test::init(project.path());
-        let mut session = Session::new(project.path().to_path_buf());
+        let mut session = Session::new(project.path().to_path_buf(), RecordsIn::GitMetadata);
         session.initialized = true;
         session
             .subscribe(&json!({"uri": super::RECORDS_CHANGED}))
@@ -2824,25 +2610,7 @@ mod tests {
         );
     }
 
-    /// Declare the project's storages: records in refs, documents in `docs`.
-    fn declare_docs_storage(project: &std::path::Path) {
-        let config = json!({
-            "config_version": 1,
-            "storages": {
-                "main": {"kind": "refs", "holds": ["records", "content"]},
-                "docs": {"kind": "repo_folder", "path": "docs", "holds": ["content"]},
-            },
-        });
-        let path = project.join(".memory");
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(
-            path.join("config.json"),
-            serde_json::to_vec_pretty(&config).unwrap(),
-        )
-        .unwrap();
-    }
-
-    /// Declare a type whose documents live in the `docs` storage, and take the
+    /// Declare a type whose documents live in the `docs` folder, and take the
     /// first scan.
     fn attach_docs_folder(session: &mut Session, sink: &mut Vec<u8>) {
         let definition = json!({
@@ -2898,11 +2666,10 @@ mod tests {
     fn a_scan_that_writes_nothing_still_reports_what_it_found() {
         let project = tempfile::tempdir().unwrap();
         git2_for_test::init(project.path());
-        declare_docs_storage(project.path());
         std::fs::create_dir_all(project.path().join("docs")).unwrap();
         std::fs::write(project.path().join("docs/guide.md"), "the original body\n").unwrap();
 
-        let mut session = Session::new(project.path().to_path_buf());
+        let mut session = Session::new(project.path().to_path_buf(), RecordsIn::GitMetadata);
         session.initialized = true;
         let mut sink = Vec::new();
         attach_docs_folder(&mut session, &mut sink);
@@ -2970,7 +2737,7 @@ mod tests {
     fn a_revision_subscriber_alone_is_not_sent_the_new_notification() {
         let project = tempfile::tempdir().unwrap();
         git2_for_test::init(project.path());
-        let mut session = Session::new(project.path().to_path_buf());
+        let mut session = Session::new(project.path().to_path_buf(), RecordsIn::GitMetadata);
         session.initialized = true;
         session
             .subscribe(&json!({"uri": "memory://revision/current"}))
@@ -3030,7 +2797,13 @@ mod tests {
             })
         );
         let mut output = Vec::new();
-        serve_io(project.path().to_path_buf(), input.as_bytes(), &mut output).unwrap();
+        serve_io(
+            project.path().to_path_buf(),
+            RecordsIn::GitMetadata,
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         let handshake = response.pointer("/result/_meta/memoryHub").unwrap();
 
@@ -3050,7 +2823,7 @@ mod tests {
     fn subscribed_mutation_notifies_and_revision_remains_authoritative() {
         let project = tempfile::tempdir().unwrap();
         git2_for_test::init(project.path());
-        let mut session = Session::new(project.path().to_path_buf());
+        let mut session = Session::new(project.path().to_path_buf(), RecordsIn::GitMetadata);
         session.initialized = true;
         session.revision_subscribed = true;
         let base = session.store().unwrap().current_revision().unwrap();
@@ -3103,12 +2876,7 @@ mod tests {
     mod git2_for_test {
         use std::path::Path;
 
-        /// A repository with its memory declared: records in refs, and a
-        /// `docs` folder for types that want their content in the tree.
-        ///
-        /// Declaring it here rather than in each test is deliberate — a
-        /// project without a declaration is a state these tests are not about,
-        /// and it has its own test.
+        /// A repository these tests can keep records in.
         pub fn init(path: &Path) {
             let status = std::process::Command::new("git")
                 .args(["init", "--quiet"])
@@ -3116,7 +2884,6 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(status.success());
-            super::declare_docs_storage(path);
         }
     }
 }

@@ -9,16 +9,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use git2::{ErrorCode, Oid, Repository, Signature};
+use git2::{ErrorCode, Oid, Repository};
 use memory_hub_core::StoredRecord;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::GitStoreError;
 use crate::types::{GitRecordId, GitRevision};
 use crate::{
-    ApplyResult, ChangeKind, Checkpoint, ExportBundle, ExportMode, MAIN_REF, Operation,
-    RecordChange, RecordId, Revision, STAGED_REF, StoreError, StoreErrorKind, StoreView,
+    ApplyResult, ChangeKind, ExportBundle, ExportMode, MAIN_REF, Operation, RecordChange, RecordId,
+    Revision, StoreError, StoreErrorKind, StoreView,
     Transaction, TransactionPolicy,
 };
 
@@ -27,65 +26,23 @@ const MAX_CAS_ATTEMPTS: usize = 32;
 /// accept a bundle without going through [`GitStore::export`] validate against
 /// this value.
 pub const EXPORT_SCHEMA_VERSION: u32 = 2;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const CONTRACT_PAUSE_BEFORE_REF_UPDATE: &str = "MEMORY_HUB_CONTRACT_PAUSE_BEFORE_REF_UPDATE";
 
 mod chain;
 mod records;
 use chain::{
-    changes_since, create_commit, find_transaction, genesis_commit, memory_commit,
+    changes_since, find_transaction, genesis_commit, memory_commit,
     require_retained_revision, transaction_commit,
 };
 use records::{build_tree, decode_record, snapshot_tree, verify_record_location};
 
-/// A signer that produces an SSH (or other) signature for Git commit content.
-///
-/// When attached to a [`GitStore`] via [`GitStore::with_signer`], every
-/// commit on `refs/memory/*` carries a `gpgsig` header with the returned
-/// signature. This provides cryptographic integrity for collaborative
-/// scenarios where GitHub does not protect custom refs (see constraint
-/// `c-fe39e4`).
-pub trait CommitSigner: Debug + Send + Sync {
-    /// Sign the raw commit content buffer and return the signature string
-    /// (including any armor/header lines Git expects in `gpgsig`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if signing fails.
-    fn sign_commit(&self, commit_content: &[u8]) -> Result<String, StoreError>;
-}
-
-/// [`CommitSigner`] backed by `ssh-keygen -Y sign -n git`.
-impl CommitSigner for memory_hub_crypto::SshSigner {
-    fn sign_commit(&self, commit_content: &[u8]) -> Result<String, StoreError> {
-        self.sign(commit_content).map_err(|e| {
-            StoreError::new(
-                StoreErrorKind::Repository,
-                "SSH commit signing failed",
-                serde_json::json!({"detail": e.to_string()}),
-            )
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct GitStore {
     git_dir: PathBuf,
-    signer: Option<Arc<dyn CommitSigner>>,
     /// Application rules this store checks a transaction against, if it was
     /// given any. A store with none accepts any well-formed batch: what counts
     /// as a legal record is not a thing Git knows.
     policy: Option<Arc<dyn TransactionPolicy>>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct CheckpointMetadata {
-    schema_version: u32,
-    kind: String,
-    revision: Revision,
-    message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    code_revision: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +81,7 @@ impl GitStore {
     }
 
     /// Open an explicit absolute repository root or Git directory and initialize
-    /// the private staged ref when needed.
+    /// the project's private ref when needed.
     ///
     /// # Errors
     ///
@@ -140,35 +97,12 @@ impl GitStore {
             ));
         }
         let git_dir = Self::discover_git_dir(project)?;
-        // Signing is opt-in through Git config. Resolving it here means every
-        // entry point — CLI, MCP, reconciliation — signs consistently instead
-        // of depending on which adapter remembered to attach a signer.
-        let signer = crate::read_signing_config(&git_dir)?
-            .key_path
-            .map(|path| Arc::new(memory_hub_crypto::SshSigner::new(path)) as Arc<dyn CommitSigner>);
         let store = Self {
             git_dir,
-            signer,
             policy: None,
         };
-        store.ensure_staged()?;
+        store.ensure_ref()?;
         Ok(store)
-    }
-
-    pub(crate) const fn from_git_dir(git_dir: PathBuf) -> Self {
-        Self {
-            git_dir,
-            signer: None,
-            policy: None,
-        }
-    }
-
-    /// Attach a commit signer so every subsequent commit on `refs/memory/*`
-    /// carries an SSH (or other) signature.
-    #[must_use]
-    pub fn with_signer(mut self, signer: Arc<dyn CommitSigner>) -> Self {
-        self.signer = Some(signer);
-        self
     }
 
     /// Attach the rules this store checks every transaction against.
@@ -199,7 +133,7 @@ impl GitStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] if the revision is malformed, missing, or is not
-    /// part of the staged transaction history.
+    /// part of the transaction history.
     pub fn snapshot(&self, revision: &Revision) -> Result<StoreView<'_>, StoreError> {
         let repository = self.repository()?;
         require_retained_revision(&repository, revision.oid()?)?;
@@ -291,11 +225,10 @@ impl GitStore {
                 transaction,
                 &request_hash,
                 &changed_ids.iter().cloned().collect::<Vec<_>>(),
-                self.signer.as_deref(),
-            )?;
+                )?;
             pause_before_ref_update()?;
             match repository.reference_matching(
-                STAGED_REF,
+                MAIN_REF,
                 new_oid,
                 true,
                 current_oid,
@@ -308,152 +241,16 @@ impl GitStore {
                     });
                 }
                 Err(error) if is_cas_race(&error) => {}
-                Err(error) => return Err(StoreError::repository("update staged ref", error)),
+                Err(error) => return Err(StoreError::repository("update the memory ref", error)),
             }
         }
         Err(StoreError::new(
             StoreErrorKind::RetryExhausted,
-            "staged ref kept changing during transaction",
+            "the memory ref kept changing during the transaction",
             serde_json::json!({"attempts": MAX_CAS_ATTEMPTS}),
         ))
     }
 
-    /// Create a commit on `refs/memory/main` whose tree is the current staged
-    /// snapshot. HEAD and code refs are untouched.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if commit creation or main-ref CAS fails.
-    pub fn checkpoint(&self, message: &str) -> Result<Checkpoint, StoreError> {
-        self.checkpoint_inner(message, None)
-    }
-
-    /// Checkpoint the current staged snapshot against one processed code
-    /// commit. Repeating the newest code revision is idempotent, which lets a
-    /// reconciler recover after a cursor write is interrupted.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if the code revision is malformed, missing, or
-    /// checkpoint creation/ref CAS fails.
-    pub fn checkpoint_code(
-        &self,
-        code_revision: &str,
-        message: &str,
-    ) -> Result<Checkpoint, StoreError> {
-        let repository = self.repository()?;
-        let code_oid = Oid::from_str(code_revision).map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::InvalidArgument,
-                "code revision is not a Git object id",
-                serde_json::json!({"field": "code_revision"}),
-            )
-        })?;
-        repository
-            .find_commit(code_oid)
-            .map_err(|error| StoreError::repository("find code revision", error))?;
-        if let Some(existing) = self.history(1)?.into_iter().next()
-            && existing.code_revision.as_deref() == Some(code_revision)
-        {
-            return Ok(existing);
-        }
-        self.checkpoint_inner(message, Some(code_revision))
-    }
-
-    fn checkpoint_inner(
-        &self,
-        message: &str,
-        code_revision: Option<&str>,
-    ) -> Result<Checkpoint, StoreError> {
-        if message.trim().is_empty() {
-            return Err(StoreError::new(
-                StoreErrorKind::InvalidArgument,
-                "checkpoint message must not be empty",
-                serde_json::json!({"field": "message"}),
-            ));
-        }
-        let repository = self.repository()?;
-        let revision_oid = current_oid(&repository)?;
-        let revision = Revision::from_oid(revision_oid);
-        let staged = memory_commit(&repository, revision_oid)?;
-        let tree = staged
-            .tree()
-            .map_err(|error| StoreError::repository("find checkpoint tree", error))?;
-        let signature = Signature::now("Memory Hub", "memory-hub@localhost")
-            .map_err(|error| StoreError::repository("create checkpoint signature", error))?;
-        let parent_oid = reference_target(&repository, MAIN_REF)?;
-        let parent = parent_oid
-            .map(|oid| repository.find_commit(oid))
-            .transpose()
-            .map_err(|error| StoreError::repository("find checkpoint parent", error))?;
-        let parents = parent.iter().collect::<Vec<_>>();
-        let metadata = CheckpointMetadata {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
-            kind: "checkpoint".into(),
-            revision: revision.clone(),
-            message: message.to_owned(),
-            code_revision: code_revision.map(str::to_owned),
-        };
-        let commit_message = serde_json::to_string(&metadata)
-            .map_err(|error| serialization_error("serialize checkpoint", error))?;
-        let commit_oid = create_commit(
-            &repository,
-            &signature,
-            &signature,
-            &commit_message,
-            &tree,
-            &parents,
-            self.signer.as_deref(),
-        )?;
-        update_optional_ref(&repository, MAIN_REF, commit_oid, parent_oid)?;
-        Ok(Checkpoint {
-            commit: commit_oid.to_string(),
-            revision,
-            message: message.to_owned(),
-            timestamp: signature.when().seconds(),
-            code_revision: code_revision.map(str::to_owned),
-        })
-    }
-
-    /// Walk checkpoint history newest-first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if checkpoint objects are corrupt.
-    pub fn history(&self, limit: usize) -> Result<Vec<Checkpoint>, StoreError> {
-        let repository = self.repository()?;
-        let Some(mut oid) = reference_target(&repository, MAIN_REF)? else {
-            return Ok(Vec::new());
-        };
-        let mut result = Vec::new();
-        while result.len() < limit {
-            let commit = repository
-                .find_commit(oid)
-                .map_err(|error| StoreError::repository("read checkpoint commit", error))?;
-            let metadata: CheckpointMetadata = serde_json::from_slice(commit.message_bytes())
-                .map_err(|error| serialization_error("decode checkpoint", error))?;
-            if metadata.schema_version != CHECKPOINT_SCHEMA_VERSION || metadata.kind != "checkpoint"
-            {
-                return Err(StoreError::new(
-                    StoreErrorKind::Repository,
-                    "checkpoint commit has an unsupported shape",
-                    serde_json::json!({"commit": oid.to_string()}),
-                ));
-            }
-            result.push(Checkpoint {
-                commit: oid.to_string(),
-                revision: metadata.revision,
-                message: metadata.message,
-                timestamp: commit.time().seconds(),
-                code_revision: metadata.code_revision,
-            });
-            let Ok(parent) = commit.parent_id(0) else {
-                break;
-            };
-            oid = parent;
-        }
-        Ok(result)
-    }
 
     /// Compare record identities between two immutable snapshots.
     ///
@@ -584,7 +381,8 @@ impl GitStore {
         Ok(Some(record))
     }
 
-    /// Public read path for a single record by id. Used by [`EncryptedStore`].
+    /// Public read path for a single record by id, for a caller outside this
+    /// module that holds the store rather than a snapshot of it.
     ///
     /// # Errors
     ///
@@ -663,13 +461,7 @@ impl GitStore {
             let Some(stored) = self.read_record_unchecked(current, &id)? else {
                 continue;
             };
-            let StoredRecord::Plaintext { envelope } = stored else {
-                return Err(StoreError::new(
-                    StoreErrorKind::Unsupported,
-                    "a conditional write cannot read the content digest of an encrypted record",
-                    serde_json::json!({"key": id.display_value()}),
-                ));
-            };
+            let StoredRecord::Plaintext { envelope } = stored;
             if &envelope.content_hash != expected {
                 return Err(StoreError::new(
                     StoreErrorKind::Conflict,
@@ -686,7 +478,7 @@ impl GitStore {
     }
 
     /// Read a single record from a revision without requiring it to be in
-    /// the local staged history. Used by the transport merge module.
+    /// the local history. Used by the transport merge module.
     ///
     /// # Errors
     ///
@@ -713,7 +505,7 @@ impl GitStore {
     }
 
     /// Read all records from a revision without requiring it to be in the
-    /// local staged history. Used by the transport merge module to read
+    /// local history. Used by the transport merge module to read
     /// records from a fetched remote revision.
     ///
     /// # Errors
@@ -744,35 +536,14 @@ impl GitStore {
         Ok(records)
     }
 
-    /// Check whether the snapshot contains at least one encrypted record.
-    ///
-    /// Stops at the first encrypted record — cheaper than [`Self::read_records`]
-    /// when only an encrypted-mode signal is needed (e.g. doctor).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if the repository or a record blob is corrupt.
-    pub fn has_encrypted_records(&self, revision: &Revision) -> Result<bool, StoreError> {
-        let repository = self.repository()?;
-        let tree = snapshot_tree(&repository, revision)?;
-        for entry in &tree {
-            if entry.name().ok().is_some_and(|name| name.starts_with("r-")) {
-                let record = decode_record(&repository, entry.id())?;
-                if matches!(record, StoredRecord::Encrypted { .. }) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     fn repository(&self) -> Result<Repository, StoreError> {
         Repository::open(&self.git_dir).map_err(|error| StoreError::repository("open", error))
     }
 
-    fn ensure_staged(&self) -> Result<(), StoreError> {
+    /// Make sure the project's ref exists.
+    fn ensure_ref(&self) -> Result<(), StoreError> {
         let repository = self.repository()?;
-        if reference_target(&repository, STAGED_REF)?.is_some() {
+        if reference_target(&repository, MAIN_REF)?.is_some() {
             return Ok(());
         }
         let empty = repository
@@ -782,11 +553,11 @@ impl GitStore {
         let tree = repository
             .find_tree(empty)
             .map_err(|error| StoreError::repository("find empty tree", error))?;
-        let genesis = genesis_commit(&repository, &tree, None)?;
-        match repository.reference(STAGED_REF, genesis, false, "memory-hub: initialize") {
+        let genesis = genesis_commit(&repository, &tree)?;
+        match repository.reference(MAIN_REF, genesis, false, "memory-hub: initialize") {
             Ok(_) => Ok(()),
             Err(error) if error.code() == ErrorCode::Exists => Ok(()),
-            Err(error) => Err(StoreError::repository("initialize staged ref", error)),
+            Err(error) => Err(StoreError::repository("initialize the memory ref", error)),
         }
     }
 }
@@ -869,11 +640,11 @@ fn conflict_error(transaction: &Transaction, current: Oid, conflicts: Vec<Record
 }
 
 fn current_oid(repository: &Repository) -> Result<Oid, StoreError> {
-    reference_target(repository, STAGED_REF)?.ok_or_else(|| {
+    reference_target(repository, MAIN_REF)?.ok_or_else(|| {
         StoreError::new(
             StoreErrorKind::Repository,
-            "staged ref is missing",
-            serde_json::json!({"reference": STAGED_REF}),
+            "the memory ref is missing",
+            serde_json::json!({"reference": MAIN_REF}),
         )
     })
 }
@@ -890,22 +661,6 @@ fn reference_target(repository: &Repository, name: &str) -> Result<Option<Oid>, 
         Err(error) if error.code() == ErrorCode::NotFound => Ok(None),
         Err(error) => Err(StoreError::repository("read Memory ref", error)),
     }
-}
-
-fn update_optional_ref(
-    repository: &Repository,
-    name: &str,
-    target: Oid,
-    previous: Option<Oid>,
-) -> Result<(), StoreError> {
-    let result = if let Some(previous) = previous {
-        repository.reference_matching(name, target, true, previous, "memory-hub: checkpoint")
-    } else {
-        repository.reference(name, target, false, "memory-hub: first checkpoint")
-    };
-    result
-        .map(drop)
-        .map_err(|error| StoreError::repository("update checkpoint ref", error))
 }
 
 fn is_cas_race(error: &git2::Error) -> bool {

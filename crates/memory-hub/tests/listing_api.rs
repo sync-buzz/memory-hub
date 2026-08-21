@@ -42,18 +42,8 @@ fn init_repository() -> TempDir {
         "git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // A project declares where its memory lives before it has any. These tests
-    // are about records in Git, so they say so.
-    let output = Command::new(binary())
-        .args(["init", "--records", "refs", "--project"])
-        .arg(dir.path())
-        .output()
-        .expect("memory-hub init");
-    assert!(
-        output.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Nothing else to prepare: `mcp` keeps a repository's records in Git, and
+    // opening them is what creates them.
     dir
 }
 

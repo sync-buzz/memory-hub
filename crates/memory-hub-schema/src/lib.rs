@@ -18,7 +18,7 @@ pub use definition::{
 };
 pub use error::{ValidationError, ValidationErrorKind};
 pub use registry::{KindResolver, SchemaRegistry};
-pub use storage::{STORAGE_NAME_RULE, TypeStorage, is_storage_name};
+pub use storage::{STORAGE_FOLDER_RULE, TypeStorage};
 
 /// Reserved record kind for document type definitions.
 pub const TYPE_KIND: &str = "__type__";

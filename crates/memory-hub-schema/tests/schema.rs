@@ -629,16 +629,20 @@ fn a_type_that_names_no_storage_keeps_its_content() {
         "content sits in the record, which is what every type was before \
          storage became a choice"
     );
-    assert_eq!(storage.name(), None);
+    assert_eq!(storage.folder(), None);
 }
 
 #[test]
-fn a_type_names_the_storage_its_content_lives_in() {
+fn a_type_names_the_folder_its_documents_live_in() {
     let definition = type_with_storage("guide", &json!("docs"));
     let storage = definition.storage().unwrap();
 
-    assert_eq!(storage, TypeStorage::Named("docs".into()));
-    assert_eq!(storage.name(), Some("docs"));
+    assert_eq!(storage, TypeStorage::Folder("docs".into()));
+    assert_eq!(
+        storage.folder(),
+        Some("docs"),
+        "the path itself, so nothing has to be looked up to act on it"
+    );
     assert!(
         storage.is_external(),
         "the bytes are somewhere the record is not"
@@ -646,37 +650,41 @@ fn a_type_names_the_storage_its_content_lives_in() {
 }
 
 #[test]
-fn the_name_is_checked_for_shape_and_nothing_else() {
-    // Whether a storage called `docs` exists is a question about the project,
-    // and the schema has never seen the project. Shape is all it can answer.
-    for name in [
+fn the_folder_is_checked_for_shape_and_nothing_else() {
+    // Whether `docs` exists in the working tree is a question about the
+    // project, and the schema has never seen the project. Shape is all it can
+    // answer.
+    for folder in [
         "",
-        "Docs",
-        "9docs",
-        "-docs",
-        "docs/nested",
-        "docs.md",
-        "докс",
+        "/docs",
+        "docs/",
+        "../docs",
+        "docs/../secrets",
+        "docs//nested",
+        "./docs",
+        r"docs\nested",
+        ".git",
+        ".git/hooks",
     ] {
-        let definition = type_with_storage("guide", &json!(name));
+        let definition = type_with_storage("guide", &json!(folder));
         let Err(error) = definition.storage() else {
-            panic!("`{name}` is not a storage name");
+            panic!("`{folder}` is not a folder a type may keep documents in");
         };
         assert_eq!(error.field, "storage");
     }
 
-    for name in ["docs", "main", "media-2", "long_name"] {
+    for folder in ["docs", "docs/adr", "Documentation", "docs.d", "докс"] {
         assert!(
-            type_with_storage("guide", &json!(name)).storage().is_ok(),
-            "`{name}` is a storage name"
+            type_with_storage("guide", &json!(folder)).storage().is_ok(),
+            "`{folder}` is a folder a type may keep documents in"
         );
     }
 }
 
 #[test]
 fn the_type_registry_cannot_choose_where_it_lives() {
-    // Reading a storage name means reading the registry, and reading the
-    // registry means already knowing where it is.
+    // Reading where a type keeps its documents means reading the registry, and
+    // reading the registry means already knowing where it is.
     let definition = type_with_storage("__type__", &json!("docs"));
     let error = definition.storage().unwrap_err();
 
@@ -685,7 +693,7 @@ fn the_type_registry_cannot_choose_where_it_lives() {
 }
 
 #[test]
-fn a_storage_name_survives_the_round_trip() {
+fn a_storage_folder_survives_the_round_trip() {
     let definition = type_with_storage("guide", &json!("docs"));
     let text = serde_json::to_string(&definition).unwrap();
     let read_back = TypeDefinition::from_content(&text).unwrap();

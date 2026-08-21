@@ -175,14 +175,6 @@ fn call_tool(
         .cloned()
         .unwrap_or(Value::Null);
     let result = match name {
-        // The fake keeps its state in one file and has nowhere else to put it,
-        // so this only has to answer — but it has to answer, because the
-        // contract now includes being told where records go.
-        "memory_init" => Ok(json!({
-            "schemaVersion": 1,
-            "recordsStorage": "main",
-            "kind": "refs",
-        })),
         "memory_apply_transaction" => {
             let progress_token = request
                 .pointer("/params/_meta/progressToken")
@@ -190,8 +182,6 @@ fn call_tool(
             apply_transaction(state_path, &arguments, progress_token, output)
         }
         "memory_get_record" => get_record(state_path, &arguments),
-        "memory_checkpoint" => checkpoint(state_path, &arguments),
-        "memory_history" => history(state_path, &arguments),
         "memory_diff" => diff(state_path, &arguments),
         "memory_export" => export(state_path, &arguments),
         "memory_import" => import(state_path, &arguments),
@@ -255,8 +245,6 @@ fn list_tools() -> Value {
                     "required": ["key", "revision"]
                 }
             },
-            {"name": "memory_checkpoint", "description": "Checkpoint", "inputSchema": {"type": "object"}},
-            {"name": "memory_history", "description": "History", "inputSchema": {"type": "object"}},
             {"name": "memory_diff", "description": "Diff", "inputSchema": {"type": "object"}},
             {"name": "memory_export", "description": "Export", "inputSchema": {"type": "object"}},
             {"name": "memory_import", "description": "Import", "inputSchema": {"type": "object"}},
@@ -385,37 +373,6 @@ fn get_record(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure
     Ok(json!({"revision": revision, "record": snapshot.records.get(key)}))
 }
 
-fn checkpoint(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
-    let message = required_string(arguments, "message")?;
-    let (_lock, mut state) = load_locked_state(state_path)?;
-    let checkpoint = Checkpoint {
-        commit: format!("c{}", state.checkpoints.len() + 1),
-        revision: state.current.clone(),
-        message: message.to_owned(),
-        timestamp: i64::try_from(state.checkpoints.len()).unwrap_or(i64::MAX),
-    };
-    state.checkpoints.push(checkpoint.clone());
-    save_state(state_path, &state).map_err(state_failure)?;
-    Ok(json!(checkpoint))
-}
-
-fn history(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
-    let limit = arguments
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(100)
-        .min(1_000);
-    let limit = usize::try_from(limit).unwrap_or(1_000);
-    let state = load_state(state_path).map_err(state_failure)?;
-    let checkpoints = state
-        .checkpoints
-        .iter()
-        .rev()
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    Ok(json!({"checkpoints": checkpoints}))
-}
 
 fn diff(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
     let from_revision = required_string(arguments, "from_revision")?;
@@ -866,8 +823,6 @@ mod tests {
             [
                 "memory_apply_transaction",
                 "memory_get_record",
-                "memory_checkpoint",
-                "memory_history",
                 "memory_diff",
                 "memory_export",
                 "memory_import",

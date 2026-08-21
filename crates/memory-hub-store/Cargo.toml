@@ -13,16 +13,15 @@ publish = false
 base64.workspace = true
 dirs.workspace = true
 memory-hub-core = { path = "../memory-hub-core" }
-memory-hub-crypto = { path = "../memory-hub-crypto" }
 memory-hub-engine = { path = "../memory-hub-engine" }
 memory-hub-schema = { path = "../memory-hub-schema" }
+getrandom.workspace = true
 git2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-age.workspace = true
 tempfile.workspace = true
 
 [lints]

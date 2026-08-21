@@ -92,9 +92,9 @@ pub struct TypeDefinition {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
-    /// The storage this type's content lives in, by the name the project gave
-    /// it. Absent means it lives with the records, which is what every type was
-    /// before storage became a choice.
+    /// The directory of the working tree this type's documents live in,
+    /// relative to the project root. Absent means they live with the records,
+    /// which is what every type was before storage became a choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<String>,
     #[serde(default)]

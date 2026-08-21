@@ -21,72 +21,43 @@ use memory_hub_engine::{
 };
 use memory_hub_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition, TypeStorage, ValidationError};
 
-use crate::config::{ProjectConfig, StorageKind};
-
 /// The rules a record store applies before accepting a transaction.
 ///
 /// Built once and shared: it holds no state beyond the strictness flag, and the
 /// registry it validates against is read from the corpus on every check —
-/// because the corpus is what just changed.
-#[derive(Clone, Debug)]
+/// because the corpus is what just changed. Where a type keeps its documents is
+/// read from the same place, being part of the definition; nothing here has to
+/// be told about the project separately, and so nothing here can be told
+/// something the corpus disagrees with.
+#[derive(Clone, Copy, Debug)]
 pub struct SchemaPolicy {
     strict: bool,
-    /// What the project declared, when it has declared anything.
-    ///
-    /// Without it a rule can still say whether a record's content is inside or
-    /// outside; what it cannot say is *which* storage a locator belongs to,
-    /// because that is written in the declaration and nowhere else.
-    config: Option<ProjectConfig>,
 }
 
 impl SchemaPolicy {
     /// Strict: a record whose `kind` has no `__type__` definition is refused.
     #[must_use]
     pub const fn new(strict: bool) -> Self {
-        Self {
-            strict,
-            config: None,
-        }
+        Self { strict }
     }
+}
 
-    /// Attach the project's declaration, so a locator can be checked against
-    /// the storage it is supposed to be in.
-    #[must_use]
-    pub fn with_config(mut self, config: ProjectConfig) -> Self {
-        self.config = Some(config);
-        self
-    }
-
-    /// Whether a record already lives where its type's storage says it should.
-    ///
-    /// The storage as a whole, not merely whether it is external: two folders
-    /// are two storages, and a record pointing into the one a type no longer
-    /// names is exactly a record left behind — which is what the caller of
-    /// this is trying to find.
-    fn conforms(&self, envelope: &Envelope, storage: &TypeStorage) -> bool {
-        let Some(name) = storage.name() else {
-            // Content lives with the envelope, so a record pointing elsewhere
-            // does not live here.
-            return envelope.content_ref.is_none();
-        };
-        let Some(reference) = &envelope.content_ref else {
-            return false;
-        };
-        let Some(config) = &self.config else {
-            // Without the declaration, "it points somewhere" is the most that
-            // can honestly be said.
-            return true;
-        };
-        let Ok(declared) = config.storage(name) else {
-            return false;
-        };
-        match (declared.kind, &declared.path) {
-            (StorageKind::RepoFolder, Some(folder)) => {
-                reference.path.starts_with(&format!("{folder}/"))
-            }
-            _ => true,
-        }
-    }
+/// Whether a record already lives where its type's storage says it should.
+///
+/// The folder itself, not merely whether the content is outside: two folders
+/// are two places, and a record pointing into the one a type no longer names is
+/// exactly a record left behind — which is what the caller of this is trying to
+/// find.
+fn conforms(envelope: &Envelope, storage: &TypeStorage) -> bool {
+    let Some(folder) = storage.folder() else {
+        // Content lives with the envelope, so a record pointing elsewhere
+        // does not live here.
+        return envelope.content_ref.is_none();
+    };
+    envelope
+        .content_ref
+        .as_ref()
+        .is_some_and(|reference| reference.path.starts_with(&format!("{folder}/")))
 }
 
 impl Default for SchemaPolicy {
@@ -127,7 +98,7 @@ impl TransactionPolicy for SchemaPolicy {
         // that are no longer there.
         let registry = SchemaRegistry::from_type_definitions(filter_type_definitions(existing)?)
             .map_err(|error| schema_registry_error(&error))?;
-        validate_operations_against_schema(self, &registry, transaction, existing)?;
+        validate_operations_against_schema(*self, &registry, transaction, existing)?;
         require_one_record_per_folder(transaction, existing)
     }
 }
@@ -145,7 +116,7 @@ fn filter_type_definitions(
             StoredRecord::Plaintext { envelope } if envelope.kind == TYPE_KIND => {
                 Some(TypeDefinition::from_content(&envelope.content))
             }
-            _ => None,
+            StoredRecord::Plaintext { .. } => None,
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -192,7 +163,7 @@ fn schema_registry_error(error: &ValidationError) -> StoreError {
 /// registry means no types are defined, so validation is disabled. In strict
 /// mode, unknown kinds are rejected; in non-strict mode, they pass.
 fn validate_operations_against_schema(
-    policy: &SchemaPolicy,
+    policy: SchemaPolicy,
     registry: &SchemaRegistry,
     transaction: &Transaction,
     existing: &[(RecordId, StoredRecord)],
@@ -201,9 +172,7 @@ fn validate_operations_against_schema(
         let Operation::Put { record, .. } = operation else {
             continue;
         };
-        let StoredRecord::Plaintext { envelope } = record else {
-            continue;
-        };
+        let StoredRecord::Plaintext { envelope } = record;
         if envelope.kind == TYPE_KIND {
             let definition = TypeDefinition::from_content(&envelope.content).map_err(|error| {
                 StoreError::new(
@@ -223,7 +192,7 @@ fn validate_operations_against_schema(
                     }),
                 )
             })?;
-            require_no_silent_storage_move(policy, registry, &definition, existing, transaction)?;
+            require_no_silent_storage_move(registry, &definition, existing, transaction)?;
         } else if !registry.is_empty() {
             registry
                 .validate_record(envelope, policy.strict)
@@ -246,9 +215,6 @@ fn validate_operations_against_schema(
 /// The corpus and the transaction are read as one state, so a batch carrying
 /// both of them is refused on the same terms, and a batch that retires the old
 /// record while introducing the new one is not refused at all.
-///
-/// Encrypted records are not visible here and are checked before encryption,
-/// in [`crate::EncryptedStore`].
 fn require_one_record_per_folder(
     transaction: &Transaction,
     existing: &[(RecordId, StoredRecord)],
@@ -269,9 +235,8 @@ fn require_one_record_per_folder(
         if touched.contains(id) {
             continue;
         }
-        if let StoredRecord::Plaintext { envelope } = record
-            && envelope.is_folder
-        {
+        let StoredRecord::Plaintext { envelope } = record;
+        if envelope.is_folder {
             standing.insert(folder_path(envelope), envelope.key.as_str());
         }
     }
@@ -280,9 +245,7 @@ fn require_one_record_per_folder(
         let Operation::Put { record, .. } = operation else {
             continue;
         };
-        let StoredRecord::Plaintext { envelope } = record else {
-            continue;
-        };
+        let StoredRecord::Plaintext { envelope } = record;
         if !envelope.is_folder {
             continue;
         }
@@ -346,7 +309,7 @@ fn require_shape_of_its_storage(
             "field": "content_ref",
             "kind": envelope.kind,
             "key": envelope.key,
-            "storage": storage.name(),
+            "storage": storage.folder(),
             "recovery_action": "write_the_document_and_scan",
         }),
     ))
@@ -368,7 +331,6 @@ fn require_shape_of_its_storage(
 /// the migration itself, and is allowed: nothing is left behind by it. A kind
 /// with no records has nothing to leave behind either.
 fn require_no_silent_storage_move(
-    policy: &SchemaPolicy,
     registry: &SchemaRegistry,
     definition: &TypeDefinition,
     existing: &[(RecordId, StoredRecord)],
@@ -390,9 +352,8 @@ fn require_no_silent_storage_move(
             StoredRecord::Plaintext { envelope } => {
                 envelope.kind == definition.kind_name
                     && !rewritten.contains(id)
-                    && !policy.conforms(envelope, &after)
+                    && !conforms(envelope, &after)
             }
-            StoredRecord::Encrypted { .. } => false,
         })
         .count();
     if records == 0 {
@@ -406,8 +367,8 @@ fn require_no_silent_storage_move(
             "field": "storage",
             "kind": definition.kind_name,
             "records": records,
-            "from": before.name(),
-            "to": after.name(),
+            "from": before.folder(),
+            "to": after.folder(),
             "recovery_action": "migrate_storage",
         }),
     ))

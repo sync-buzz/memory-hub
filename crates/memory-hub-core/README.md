@@ -7,8 +7,6 @@ The module owns three things:
 
 - the versioned plaintext envelope, including all data needed for rebuild and
   code-history reconciliation;
-- a reserved opaque encrypted representation whose Git tree path cannot contain
-  a semantic record key;
 - policy resolution with explicit `default`, `project`, and `client` sources.
 
 Envelope major versions are compatibility boundaries. Newer minor versions are

@@ -115,15 +115,6 @@ pub struct ProjectionStatus {
     pub fingerprint: Option<String>,
 }
 
-/// What a crash-recovery wipe did.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SilentDestroy {
-    /// The projection's contents were removed (or there was nothing to remove).
-    Wiped,
-    /// Another live session holds the projection lock, so it was left alone.
-    HeldByLiveSession,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectedRecord {
     pub id: String,
@@ -961,7 +952,7 @@ impl Projection {
         Ok(hits)
     }
 
-    /// Bring the projection to the store's current revision — the staged one,
+    /// Bring the projection to the store's current revision,
     /// which is what every read serves. Interrupted or corrupt derived state is
     /// rebuilt automatically from Git.
     ///
@@ -1039,87 +1030,11 @@ impl Projection {
         self.rebuild_unlocked(snapshot).await
     }
 
-    /// Destroy the ephemeral projection — delete the `LanceDB` directory and
-    /// status file so no plaintext persists on disk.
+    /// Rebuild the projection from envelopes the caller already holds.
     ///
-    /// Used by encrypted projects on `lock()`: the index is rebuilt from
-    /// decrypted records on the next `unlock()`, so it must not survive on
-    /// disk while locked.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the filesystem delete fails.
-    pub async fn destroy(&self) -> Result<(), IndexError> {
-        let _lock = self.write_lock_async().await?;
-        let lance = self.root.join("lance");
-        if lance.exists() {
-            fs::remove_dir_all(&lance)?;
-        }
-        let status = self.status_path();
-        let _ = fs::remove_file(&status);
-        let tmp = self.root.join("status.json.tmp");
-        let _ = fs::remove_file(&tmp);
-        Ok(())
-    }
-
-    /// Synchronous wrapper: destroy the default per-repository projection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the runtime or destroy fails.
-    pub fn destroy_store(store: &dyn RecordStore) -> Result<(), IndexError> {
-        run_off_thread(|| async {
-            let projection = Self::open_store(store, None, None).await?;
-            projection.destroy().await
-        })
-    }
-
-    /// Crash-safe destroy: remove the projection's contents without opening
-    /// `LanceDB`. Used on encrypted-project start to wipe any plaintext left by
-    /// a process that was killed before `memory_lock` could run. Unlike
-    /// [`destroy_store`](Self::destroy_store), this never opens a catalog, so a
-    /// corrupt or half-written index from a crash is removed rather than
-    /// failing to open.
-    ///
-    /// It first tries to take the projection lock. A held lock means another
-    /// session is live and owns that index, so nothing is touched — wiping it
-    /// would leave that session searching a directory that no longer exists.
-    /// The lock file itself survives the wipe, so both processes keep
-    /// contending on the same inode.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the directory exists but its contents cannot be
-    /// removed.
-    pub fn destroy_store_silent(store: &dyn RecordStore) -> Result<SilentDestroy, IndexError> {
-        let root = store.index_root();
-        if !root.exists() {
-            return Ok(SilentDestroy::Wiped);
-        }
-        let Some(_lock) = try_lock_exclusive_at(&root)? else {
-            return Ok(SilentDestroy::HeldByLiveSession);
-        };
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            if entry.file_name() == LOCK_FILE {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-            } else {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        Ok(SilentDestroy::Wiped)
-    }
-
-    /// Rebuild the projection from pre-decrypted envelopes.
-    ///
-    /// Used by encrypted projects on `unlock()`: the canonical Git snapshot
-    /// contains encrypted blobs, so the standard `rebuild` (which reads
-    /// plaintext records from the snapshot) cannot be used. Instead, the
-    /// caller decrypts all records via `EncryptedStore::list()` and passes
-    /// the resulting `(key, envelope)` pairs here.
+    /// For a store whose records are read as envelopes rather than walked from
+    /// a snapshot — a folder of files is the one that does — the caller passes
+    /// the `(key, envelope)` pairs it read instead of having them read twice.
     ///
     /// # Errors
     ///
@@ -1408,24 +1323,7 @@ impl ProjectionRow {
     ) -> Result<Self, IndexError> {
         let record_json = serde_json::to_string(record)
             .map_err(|error| IndexError::new(format!("serialize projected record: {error}")))?;
-        let StoredRecord::Plaintext { envelope } = record else {
-            return Ok(Self {
-                id: id.display_value(),
-                kind: None,
-                title: None,
-                content: None,
-                content_kind: None,
-                archived: false,
-                freshness: None,
-                tags: None,
-                folder: None,
-                presence: None,
-                record_json,
-                render_text: String::new(),
-                vector: None,
-                content_hash: None,
-            });
-        };
+        let StoredRecord::Plaintext { envelope } = record;
         let mut row = Self::from_envelope(&id.display_value(), envelope, content)?;
         row.record_json = record_json;
         Ok(row)
@@ -1872,29 +1770,6 @@ fn lock_at(root: &Path, exclusive: bool) -> Result<File, IndexError> {
     Ok(file)
 }
 
-/// Take the exclusive projection lock only if it is free right now.
-///
-/// Returns `None` when another process holds it, which is the question a
-/// crash-recovery wipe actually needs answered: "is anyone using this index?"
-fn try_lock_exclusive_at(root: &Path) -> Result<Option<File>, IndexError> {
-    let file = open_lock_file(root)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
-        // Contention is not one error across platforms. Unix answers
-        // `EWOULDBLOCK`; Windows answers `ERROR_LOCK_VIOLATION`, which std
-        // does not classify — its `ErrorKind` is indistinguishable from a real
-        // I/O failure, and reading it as one turns "another session is using
-        // this index" into an error a starting session reports. `fs2` names
-        // the value each platform uses, so the raw codes are what to compare.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
 
 /// Render a value as a SQL string literal, or refuse it.
 ///
@@ -2107,11 +1982,9 @@ fn build_predicate(filters: &SearchFilters) -> Predicate {
 
 /// Compute backlinks from a canonical snapshot.
 ///
-/// Scans every plaintext record for:
+/// Scans every record for:
 /// - explicit `envelope.links` entries whose `key` matches `target_key`
 /// - body-mention: `target_key` appears as a word-boundary substring of `envelope.content`
-///
-/// Encrypted records are opaque and never produce backlinks.
 ///
 /// # Errors
 ///
@@ -2123,22 +1996,18 @@ pub fn compute_backlinks(
     let records = snapshot.records().map_err(store_error)?;
     let envelopes = records
         .iter()
-        .filter_map(|(id, record)| match record {
-            StoredRecord::Plaintext { envelope } => {
-                Some((id.display_value(), envelope.as_ref().clone()))
-            }
-            StoredRecord::Encrypted { .. } => None,
+        .map(|(id, StoredRecord::Plaintext { envelope })| {
+            (id.display_value(), envelope.as_ref().clone())
         })
         .collect::<Vec<_>>();
     Ok(compute_backlinks_from_envelopes(&envelopes, target_key))
 }
 
-/// Compute backlinks from already-decrypted envelopes.
+/// Compute backlinks from envelopes the caller already holds.
 ///
-/// Encrypted projects hold ciphertext in the canonical snapshot, so the
-/// snapshot-based [`compute_backlinks`] would always find nothing. The caller
-/// decrypts through `EncryptedStore::list` and passes `(key, envelope)` pairs
-/// here.
+/// For a caller that has already read the corpus — a rebuild, or a store whose
+/// records did not come from a snapshot this crate can open. [`compute_backlinks`]
+/// is the same computation reached from a snapshot instead.
 #[must_use]
 pub fn compute_backlinks_from_envelopes(
     records: &[(String, Envelope)],

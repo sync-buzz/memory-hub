@@ -12,7 +12,7 @@ use memory_hub_schema::{SchemaRegistry, TypeDefinition};
 use memory_hub_store::GitStore;
 use serde_json::{Value, json};
 
-/// A repository whose memory is declared: records in refs, documents in `docs`.
+/// A repository these tests keep their records in.
 fn init_git(path: &std::path::Path) {
     let status = std::process::Command::new("git")
         .args(["init", "--quiet"])
@@ -20,20 +20,6 @@ fn init_git(path: &std::path::Path) {
         .status()
         .unwrap();
     assert!(status.success());
-
-    let config = json!({
-        "config_version": 1,
-        "storages": {
-            "main": {"kind": "refs", "holds": ["records", "content"]},
-            "docs": {"kind": "repo_folder", "path": "docs", "holds": ["content"]},
-        },
-    });
-    std::fs::create_dir_all(path.join(".memory")).unwrap();
-    std::fs::write(
-        path.join(".memory/config.json"),
-        serde_json::to_vec_pretty(&config).unwrap(),
-    )
-    .unwrap();
 }
 
 const DECISION_TYPE: &str = r#"{
@@ -184,7 +170,10 @@ fn setup_project() -> (tempfile::TempDir, memory_hub_mcp::Session) {
     };
     store.apply(&tx).unwrap();
 
-    let session = memory_hub_mcp::Session::new(project.path().to_path_buf());
+    let session = memory_hub_mcp::Session::new(
+        project.path().to_path_buf(),
+        memory_hub_service::RecordsIn::GitMetadata,
+    );
     (project, session)
 }
 
@@ -209,7 +198,10 @@ fn initialize_includes_schema_instructions_when_types_exist() {
 fn initialize_without_types_has_only_builtin_instructions() {
     let project = tempfile::tempdir().unwrap();
     init_git(project.path());
-    let mut session = memory_hub_mcp::Session::new(project.path().to_path_buf());
+    let mut session = memory_hub_mcp::Session::new(
+        project.path().to_path_buf(),
+        memory_hub_service::RecordsIn::GitMetadata,
+    );
     let result = session.initialize(&json!({
         "protocolVersion": memory_hub_mcp::MCP_PROTOCOL_VERSION,
         "capabilities": {},
@@ -342,7 +334,10 @@ fn memory_schema_status_reports_incompatible_records() {
 fn memory_schema_status_inactive_when_no_types() {
     let project = tempfile::tempdir().unwrap();
     init_git(project.path());
-    let mut session = memory_hub_mcp::Session::new(project.path().to_path_buf());
+    let mut session = memory_hub_mcp::Session::new(
+        project.path().to_path_buf(),
+        memory_hub_service::RecordsIn::GitMetadata,
+    );
     session.initialized = true;
 
     let outcome = session.schema_status().unwrap();

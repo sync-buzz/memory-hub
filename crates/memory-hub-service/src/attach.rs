@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ServiceError;
 
-/// Where a storage's documents are, in the working tree.
+/// Where a type's documents are, in the working tree.
 ///
 /// A folder and nothing else — no file-name mask, deliberately: a person who
 /// put a diagram in their documentation folder should see the diagram in
@@ -26,14 +26,11 @@ use crate::ServiceError;
 /// and that is not a decision a corpus gets to make about somebody's project —
 /// what we cannot render is a question for the viewer, not for the scan.
 ///
-/// One storage holds one type, so nothing has to be told apart inside it.
+/// One folder holds one type, so nothing has to be told apart inside it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attachment {
     /// Directory, relative to the project root.
     pub folder: String,
-    /// What to call a document this attachment creates, with `*` where the
-    /// record's key goes. A default for writing, never a filter for reading.
-    pub new_files: String,
 }
 
 /// Names the operating system leaves behind. Nobody put them there and nobody
@@ -42,8 +39,8 @@ const LITTER: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 
 impl Attachment {
     #[must_use]
-    pub const fn new(folder: String, new_files: String) -> Self {
-        Self { folder, new_files }
+    pub const fn new(folder: String) -> Self {
+        Self { folder }
     }
 
     /// Whether `path` — project-relative — is one of this attachment's
@@ -176,6 +173,25 @@ pub trait DocumentSource {
     /// Returns [`ServiceError`] with kind `unsupported` when the source does
     /// not write, and `repository` when the write itself fails.
     fn write(&self, locator: &str, content: &[u8]) -> Result<(), ServiceError>;
+
+    /// Take a document out of the source.
+    ///
+    /// The other half of [`Self::write`], and the reason it exists: a record
+    /// whose body is a document owns that document, so deleting the record has
+    /// to take it. A source that kept the file would leave something the next
+    /// scan reads as a document belonging to no record — and gives back a
+    /// record for, with a new key and none of the links the old one had.
+    ///
+    /// A locator that is already not here is the state this was asked for, and
+    /// answers `Ok`. The three ways that happens are all ordinary: the file is
+    /// on another branch, somebody deleted it by hand, or this ran once before
+    /// and was interrupted after the file and before the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] with kind `unsupported` when the source does
+    /// not write, and `repository` when the removal itself fails.
+    fn remove(&self, locator: &str) -> Result<(), ServiceError>;
 
     /// The folders the source has, whether or not anything Memory knows about
     /// is in them. Repository-relative and ordered, the attachment's own root
@@ -352,6 +368,34 @@ impl DocumentSource for FolderSource<'_> {
                 serde_json::json!({"locator": locator}),
             )
         })
+    }
+
+    fn remove(&self, locator: &str) -> Result<(), ServiceError> {
+        if !self.attachment.covers(locator) {
+            return Err(ServiceError::new(
+                "invalid_argument",
+                "that locator is not inside this storage",
+                serde_json::json!({
+                    "locator": locator,
+                    "folder": self.attachment.folder,
+                }),
+            ));
+        }
+        let path = self.project.join(locator);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            // Already gone is what this was asked for.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ServiceError::new(
+                "repository",
+                format!("could not remove {}: {error}", path.display()),
+                serde_json::json!({"locator": locator}),
+            )),
+        }
+        // The directory it was in is left alone, empty or not. Git keeps no
+        // empty directories, so an empty one is a fact about this working tree
+        // and nothing anybody clones; removing it would also, for the last
+        // document in an attachment, delete the folder somebody attached.
     }
 
     fn list(&self) -> Result<Vec<SourceDocument>, ServiceError> {

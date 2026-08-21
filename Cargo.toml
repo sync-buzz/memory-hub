@@ -4,7 +4,6 @@ members = [
     "crates/memory-hub",
     "crates/memory-hub-contract",
     "crates/memory-hub-core",
-    "crates/memory-hub-crypto",
     "crates/memory-hub-engine",
     "crates/memory-hub-embed",
     "crates/memory-hub-folder",
@@ -41,7 +40,6 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1"
-age = { version = "0.11", features = ["ssh"] }
 clap = { version = "4.5.46", features = ["derive"] }
 dirs = "5"
 fs2 = "0.4.3"

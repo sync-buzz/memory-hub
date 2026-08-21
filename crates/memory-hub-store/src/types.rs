@@ -40,7 +40,6 @@ impl GitRecordId for RecordId {
     fn tree_name(&self) -> String {
         match self {
             Self::Plaintext(key) => format!("r-p-{:x}", Sha256::digest(key.as_bytes())),
-            Self::Opaque(id) => format!("r-o-{}", id.as_str()),
         }
     }
 }

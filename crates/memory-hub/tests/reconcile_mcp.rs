@@ -107,12 +107,6 @@ fn running_mcp_reconciles_before_the_first_memory_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     let repository = Repository::init(project.path())?;
-    // The project says where its memory lives before it has any.
-    let init = std::process::Command::new(env!("CARGO_BIN_EXE_memory-hub"))
-        .args(["init", "--records", "refs", "--project"])
-        .arg(project.path())
-        .output()?;
-    assert!(init.status.success(), "init: {init:?}");
     commit_file(&repository, project.path(), "one")?;
     let mut session = Session::start(project.path());
     session.request(
@@ -164,11 +158,22 @@ fn running_mcp_reconciles_before_the_first_memory_mutation()
     let applied_revision = applied["revision"]
         .as_str()
         .ok_or("apply revision missing")?;
-    let history = session.tool("memory_history", json!({"limit": 10}));
-    let newest = &history["checkpoints"][0];
-    assert_eq!(newest["code_revision"], code_revision);
-    assert_eq!(newest["revision"], base);
-    assert_ne!(newest["revision"], applied_revision);
+    // Reconciliation ran on the way in rather than after the write: its cursor
+    // names the code commit made before the session started, and the record
+    // written afterwards was not caught by it — a reconcile that ran late would
+    // have marked this record against a commit older than the record itself.
+    let cursor: Value = serde_json::from_slice(&fs::read(
+        project.path().join(".git/memory-hub/reconcile-cursor.json"),
+    )?)?;
+    assert_eq!(cursor["code_revision"], code_revision);
+    let written = session.tool(
+        "memory_get_record",
+        json!({"key": "new-memory", "revision": applied_revision}),
+    );
+    assert_eq!(
+        written["record"]["envelope"]["freshness"]["state"],
+        "unverified"
+    );
     let index_status: Value = serde_json::from_slice(&fs::read(
         project.path().join(".git/memory-hub/index/status.json"),
     )?)?;

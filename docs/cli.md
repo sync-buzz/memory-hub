@@ -5,22 +5,23 @@
 ```sh
 memory-hub --version
 memory-hub --help
-memory-hub init --records refs --project /path/to/project
-memory-hub init --records folder --project /path/to/project
-memory-hub declare-storage docs --kind repo-folder --path docs --project /path/to/project
 memory-hub doctor --project /path/to/repository
 memory-hub doctor --project /path/to/repository --output json
 memory-hub reconcile --project /path/to/repository --output json
 memory-hub reconcile --project /path/to/repository --full-rebuild
 memory-hub reconcile --project /path/to/repository --embed
+memory-hub reconcile --project /path/to/repository --records directory
 ```
 
-`init` is the first command a project needs; everything that reads or writes
-records answers `not_initialised` until it has run. `doctor` accepts an empty
+There is no `init`. The engine keeps records where its host says, and `--records`
+is how this command line says it — `git-metadata` or `directory`, defaulting to
+Git's metadata in a repository and a directory anywhere else. Opening that
+storage is what creates it, so the first read of a project that has never held
+memory is what gives it some. `doctor` accepts an empty
 Git repository; a commit is not required. JSON output
 is versioned with `schema_version` and reports failures using stable `kind`
 values. `doctor` is read-only: it reports how far Memory trails code history
-but never creates checkpoints, advances the cursor, or marks records stale —
+but never advances the cursor or marks records stale —
 run `memory-hub reconcile` for that. `reconcile --embed` rebuilds the index with embedding vectors when a
 model is downloaded; without `--embed` the index is FTS-only.
 

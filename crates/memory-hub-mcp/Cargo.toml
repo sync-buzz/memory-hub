@@ -12,7 +12,6 @@ publish = false
 [dependencies]
 base64.workspace = true
 memory-hub-core = { path = "../memory-hub-core" }
-memory-hub-crypto = { path = "../memory-hub-crypto" }
 memory-hub-embed = { path = "../memory-hub-embed" }
 memory-hub-engine = { path = "../memory-hub-engine" }
 memory-hub-index = { path = "../memory-hub-index" }

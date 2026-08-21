@@ -40,33 +40,12 @@ fn open_service(
 ) -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     Repository::init(project.path())?;
-    declare_storages(project.path())?;
-    let mut service = MemoryService::open(project.path().to_path_buf());
+    let mut service =
+        MemoryService::open(project.path().to_path_buf(), memory_hub_service::RecordsIn::GitMetadata);
     if provider.is_some() {
         service = service.with_provider(provider);
     }
     Ok((project, service))
-}
-
-/// The storages these tests' projects declare.
-///
-/// `main` holds the records; `docs` and `handbook` are folders of the working
-/// tree that types can name.
-fn declare_storages(project: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let config = serde_json::json!({
-        "config_version": 1,
-        "storages": {
-            "main": {"kind": "refs", "holds": ["records", "content"]},
-            "docs": {"kind": "repo_folder", "path": "docs", "holds": ["content"]},
-            "handbook": {"kind": "repo_folder", "path": "handbook", "holds": ["content"]},
-        },
-    });
-    std::fs::create_dir_all(project.join(".memory"))?;
-    std::fs::write(
-        project.join(".memory/config.json"),
-        serde_json::to_vec_pretty(&config)?,
-    )?;
-    Ok(())
 }
 
 fn put(key: &str, kind: &str, content: &str) -> Result<Operation, Box<dyn std::error::Error>> {
@@ -403,14 +382,14 @@ fn moving_an_attachment_to_another_folder_is_not_a_silent_edit() -> TestResult {
     Ok(())
 }
 
-// --- a pattern with no `*` collapses a migration onto one file ----------
+// --- a migration may not publish two records to one file ----------------
 
-/// `file_name_for` substitutes the key into the mask's `*`. A mask without one
-/// is legal — it has no separator and is not empty — and every record of the
-/// type is then written to the same path: the last one wins and the rest are
-/// lost, while every record points at the same locator.
+/// A published document is the record's key under the folder, and keys are
+/// unique, so two records cannot land on one path. Asserted rather than
+/// assumed: the last write would win and every record but one would be lost,
+/// while all of them went on pointing at the same locator.
 #[test]
-fn migration_into_a_starless_pattern_does_not_collapse_records() -> TestResult {
+fn migration_publishes_each_record_to_its_own_file() -> TestResult {
     let (project, service) = service()?;
     seed(
         &service,

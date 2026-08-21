@@ -15,5 +15,5 @@ pub use envelope::{
 };
 pub use error::{ContractError, ContractErrorKind};
 pub use policy::{EffectivePolicy, PolicyConfig, PolicyMode, PolicyResolver, PolicySource};
-pub use representation::{EncryptedRecord, OpaqueStorageId, StoredRecord};
+pub use representation::StoredRecord;
 pub use version::{CURRENT_ENVELOPE_VERSION, FormatVersion};

@@ -23,7 +23,7 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ("different_key_race", different_key_race),
     ("same_key_conflict", same_key_conflict),
     ("interrupted_write_recovery", interrupted_write_recovery),
-    ("history_diff_import_export", history_diff_import_export),
+    ("diff_import_export", diff_import_export),
     ("search_fts_and_filters", search_fts_and_filters),
     ("search_pagination", search_pagination),
     (
@@ -57,12 +57,7 @@ pub struct ScenarioReport {
 pub fn run_contract(target: &dyn ServerTarget) -> ContractReport {
     let mut reports = Vec::with_capacity(SCENARIOS.len());
     for (name, scenario) in SCENARIOS {
-        let outcome = prepare_project()
-            .and_then(|project| {
-                declare_storage(target, project.path())?;
-                Ok(project)
-            })
-            .and_then(|project| scenario(target, project.path()));
+        let outcome = prepare_project().and_then(|project| scenario(target, project.path()));
         reports.push(ScenarioReport {
             name,
             passed: outcome.is_ok(),
@@ -91,17 +86,6 @@ fn prepare_project() -> Result<tempfile::TempDir, String> {
         ));
     }
     Ok(project)
-}
-
-/// Declare where the project keeps its records, through the public interface.
-///
-/// Part of the contract rather than a fixture detail: an implementation that
-/// cannot be told where to put its records is not usable by anything that
-/// embeds it, and the scenarios below all assume a project that has been told.
-fn declare_storage(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
-    call_tool(target, project, "memory_init", json!({"records": "refs"}))
-        .map(|_| ())
-        .map_err(display)
 }
 
 fn current_revision(target: &dyn ServerTarget, project: &Path) -> Result<String, String> {
@@ -404,7 +388,7 @@ fn interrupted_write_recovery(target: &dyn ServerTarget, project: &Path) -> Resu
     assert_record_content(target, project, "discard", &base, "old value")
 }
 
-fn history_diff_import_export(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
+fn diff_import_export(target: &dyn ServerTarget, project: &Path) -> Result<(), String> {
     let base = current_revision(target, project)?;
     let first = apply(
         target,
@@ -418,13 +402,6 @@ fn history_diff_import_export(target: &dyn ServerTarget, project: &Path) -> Resu
     )
     .map_err(display)?;
     let first_revision = string_field(&first, "revision")?;
-    let first_checkpoint = call_tool(
-        target,
-        project,
-        "memory_checkpoint",
-        json!({"message": "first checkpoint"}),
-    )
-    .map_err(display)?;
 
     let second = apply(
         target,
@@ -439,51 +416,17 @@ fn history_diff_import_export(target: &dyn ServerTarget, project: &Path) -> Resu
     )
     .map_err(display)?;
     let second_revision = string_field(&second, "revision")?;
-    let second_checkpoint = call_tool(
-        target,
-        project,
-        "memory_checkpoint",
-        json!({"message": "second checkpoint"}),
-    )
-    .map_err(display)?;
 
-    assert_history_and_diff(
-        target,
-        project,
-        &first_revision,
-        &second_revision,
-        &first_checkpoint,
-        &second_checkpoint,
-    )?;
+    assert_diff(target, project, &first_revision, &second_revision)?;
     assert_export_import_round_trip(target, project, &second_revision)
 }
 
-fn assert_history_and_diff(
+fn assert_diff(
     target: &dyn ServerTarget,
     project: &Path,
     first_revision: &str,
     second_revision: &str,
-    first_checkpoint: &Value,
-    second_checkpoint: &Value,
 ) -> Result<(), String> {
-    let history =
-        call_tool(target, project, "memory_history", json!({"limit": 10})).map_err(display)?;
-    let checkpoints = history
-        .get("checkpoints")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("history response has no checkpoints: {history}"))?;
-    equal(checkpoints.len(), 2, "checkpoint history length differs")?;
-    equal(
-        checkpoints[0].get("commit"),
-        second_checkpoint.get("commit"),
-        "newest checkpoint differs",
-    )?;
-    equal(
-        checkpoints[1].get("commit"),
-        first_checkpoint.get("commit"),
-        "oldest checkpoint differs",
-    )?;
-
     let diff = call_tool(
         target,
         project,

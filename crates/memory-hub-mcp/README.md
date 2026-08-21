@@ -17,7 +17,6 @@ Memory Hub handshake in `capabilities.experimental.memoryHub` and
   "envelopeVersion": {"major": 1, "minor": 0},
   "indexVersion": {"major": 1, "minor": 0},
   "modelFingerprint": null,
-  "encryptionMode": "plaintext",
   "installationId": "installation-<sha256>",
   "projectId": "project-<sha256>",
   "projectPath": "/absolute/repository/path",
@@ -44,7 +43,6 @@ All resource bodies are UTF-8 JSON with `mimeType: application/json`.
 | `memory://index/status` | `{schemaVersion, available, state, indexedRevision, targetRevision, fingerprint}` |
 | `memory://model/status` | `{schemaVersion, available, model_id, dimensions, runtime_state, vector_search}` |
 | `memory://policy/effective` | `{schemaVersion: 1, policies: EffectivePolicy[]}` |
-| `memory://encryption/status` | `{mode, available, encryptedStoreAvailable, encryptedIndexAvailable, ephemeralIndex}` |
 
 `memory://records/summary` returns aggregate counts (total, by_kind, by_freshness,
 archived/live) over the full live corpus without pagination — for dashboard use.
@@ -57,7 +55,7 @@ the client must reread the resource and treat its revision as authoritative.
 ## Tools
 
 `tools/list` is the canonical JSON Schema catalogue. The implemented surface
-spans store, read, search, transport, model, and encryption operations:
+spans store, read, search, transport, and model operations:
 
 ### Store and history
 
@@ -65,8 +63,6 @@ spans store, read, search, transport, model, and encryption operations:
 | --- | --- | --- |
 | `memory_apply_transaction` | `transaction_id`, `expected_revision`, non-empty `operations[]` | `{revision, changed_keys}` |
 | `memory_rename_folder` | `from`, `to`, `transaction_id` | `{revision, changed_keys}` |
-| `memory_checkpoint` | `message` | `Checkpoint` |
-| `memory_history` | optional `limit` | `{checkpoints}` |
 | `memory_diff` | `from_revision`, `to_revision` | `{fromRevision, toRevision, changes}` |
 | `memory_export` | `revision` | `{revision, bundle}` |
 | `memory_import` | `transaction_id`, `expected_revision`, `bundle` | `{revision, changed_keys}` |
@@ -127,18 +123,11 @@ model is available). Each hit carries `fts_score`, `vector_score`, and
 | `memory_fetch` | none | fetch result and merged keys |
 | `memory_push` | optional `force` | push result |
 
-### Model and encryption
+### Model
 
 | Tool | Required input | Result |
 | --- | --- | --- |
 | `memory_model_status` | none | embedding model status |
-| `memory_encryption_status` | none | current plaintext/encryption availability |
-| `memory_unlock` | `identity_path` | `{unlocked, revision, indexRebuilt}` |
-| `memory_lock` | none | `{locked, indexDestroyed}` |
-| `memory_init_encrypted` | `identity_path`, `recipient_public_key` | `{backup_identity}` |
-| `memory_list_recipients` | none | `{recipients}` |
-| `memory_add_recipient` | `public_key` | re-encryption result |
-| `memory_remove_recipient` | `public_key` | re-encryption + index rebuild result |
 
 A transaction operation is either `{"op":"put","record":StoredRecord}` or
 `{"op":"delete","key":"..."}` (opaque callers may supply `id` instead of

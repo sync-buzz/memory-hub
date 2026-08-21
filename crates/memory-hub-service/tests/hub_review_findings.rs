@@ -19,27 +19,15 @@ use serde_json::json;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// A project whose `main` holds the records, with `docs` a folder of the
-/// working tree and `vault` a second record-shaped folder that holds only
-/// content — declared by hand, because it is a shape the tools refuse to
-/// create and a hand-edited file can still produce.
+/// A project keeping its records in Git, with `docs` a directory of the working
+/// tree a type can keep its documents in.
 fn service() -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     Repository::init(project.path())?;
-    let config = json!({
-        "config_version": 1,
-        "storages": {
-            "main": {"kind": "refs", "holds": ["records", "content"]},
-            "docs": {"kind": "repo_folder", "path": "docs", "holds": ["content"]},
-            "vault": {"kind": "folder", "path": "vault", "holds": ["content"]},
-        },
-    });
-    std::fs::create_dir_all(project.path().join(".memory"))?;
-    std::fs::write(
-        project.path().join(".memory/config.json"),
-        serde_json::to_vec_pretty(&config)?,
-    )?;
-    let service = MemoryService::open(project.path().to_path_buf());
+    let service = MemoryService::open(
+        project.path().to_path_buf(),
+        memory_hub_service::RecordsIn::GitMetadata,
+    );
     Ok((project, service))
 }
 
@@ -137,30 +125,6 @@ fn a_type_that_names_the_records_storage_can_still_be_written() -> TestResult {
     Ok(())
 }
 
-// --- a storage that cannot hold bodies says so ----------------------------
-
-/// `vault` holds content and is not a folder of the working tree, so there is
-/// nowhere in it to put a body. The migration is refused rather than reporting
-/// success and inlining every body into its record — the same effect as
-/// `storage: null`, which is the one thing the caller did not ask for.
-#[test]
-fn migrating_into_a_storage_that_cannot_hold_bodies_is_refused() -> TestResult {
-    let (_project, service) = service()?;
-    declare_type(&service, "note", None)?;
-    seed(&service, vec![put("note-1", "note", "a body")?])?;
-
-    let error = service
-        .plan_migration("note", Some("vault"))
-        .expect_err("a storage that cannot hold bodies is not a destination");
-    assert_eq!(error.kind, "unsupported");
-    assert_eq!(error.data["storage"], json!("vault"));
-
-    // And the record is untouched: the refusal came before anything was
-    // written, not after half of it was.
-    assert_eq!(envelope_of(&service, "note-1")?.content, "a body");
-    Ok(())
-}
-
 // --- the media type follows the file name ---------------------------------
 
 /// It is read off the file name, and a move is how a file name changes. Set
@@ -243,26 +207,3 @@ fn a_migration_keeps_the_media_type_true() -> TestResult {
     Ok(())
 }
 
-// --- the gate does not depend on how the project is stored ----------------
-
-/// Every read of records answers `not_initialised` without a declaration. The
-/// registry is records too, and read through a different door.
-#[test]
-fn a_project_without_a_declaration_refuses_reads_at_every_door() -> TestResult {
-    let project = tempfile::tempdir()?;
-    Repository::init(project.path())?;
-    let service = MemoryService::open(project.path().to_path_buf());
-
-    for kind in [
-        service.record_store().err().map(|error| error.kind),
-        service.schema_registry().err().map(|error| error.kind),
-        service.list_types().err().map(|error| error.kind),
-        service
-            .get_record("anything", None)
-            .err()
-            .map(|error| error.kind),
-    ] {
-        assert_eq!(kind.as_deref(), Some("not_initialised"));
-    }
-    Ok(())
-}

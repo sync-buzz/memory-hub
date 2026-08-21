@@ -643,12 +643,9 @@ fn type_record_uses_type_kind_and_key_prefix() {
         .get(&RecordId::plaintext(&type_key))
         .unwrap()
         .unwrap();
-    if let StoredRecord::Plaintext { envelope } = stored {
-        assert_eq!(envelope.kind, "__type__");
-        assert!(envelope.content.contains("decision"));
-    } else {
-        panic!("expected plaintext record");
-    }
+    let StoredRecord::Plaintext { envelope } = stored;
+    assert_eq!(envelope.kind, "__type__");
+    assert!(envelope.content.contains("decision"));
 }
 
 // ---------------------------------------------------------------------------

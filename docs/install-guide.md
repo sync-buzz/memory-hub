@@ -1,8 +1,8 @@
 # Memory Hub — Installation Guide
 
 Memory Hub is a project memory engine. It keeps a project's records in the
-storage that project declares — Git objects, a folder of plain files, or
-age-encrypted Git objects — and serves them through the Model Context Protocol
+storage that project declares — Git objects or a folder of plain files — and
+serves them through the Model Context Protocol
 (MCP).
 
 ## Build & install
@@ -85,8 +85,7 @@ Uninstalling one consumer (e.g. Sync) only unregisters it:
 memory-hub registry unregister-consumer sync
 ```
 
-This does **not** remove memory-hub, memory refs, encryption keys, or
-search indexes. Other consumers continue to work.
+This does **not** remove memory-hub, memory refs, or search indexes. Other consumers continue to work.
 
 ## Manual build
 

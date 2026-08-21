@@ -218,10 +218,9 @@ fn require_expected_content(
             continue;
         };
         let id = RecordId::from_record(record);
-        let actual = records.get(&id).and_then(|stored| match stored {
-            StoredRecord::Plaintext { envelope } => Some(envelope.content_hash.clone()),
-            StoredRecord::Encrypted { .. } => None,
-        });
+        let actual = records
+            .get(&id)
+            .map(|StoredRecord::Plaintext { envelope }| envelope.content_hash.clone());
         if actual.as_ref() != Some(expected) {
             return Err(StoreError::new(
                 StoreErrorKind::Conflict,

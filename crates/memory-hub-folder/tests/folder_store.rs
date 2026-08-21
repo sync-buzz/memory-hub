@@ -54,9 +54,7 @@ fn reading_back_returns_what_was_written() {
         .read_record(&revision, &RecordId::plaintext("notes/one"))
         .unwrap()
         .expect("the record is there");
-    let StoredRecord::Plaintext { envelope } = stored else {
-        panic!("expected plaintext");
-    };
+    let StoredRecord::Plaintext { envelope } = stored;
     assert_eq!(envelope.content, "first");
 }
 
@@ -183,7 +181,6 @@ fn it_offers_nothing_it_cannot_do() {
     for capability in [
         Capability::History,
         Capability::Transport,
-        Capability::Encryption,
         Capability::Snapshots,
     ] {
         assert!(

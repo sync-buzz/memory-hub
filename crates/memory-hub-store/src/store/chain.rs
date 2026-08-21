@@ -5,12 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{StoreError, StoreErrorKind, serialization_error};
 use crate::error::GitStoreError;
-use crate::{CommitSigner, RecordId, Transaction};
+use crate::{RecordId, Transaction};
 
 const SCHEMA_VERSION: u32 = 1;
 
-/// Create a Git commit — signed when a [`CommitSigner`] is provided,
-/// unsigned otherwise.
+/// Create a Git commit on `refs/memory/*`.
 pub(super) fn create_commit(
     repository: &Repository,
     author: &Signature<'_>,
@@ -18,29 +17,10 @@ pub(super) fn create_commit(
     message: &str,
     tree: &git2::Tree<'_>,
     parents: &[&Commit<'_>],
-    signer: Option<&dyn CommitSigner>,
 ) -> Result<Oid, StoreError> {
-    match signer {
-        Some(signer) => {
-            let buffer = repository
-                .commit_create_buffer(author, committer, message, tree, parents)
-                .map_err(|error| StoreError::repository("buffer commit content", error))?;
-            let content = std::str::from_utf8(buffer.as_ref()).map_err(|error| {
-                StoreError::new(
-                    StoreErrorKind::Repository,
-                    "commit buffer is not valid UTF-8",
-                    serde_json::json!({"detail": error.to_string()}),
-                )
-            })?;
-            let signature = signer.sign_commit(buffer.as_ref())?;
-            repository
-                .commit_signed(content, &signature, Some("gpgsig"))
-                .map_err(|error| StoreError::repository("write signed commit", error))
-        }
-        None => repository
-            .commit(None, author, committer, message, tree, parents)
-            .map_err(|error| StoreError::repository("write commit", error)),
-    }
+    repository
+        .commit(None, author, committer, message, tree, parents)
+        .map_err(|error| StoreError::repository("write commit", error))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,7 +45,6 @@ enum TransactionKind {
 pub(super) fn genesis_commit(
     repository: &Repository,
     tree: &git2::Tree<'_>,
-    signer: Option<&dyn CommitSigner>,
 ) -> Result<Oid, StoreError> {
     let metadata = TransactionMetadata {
         schema_version: SCHEMA_VERSION,
@@ -85,7 +64,6 @@ pub(super) fn genesis_commit(
         &message,
         tree,
         &[],
-        signer,
     )
 }
 
@@ -96,7 +74,6 @@ pub(super) fn transaction_commit(
     transaction: &Transaction,
     request_hash: &str,
     changed_keys: &[RecordId],
-    signer: Option<&dyn CommitSigner>,
 ) -> Result<Oid, StoreError> {
     let metadata = TransactionMetadata {
         schema_version: SCHEMA_VERSION,
@@ -119,7 +96,6 @@ pub(super) fn transaction_commit(
         &message,
         &tree,
         &[parent],
-        signer,
     )
 }
 

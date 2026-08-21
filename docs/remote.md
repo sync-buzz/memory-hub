@@ -13,10 +13,9 @@ memory-hub push --project /path/to/repo   # publish memory refs (use --force to 
 ```
 
 Merge is record-level: different keys merge automatically; the same key changed
-by both sides returns both versions as a conflict. Encrypted merge decrypts,
-merges, and re-encrypts in one step (requires `memory_unlock` first). Records
-deleted on the remote are kept locally — deletions do not replicate through
-merge; publish an explicit delete instead.
+by both sides returns both versions as a conflict. Records deleted on the
+remote are kept locally — deletions do not replicate through merge; publish an
+explicit delete instead.
 
 
 ## Memory does not arrive with a clone
@@ -45,52 +44,18 @@ normal state, not a failure.
 The `kind` field is stable for scripts and for consumers rendering the report:
 `memory_not_fetched` (it is on the remote), `no_memory_anywhere` (there is none
 yet), `remote_unreachable` (the question could not be asked).
+## Who can read what a remote holds
 
-One thing the fetch will insist on: verification is fail-closed, so
-`memory-hub fetch` refuses history it cannot verify until you configure an
-allowed signer or opt out explicitly — see
-[Signing and verification](#signing-and-verification).
-## Encryption is the storage's, not the type's
+Memory refs are ordinary Git objects, so whoever can read the repository they
+were pushed to can read the memory in it. That is the whole access model, and
+it is deliberate: a private repository for the memory is what keeps it private,
+not a key Memory Hub would have to distribute, rotate and lose.
 
-A type cannot ask to be encrypted, and a `storage` section that tries is
-refused by name. `refs` encrypts the whole store at once or not at all, and a
-folder of ordinary repository files cannot be encrypted and stay ordinary —
-which is the entire reason it is a folder of ordinary repository files.
-
-Nothing extra is needed for records whose content is outside. Their links,
-tags, title and freshness live in the envelope, and the envelope is in `refs`:
-encrypt `refs` and they are encrypted with it. The file holds the content and
-nothing else, which is what makes attaching one invisible in the first place.
-
-A locked project answers a search with `locked`, never with an empty result.
-The two look the same and mean opposite things — one says look elsewhere, the
-other says unlock and look again.
-
-Turning encryption on protects future writes only. The plaintext blobs already
-in Git history stay readable to anyone with the repository; `memory-hub doctor`
-says so on every plaintext project rather than leaving it to be discovered.
-
-## Signing and verification
-
-GitHub rulesets do not protect `refs/memory/*`, so any collaborator with push
-access can rewrite Memory refs. Signatures are the only real protection, and
-Memory Hub treats the two directions differently:
-
-- **Signing is opt-in.** Point `memory-hub.signing.key` at a private key, or
-  let Memory Hub reuse Git's own SSH signing key (`gpg.format = ssh` plus a
-  `user.signingkey` that names a file). Every Memory commit is then SSH-signed.
-- **Verification is fail-closed.** `memory-hub fetch` refuses to import history
-  it cannot verify. Configure the keys you trust, or opt out explicitly:
-
-```sh
-git config memory-hub.signing.key ~/.ssh/id_ed25519
-git config --add memory-hub.signing.allowedSigner "ssh-ed25519 AAAA... alice"
-git config memory-hub.signing.allowedSignersFile .memory-hub/allowed_signers
-git config memory-hub.signing.verify off     # accept unsigned memory refs
-```
-
-For encrypted projects the manifest's SSH recipients are trusted automatically,
-so a team that already shares keys needs no extra configuration.
+Nothing is published by accident. `refs/memory/*` are not part of a normal
+`git push`, so memory stays on the machine that wrote it until somebody
+configures a remote for it — and that remote does not have to be the code one.
+A public repository for the code and a private one for its memory is one
+`memory-hub remote add` apart.
 
 A configured refspec may only move `refs/memory/*`, and a remote URL that Git
 would read as an option (`--upload-pack=…`) or as a remote helper (`ext::…`) is

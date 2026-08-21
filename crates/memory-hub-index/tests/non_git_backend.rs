@@ -188,7 +188,6 @@ fn a_backend_without_a_git_directory_omits_the_field() {
     for capability in [
         Capability::History,
         Capability::Transport,
-        Capability::Encryption,
         Capability::Snapshots,
     ] {
         assert!(

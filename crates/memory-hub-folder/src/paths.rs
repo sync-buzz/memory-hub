@@ -8,18 +8,10 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use memory_hub_core::OpaqueStorageId;
 use memory_hub_engine::{RecordId, StoreError, StoreErrorKind};
 
 /// Extension every record file carries.
 pub(crate) const RECORD_EXTENSION: &str = "json";
-
-/// Sub-folder for records addressed by an opaque id rather than a key.
-///
-/// Kept apart from keyed records because the two name spaces are different:
-/// an opaque id is a random string with no meaning, and mixing it into the
-/// tree a person reads would put noise where their own names are.
-pub(crate) const OPAQUE_FOLDER: &str = "_opaque";
 
 /// The path of `id` relative to the records folder.
 pub(crate) fn record_path(id: &RecordId) -> Result<PathBuf, StoreError> {
@@ -27,11 +19,6 @@ pub(crate) fn record_path(id: &RecordId) -> Result<PathBuf, StoreError> {
         RecordId::Plaintext(key) => {
             check_key(key)?;
             Ok(PathBuf::from(format!("{key}.{RECORD_EXTENSION}")))
-        }
-        RecordId::Opaque(storage_id) => {
-            let value = storage_id.as_str();
-            check_component("storage id", value)?;
-            Ok(Path::new(OPAQUE_FOLDER).join(format!("{value}.{RECORD_EXTENSION}")))
         }
     }
 }
@@ -55,12 +42,6 @@ pub(crate) fn record_id(relative: &Path) -> Option<RecordId> {
     if parts.is_empty() {
         return None;
     }
-    if parts[0] == OPAQUE_FOLDER {
-        let [_, id] = parts.as_slice() else {
-            return None;
-        };
-        return OpaqueStorageId::new(id.clone()).ok().map(RecordId::opaque);
-    }
     Some(RecordId::plaintext(parts.join("/")))
 }
 
@@ -74,13 +55,6 @@ fn check_key(key: &str) -> Result<(), StoreError> {
     }
     for component in key.split('/') {
         check_component("key component", component)?;
-    }
-    if key.split('/').next() == Some(OPAQUE_FOLDER) {
-        return Err(invalid(
-            "key",
-            key,
-            "`_opaque` is where records with no key are kept",
-        ));
     }
     Ok(())
 }

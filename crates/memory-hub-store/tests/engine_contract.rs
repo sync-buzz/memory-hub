@@ -66,7 +66,6 @@ fn the_git_store_answers_the_whole_contract_through_a_dyn_reference()
         .expect("the record just written is readable");
     match stored {
         StoredRecord::Plaintext { envelope } => assert_eq!(envelope.content, "one"),
-        StoredRecord::Encrypted { .. } => panic!("a plaintext project stores plaintext"),
     }
 
     let view = StoreView::open(store, &applied.revision)?;
@@ -103,11 +102,11 @@ fn declared_capabilities_agree_with_the_optional_traits() -> Result<(), Box<dyn 
     );
 
     // And the optional sides work through the contract, not only inherently.
-    let history = store.history().expect("refs keeps history");
-    let checkpoint = history.checkpoint("through the contract")?;
-    assert_eq!(
-        history.history(10)?.first().map(|c| c.commit.clone()),
-        Some(checkpoint.commit)
+    let history = store.history().expect("refs keeps its past");
+    let revision = store.current_revision()?;
+    assert!(
+        history.diff(&revision, &revision)?.is_empty(),
+        "a revision compared with itself changed nothing"
     );
 
     let portable = store.portable().expect("refs exports");

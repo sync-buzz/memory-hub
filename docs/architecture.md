@@ -5,8 +5,8 @@ backends behind it. Every crate below has a README of its own.
 
 ## Envelope and policy contract
 
-`memory-hub-core` owns the versioned generic record envelope, the reserved
-opaque encrypted representation, and effective policy resolution. It has no
+`memory-hub-core` owns the versioned generic record envelope and effective
+policy resolution. It has no
 store, MCP, index, or client-product dependency. Compatible future fields and
 unknown client profile metadata survive JSON round trips; incompatible envelope
 major versions fail during decode. See
@@ -17,16 +17,15 @@ interface guarantees.
 
 `memory-hub-engine` owns the storage contract: what a store must do to hold
 records (read one, read them all, apply a transaction, report a revision) and
-what it may additionally offer — history, transport, snapshots, encryption —
-declared as capabilities a caller can ask about instead of discovering through
+what it may additionally offer — history, transport, snapshots — declared as
+capabilities a caller can ask about instead of discovering through
 a failure.
 
 `memory-hub-store` keeps immutable snapshots under private Git refs without
 touching HEAD, code branches, the index, or worktree. Atomic transactions use
 libgit2 ref compare-and-swap, rebase concurrent different-record writes, and
-return structured same-record conflicts. It also owns checkpoints, history,
-diff, and deterministic import/export, and — through `EncryptedStore` — the
-age-encrypted variant of all of it. See
+return structured same-record conflicts. It also owns diff and deterministic
+import/export. See
 [`crates/memory-hub-store/README.md`](../crates/memory-hub-store/README.md).
 
 `memory-hub-folder` keeps one JSON file per record under a directory. A key is
@@ -48,8 +47,9 @@ moment it owns: state read, nothing written yet. No backend knows what a
 
 `memory-hub-reconcile` stores a worktree-local cursor and catches up every code
 commit on MCP initialization, CLI use, and before Memory mutations. Path diffs
-update generic record freshness and each processed commit receives a
-code-linked Memory checkpoint. Rebase/reset divergence is reported and requires
+update generic record freshness, and the cursor moves commit by commit so an
+interrupted catch-up resumes where it stopped. Rebase/reset divergence is
+reported and requires
 an explicit full rebuild; hooks are never required for correctness. See
 [`crates/memory-hub-reconcile/README.md`](../crates/memory-hub-reconcile/README.md).
 
@@ -57,8 +57,8 @@ an explicit full rebuild; hooks are never required for correctness. See
 
 `memory-hub-index` maintains a disposable LanceDB read model under the Git
 directory. MCP startup, successful Memory mutations, explicit reconciliation,
-and `memory_reindex` synchronize it to the store's current revision — the
-staged one, which is what every read serves.
+and `memory_reindex` synchronize it to the store's current revision, which is
+what every read serves.
 Interrupted or corrupt projections rebuild exclusively from an immutable Git
 snapshot; readers refuse lagging generations.
 

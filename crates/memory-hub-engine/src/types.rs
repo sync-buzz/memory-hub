@@ -1,6 +1,6 @@
 use std::fmt;
 
-use memory_hub_core::{ContentHash, OpaqueStorageId, StoredRecord};
+use memory_hub_core::{ContentHash, StoredRecord};
 use serde::{Deserialize, Serialize};
 
 /// An opaque marker for "the state the store was in".
@@ -32,13 +32,15 @@ impl fmt::Display for Revision {
     }
 }
 
-/// Logical identity used for conflict detection. Plaintext ids remain useful
-/// to callers; opaque ids never reveal the encrypted record key.
+/// Logical identity used for conflict detection.
+///
+/// An enum with one variant, and deliberately so: the addressing tag is part
+/// of what a store writes down, and a record already written says
+/// `"addressing": "plaintext"`.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "addressing", content = "value", rename_all = "snake_case")]
 pub enum RecordId {
     Plaintext(String),
-    Opaque(OpaqueStorageId),
 }
 
 impl RecordId {
@@ -48,15 +50,9 @@ impl RecordId {
     }
 
     #[must_use]
-    pub const fn opaque(id: OpaqueStorageId) -> Self {
-        Self::Opaque(id)
-    }
-
-    #[must_use]
     pub fn from_record(record: &StoredRecord) -> Self {
         match record {
             StoredRecord::Plaintext { envelope } => Self::Plaintext(envelope.key.clone()),
-            StoredRecord::Encrypted { encrypted } => Self::Opaque(encrypted.storage_id.clone()),
         }
     }
 
@@ -64,7 +60,6 @@ impl RecordId {
     pub fn display_value(&self) -> String {
         match self {
             Self::Plaintext(key) => key.clone(),
-            Self::Opaque(id) => format!("opaque:{}", id.as_str()),
         }
     }
 }
@@ -152,16 +147,6 @@ pub enum ChangeKind {
 pub struct RecordChange {
     pub id: RecordId,
     pub kind: ChangeKind,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Checkpoint {
-    pub commit: String,
-    pub revision: Revision,
-    pub message: String,
-    pub timestamp: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_revision: Option<String>,
 }
 
 /// What an export does with a record whose content lives outside it.

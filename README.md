@@ -16,7 +16,7 @@ storage answered.
 
 ```
     agent (MCP)  ─┐
-                  ├─►  Memory Hub  ─►  Git objects · plain files · encrypted objects
+                  ├─►  Memory Hub  ─►  Git objects · plain files
   your app (Rust) ─┘                    + a local search index
 ```
 
@@ -47,7 +47,7 @@ typed errors, no process to supervise and no JSON to parse. See
 ./build.sh && ./install.sh                 # or take a binary from a release
 cd /path/to/your/project
 
-memory-hub init --records refs             # decide where records live
+memory-hub init --records git-metadata     # decide where records live
 memory-hub model download bge-m3           # optional: search by meaning
 memory-hub mcp --project "$PWD"            # what an MCP client runs
 ```
@@ -59,10 +59,9 @@ including the model and what to do without one.
 
 | Storage | What it is | Good for |
 | --- | --- | --- |
-| `refs` | Git objects under `refs/memory/*`, outside your branches and your working tree | memory that travels with the repository and never shows up in a diff |
-| `folder` | one JSON file per record in a directory | a project that is not a Git repository, or one that wants its memory as plain files |
-| encrypted `refs` | the same Git objects, age-encrypted to a list of recipients | a shared repository where memory must not be readable by everyone who can clone it |
-| a repository folder | the *content* of records is your own files — `docs/*.md` and the rest | documentation the team already writes and reviews, with the records tracking it |
+| `git_metadata` | Git objects under `refs/memory/*`, outside your branches and your working tree | memory that travels with the repository and never shows up in a diff |
+| `directory` holding records | one JSON file per record in a directory | a project that is not a Git repository, or one that wants its memory as plain files |
+| `directory` holding content | the *content* of records is your own files — `docs/*.md` and the rest | documentation the team already writes and reviews, with the records tracking it |
 
 A project declares its storages once, in a file it commits, and a type points at
 one by name. Nothing above that layer knows which is which:
@@ -94,8 +93,7 @@ one by name. Nothing above that layer knows which is which:
 | [The MCP interface](docs/mcp.md) | how a client connects, and how it hears about changes |
 | [Embedding in Rust](docs/embedding.md) | using Memory Hub as a library |
 | [The command line](docs/cli.md) | every command, model management, exit codes, platforms |
-| [Encryption](docs/encryption.md) | age recipients, the access model, the ephemeral index |
-| [Sharing memory](docs/remote.md) | memory remotes, fetch and push, signing and verification |
+| [Sharing memory](docs/remote.md) | memory remotes, fetch and push, who can read what |
 | [Architecture](docs/architecture.md) | the crates, the storage contract, the index, the contract harness |
 | [Compatibility](docs/compatibility-matrix.md) | interface versions and what a client must negotiate |
 

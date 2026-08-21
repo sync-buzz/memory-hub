@@ -64,23 +64,16 @@ fn catches_up_every_commit_and_stales_matching_paths() -> Result<(), Box<dyn std
     assert_eq!(report.processed.len(), 2);
     assert_eq!(report.processed[0].stale_keys, ["design"]);
     assert!(report.processed[1].stale_keys.is_empty());
-    assert_eq!(
-        report.processed[0].checkpoint.revision,
-        report.processed[1].checkpoint.revision
-    );
     let record = store
         .current()?
         .get(&RecordId::plaintext("design"))?
         .ok_or("record missing")?;
-    let StoredRecord::Plaintext { envelope } = record else {
-        return Err("expected plaintext record".into());
-    };
+    let StoredRecord::Plaintext { envelope } = record;
     assert_eq!(envelope.freshness.state, FreshnessState::Stale);
     assert_eq!(
         envelope.freshness.reason.as_deref(),
         Some("code_paths_changed")
     );
-    assert_eq!(store.history(10)?.len(), 3);
     assert!(
         reconciler
             .reconcile(DivergenceMode::Report)?

@@ -26,7 +26,7 @@ fn deterministic_fake_passes_every_shared_scenario() {
             "different_key_race",
             "same_key_conflict",
             "interrupted_write_recovery",
-            "history_diff_import_export",
+            "diff_import_export",
             "search_fts_and_filters",
             "search_pagination",
             "backlinks_explicit_and_mentions"

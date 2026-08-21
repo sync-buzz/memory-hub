@@ -1,27 +1,38 @@
 # Storages
 
-A project says once where its records go, and the declaration is committed
-alongside the code, so everyone who clones the project reads the same answer:
+Where a project's **records** go is the host's answer, given when it opens the
+project — the engine does not decide for the product that embeds it whether
+memory travels inside Git or sits beside it, and there is nothing on disk that
+could disagree with the host that gave the answer.
 
 ```sh
-memory-hub init --records refs             # Git objects under refs/memory/*
-memory-hub init --records folder           # one JSON file per record
-memory-hub declare-storage docs --kind repo-folder --path docs
+memory-hub mcp --records git-metadata     # Git objects under refs/memory/*
+memory-hub mcp --records directory        # one JSON file per record
 ```
 
-There is no default. The engine does not decide for the product that embeds it
-whether memory should travel inside Git or sit beside it.
+Unsaid, this command line answers from the project: Git's metadata in a
+repository, a directory anywhere else. Another host answers however it likes —
+Sync always says `git_metadata`, because a project there is a repository.
+
+Where a **type's documents** go is written in the type, as the directory
+itself:
 
 ```jsonc
-// .memory/config.json
-{"config_version": 1,
- "storages": {
-   "main": {"kind": "refs", "holds": ["records", "content"]},
-   "docs": {"kind": "repo_folder", "path": "docs", "holds": ["content"]}}}
+// the content of a `__type__` record
+{"kind_name": "doc", "storage": "docs"}
 ```
 
-Exactly one storage holds records. Others hold content, and a type points at
-one by name.
+Absent means the bodies sit in the records, which is what every type was before
+storage became a choice. A path means a directory of the working tree: the
+files are the team's, Git versions them, a pull request shows them in its diff,
+and Memory writes nothing into them.
+
+One folder per type. There is no file-name mask, so *every* file in the folder
+is a document of the type that names it, and two types over one folder would
+both claim every new file in it. `memory_delete_type` removes the type it is
+asked about and the records that mirror the folder; the files are left exactly
+where they are — see [Deleting one](documents.md#deleting-one) for why removing
+a type and deleting its records are different operations.
 
 ## Moving a type to another storage
 
@@ -35,9 +46,9 @@ records behind, and moving them is an operation of its own:
   "arguments": { "kind": "doc", "dry_run": true, "storage": "docs" } }
 ```
 
-`"storage": null` brings the content back into the records. An absent field is
-not the same thing and is refused: `null` says "here", absent says the caller
-forgot to say.
+`storage` is the directory to move into. `"storage": null` brings the content
+back into the records; an absent field is not the same thing and is refused:
+`null` says "here", absent says the caller forgot to say.
 
 `dry_run` returns the plan — which records move, in which direction, and what
 has to be accepted — and writes nothing. Every warning code the plan lists must
@@ -54,5 +65,5 @@ not consent, and the two directions are not asking the same thing:
 
 Content is written before the records that point at it, and the records move
 before the definition that describes them. Interrupted anywhere, running it
-again resumes: records that already live where the new storage says are not
+again resumes: records that already live where the new folder says are not
 records left behind.

@@ -12,8 +12,8 @@ memory-hub mcp --project /absolute/path/to/repository
 
 The server speaks MCP `2025-11-25` over stdio and Memory interface major `1`. Initialization publishes the
 Memory interface, store, envelope, and index versions together with capability
-availability, installation/project identifiers, encryption mode, and the
-resolved Git directory. Clients may require a Memory interface major through
+availability, installation/project identifiers, and the resolved Git
+directory. Clients may require a Memory interface major through
 `_meta.memoryHub.memoryInterfaceVersion`; an incompatible major is rejected
 before Memory Hub creates or moves a ref.
 

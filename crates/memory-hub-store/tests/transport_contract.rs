@@ -10,8 +10,8 @@ use std::process::Command;
 use git2::Repository;
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_store::{
-    GitStore, MemoryRemote, Operation, RecordId, StoreErrorKind, Transaction, fetch_and_merge,
-    push_to_remote, read_remote_config, write_remote_config,
+    GitStore, MemoryPresence, MemoryRemote, Operation, RecordId, StoreErrorKind, Transaction,
+    fetch_and_merge, memory_presence, push_to_remote, read_remote_config, write_remote_config,
 };
 
 fn repo_with_store() -> (tempfile::TempDir, GitStore) {
@@ -68,7 +68,6 @@ fn read_record(store: &GitStore, key: &str) -> Option<String> {
     let id = RecordId::plaintext(key);
     snapshot.get(&id).unwrap().map(|record| match record {
         StoredRecord::Plaintext { envelope } => envelope.content.clone(),
-        StoredRecord::Encrypted { .. } => String::new(),
     })
 }
 
@@ -88,69 +87,6 @@ fn remote_config_round_trip() {
     let read = read_remote_config(&git_dir).unwrap().unwrap();
     assert_eq!(read.url, "/path/to/remote");
     assert!(read.refspec.is_none());
-}
-
-#[test]
-fn fetch_without_allowed_signers_is_refused() {
-    // A repository that never configured signing: `refs/memory/*` has no
-    // server-side protection, so a fetch that cannot verify anything must
-    // fail instead of importing whatever the remote sent.
-    let (_local_dir, local_store) = repo_with_store();
-    let remote_dir = bare_remote();
-    let local_git_dir = local_store.git_dir().to_path_buf();
-    let remote = MemoryRemote {
-        url: remote_dir.path().to_string_lossy().to_string(),
-        refspec: None,
-    };
-    write_remote_config(&local_git_dir, &remote).unwrap();
-    put(&local_store, "decision/auth", "Use OAuth2");
-    push_to_remote(&local_git_dir, &remote, false).unwrap();
-
-    let second_dir = tempfile::tempdir().unwrap();
-    Repository::init(second_dir.path()).unwrap();
-    let second_store = GitStore::open(second_dir.path()).unwrap();
-    write_remote_config(second_store.git_dir(), &remote).unwrap();
-
-    let error = fetch_and_merge(&second_store, &remote, &[]).unwrap_err();
-    assert_eq!(error.kind, StoreErrorKind::SigningNotConfigured);
-    assert_eq!(
-        error.data["recovery_action"],
-        "configure_allowed_signers_or_disable_verification"
-    );
-}
-
-#[test]
-fn fetch_verifies_against_a_configured_allowed_signer() {
-    // With an allowed signer configured but the pushed commits unsigned, the
-    // fetch must reject rather than fall back to accepting them.
-    let (_local_dir, local_store) = repo_with_store();
-    let remote_dir = bare_remote();
-    let local_git_dir = local_store.git_dir().to_path_buf();
-    let remote = MemoryRemote {
-        url: remote_dir.path().to_string_lossy().to_string(),
-        refspec: None,
-    };
-    write_remote_config(&local_git_dir, &remote).unwrap();
-    put(&local_store, "decision/auth", "Use OAuth2");
-    push_to_remote(&local_git_dir, &remote, false).unwrap();
-
-    let second_dir = tempfile::tempdir().unwrap();
-    Repository::init(second_dir.path()).unwrap();
-    {
-        let repository = Repository::open(second_dir.path()).unwrap();
-        let mut config = repository.config().unwrap();
-        config
-            .set_str(
-                "memory-hub.signing.allowedSigner",
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterial test@example.com",
-            )
-            .unwrap();
-    }
-    let second_store = GitStore::open(second_dir.path()).unwrap();
-    write_remote_config(second_store.git_dir(), &remote).unwrap();
-
-    let error = fetch_and_merge(&second_store, &remote, &[]).unwrap_err();
-    assert_eq!(error.kind, StoreErrorKind::SignatureInvalid);
 }
 
 #[test]
@@ -199,7 +135,6 @@ fn push_and_fetch_fast_forward() {
     let result = fetch_and_merge(
         &second_store,
         &read_remote_config(&second_git_dir).unwrap().unwrap(),
-        &[],
     )
     .unwrap();
 
@@ -256,7 +191,6 @@ fn fetch_merges_different_keys() {
     fetch_and_merge(
         &bob_store,
         &read_remote_config(&bob_git).unwrap().unwrap(),
-        &[],
     )
     .unwrap();
     assert_eq!(
@@ -279,7 +213,6 @@ fn fetch_merges_different_keys() {
     let result = fetch_and_merge(
         &bob_store,
         &read_remote_config(&bob_git).unwrap().unwrap(),
-        &[],
     )
     .unwrap();
 
@@ -338,7 +271,6 @@ fn fetch_same_key_conflict_returns_both_versions() {
     fetch_and_merge(
         &bob_store,
         &read_remote_config(&bob_git).unwrap().unwrap(),
-        &[],
     )
     .unwrap();
 
@@ -357,7 +289,6 @@ fn fetch_same_key_conflict_returns_both_versions() {
     let result = fetch_and_merge(
         &bob_store,
         &read_remote_config(&bob_git).unwrap().unwrap(),
-        &[],
     )
     .unwrap();
 
@@ -396,7 +327,6 @@ fn fetch_up_to_date_is_noop() {
     let result = fetch_and_merge(
         &alice_store,
         &read_remote_config(&alice_git).unwrap().unwrap(),
-        &[],
     )
     .unwrap();
 
@@ -469,7 +399,7 @@ fn push_does_not_touch_code_branches() {
 
     assert_eq!(head_before, head_after);
 
-    // Remote should have refs/memory/staged but NOT the code branch.
+    // Remote should have refs/memory/main but NOT the code branch.
     let remote_refs = Command::new("git")
         .arg("-C")
         .arg(remote_dir.path())
@@ -477,7 +407,7 @@ fn push_does_not_touch_code_branches() {
         .output()
         .unwrap();
     let remote_refs = String::from_utf8_lossy(&remote_refs.stdout);
-    assert!(remote_refs.contains("refs/memory/staged"));
+    assert!(remote_refs.contains("refs/memory/main"));
     // No code branches (refs/heads/*) should exist on the remote.
     assert!(!remote_refs.contains("refs/heads/"));
 }
@@ -507,11 +437,155 @@ fn fetch_from_uninitialized_remote_fails() {
     )
     .unwrap();
 
-    let result = fetch_and_merge(&store, &read_remote_config(&git_dir).unwrap().unwrap(), &[]);
+    let result = fetch_and_merge(&store, &read_remote_config(&git_dir).unwrap().unwrap());
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         err.kind == StoreErrorKind::TransportFailed
             || err.kind == StoreErrorKind::NamespaceRejected
+    );
+}
+
+// --- presence: is the memory here, elsewhere, or nowhere -------------------
+//
+// The three answers look identical from inside a fresh clone, and only one of
+// them is something a person can act on. Each of these is one of the states
+// `memory_presence` exists to tell apart.
+
+/// A repository that has never been touched, with no remote to ask.
+#[test]
+fn presence_of_an_untouched_repository_is_absent_with_nothing_to_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+
+    let presence = memory_presence(dir.path()).unwrap();
+
+    assert!(
+        matches!(presence, MemoryPresence::Absent { url: None }),
+        "no memory and no address to ask is an empty project, not a failure: {presence:?}"
+    );
+}
+
+/// Asking must not be mistaken for having. `GitStore::open` creates
+/// `refs/memory/staged`, so a repository somebody merely *looked* at has a
+/// memory ref and no memory — which is why the count is of records.
+#[test]
+fn presence_counts_records_rather_than_refs() {
+    let (dir, _store) = repo_with_store();
+
+    let presence = memory_presence(dir.path()).unwrap();
+
+    assert!(
+        matches!(presence, MemoryPresence::Absent { .. }),
+        "opening a store writes a ref and no records, and must not read as memory: {presence:?}"
+    );
+}
+
+#[test]
+fn presence_of_a_repository_with_records_is_present() {
+    let (dir, store) = repo_with_store();
+    put(&store, "note-1", "one");
+    put(&store, "note-2", "two");
+
+    let presence = memory_presence(dir.path()).unwrap();
+
+    match presence {
+        MemoryPresence::Present { records } => assert_eq!(records, 2),
+        other => panic!("expected the memory to be found here: {other:?}"),
+    }
+}
+
+/// The case the whole check exists for: a clone whose memory is still on the
+/// remote. It is reported against the *code* origin, because that is the only
+/// address a fresh clone knows before anybody configures a memory remote.
+#[test]
+fn presence_of_a_fresh_clone_names_the_code_origin_it_can_be_fetched_from() {
+    let (source, store) = repo_with_store();
+    put(&store, "note-1", "one");
+    let remote_dir = bare_remote();
+    let url = remote_dir.path().to_string_lossy().into_owned();
+    push_to_remote(
+        store.git_dir(),
+        &MemoryRemote {
+            url: url.clone(),
+            refspec: None,
+        },
+        false,
+    )
+    .unwrap();
+    drop(source);
+
+    // A clone, made the ordinary way: branches and tags, no refs/memory/*.
+    let clone_dir = tempfile::tempdir().unwrap();
+    let clone_path = clone_dir.path().join("clone");
+    Command::new("git")
+        .args(["clone"])
+        .arg(&url)
+        .arg(&clone_path)
+        .output()
+        .unwrap();
+
+    let presence = memory_presence(&clone_path).unwrap();
+
+    match presence {
+        MemoryPresence::NotFetched { url: found, configured } => {
+            assert!(!configured, "a fresh clone has no memory remote configured yet");
+            assert!(
+                found.contains(remote_dir.path().to_string_lossy().as_ref()),
+                "the answer has to name the address to fetch from, got {found}"
+            );
+        }
+        other => panic!("a clone of a repository with memory is not empty: {other:?}"),
+    }
+}
+
+/// A remote that carries no memory either. Not a failure, and not the same
+/// answer as the one above — this is a project nobody has started a memory
+/// for, which is where every project begins.
+#[test]
+fn presence_of_a_clone_whose_remote_has_no_memory_is_absent() {
+    let remote_dir = bare_remote();
+    let url = remote_dir.path().to_string_lossy().into_owned();
+    let dir = tempfile::tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    write_remote_config(
+        &GitStore::discover_git_dir(dir.path()).unwrap(),
+        &MemoryRemote {
+            url: url.clone(),
+            refspec: None,
+        },
+    )
+    .unwrap();
+
+    let presence = memory_presence(dir.path()).unwrap();
+
+    match presence {
+        MemoryPresence::Absent { url: Some(found) } => assert_eq!(found, url),
+        other => panic!("an empty remote means an empty project, not a defect: {other:?}"),
+    }
+}
+
+/// "Nobody could say" is not "there is none". A caller that collapsed the two
+/// would describe a project afresh on a flaky network and diverge from memory
+/// that exists.
+#[test]
+fn presence_of_an_unreachable_remote_is_its_own_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let missing = dir.path().join("no-such-remote");
+    write_remote_config(
+        &GitStore::discover_git_dir(dir.path()).unwrap(),
+        &MemoryRemote {
+            url: missing.to_string_lossy().into_owned(),
+            refspec: None,
+        },
+    )
+    .unwrap();
+
+    let presence = memory_presence(dir.path()).unwrap();
+
+    assert!(
+        matches!(presence, MemoryPresence::Unreachable { .. }),
+        "a remote that cannot be asked must not answer for the remote: {presence:?}"
     );
 }

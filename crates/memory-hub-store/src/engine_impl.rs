@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use memory_hub_core::StoredRecord;
 use memory_hub_engine::{
-    ApplyResult, Capabilities, Capability, Checkpoint, HistoryStore, Ownership, PortableStore,
+    ApplyResult, Capabilities, Capability, HistoryStore, Ownership, PortableStore,
     RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreError, Transaction,
 };
 
@@ -17,14 +17,12 @@ use crate::GitStore;
 pub const REFS_BACKEND: &str = "refs";
 
 impl RecordStore for GitStore {
-    /// Encryption is deliberately absent.
+    /// What this store can be asked for, and nothing beyond it.
     ///
-    /// This store writes what it is given. When a project is encrypted the
-    /// records reaching it are already ciphertext, and the store that did the
-    /// encrypting — [`EncryptedStore`](crate::EncryptedStore) — is the one
-    /// that declares the capability. Claiming it here would tell a caller that
-    /// asking this store for plaintext is safe when it is exactly what a
-    /// plaintext project does.
+    /// Declared rather than assumed, because a caller reads this to decide
+    /// whether to offer an operation at all — a capability claimed here that
+    /// the store cannot honour is a failure discovered at the call instead of
+    /// at the question.
     fn capabilities(&self) -> Capabilities {
         Capabilities::new(
             Ownership::Owned,
@@ -86,22 +84,6 @@ impl RecordStore for GitStore {
 }
 
 impl HistoryStore for GitStore {
-    fn checkpoint(&self, message: &str) -> Result<Checkpoint, StoreError> {
-        GitStore::checkpoint(self, message)
-    }
-
-    fn checkpoint_code(
-        &self,
-        code_revision: &str,
-        message: &str,
-    ) -> Result<Checkpoint, StoreError> {
-        GitStore::checkpoint_code(self, code_revision, message)
-    }
-
-    fn history(&self, limit: usize) -> Result<Vec<Checkpoint>, StoreError> {
-        GitStore::history(self, limit)
-    }
-
     fn diff(&self, from: &Revision, to: &Revision) -> Result<Vec<RecordChange>, StoreError> {
         GitStore::diff(self, from, to)
     }

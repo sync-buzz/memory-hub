@@ -1,8 +1,8 @@
 //! Generate agent instructions from project document type definitions.
 //!
-//! The built-in conductor (`builtin_instructions`) describes the storage tools,
-//! revision model, and encryption lifecycle. `schema_instructions` composes
-//! project-specific text from `__type__` records on top of the built-in base.
+//! The built-in conductor (`builtin_instructions`) describes the storage tools
+//! and the revision model. `schema_instructions` composes project-specific text
+//! from `__type__` records on top of the built-in base.
 
 use memory_hub_schema::{SchemaRegistry, TypeDefinition};
 

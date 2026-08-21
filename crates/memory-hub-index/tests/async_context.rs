@@ -43,6 +43,5 @@ async fn synchronize_and_search_work_inside_a_runtime() -> Result<(), Box<dyn st
     let result = Projection::search_store(&store, &request)?;
     assert_eq!(result.hits.len(), 1, "the seeded record is searchable");
 
-    Projection::destroy_store(&store)?;
     Ok(())
 }

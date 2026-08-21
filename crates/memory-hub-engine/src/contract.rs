@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use memory_hub_core::StoredRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyResult, Checkpoint, RecordChange, RecordId, Revision, StoreError, Transaction};
+use crate::{ApplyResult, RecordChange, RecordId, Revision, StoreError, Transaction};
 
 /// Who writes to the storage.
 ///
@@ -26,12 +26,10 @@ pub enum Ownership {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Checkpoints, history, and diff between two past states.
+    /// A past state can be compared with another: what a diff reads.
     History,
     /// Exchange with a remote.
     Transport,
-    /// Content encryption at rest.
-    Encryption,
     /// A past revision can be reopened as an immutable view. A folder someone
     /// else edits cannot offer this: the past state is not kept anywhere, so
     /// there is nothing to reopen.
@@ -237,27 +235,9 @@ impl<'a> StoreView<'a> {
     }
 }
 
-/// A store that keeps its past.
+/// A store that keeps its past, and so can say what changed between two of
+/// its states.
 pub trait HistoryStore {
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if the checkpoint cannot be written.
-    fn checkpoint(&self, message: &str) -> Result<Checkpoint, StoreError>;
-
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if the code revision is malformed or the
-    /// checkpoint cannot be written.
-    fn checkpoint_code(&self, code_revision: &str, message: &str)
-    -> Result<Checkpoint, StoreError>;
-
-    /// Newest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if checkpoint objects are corrupt.
-    fn history(&self, limit: usize) -> Result<Vec<Checkpoint>, StoreError>;
-
     /// # Errors
     ///
     /// Returns [`StoreError`] if either revision is invalid.
