@@ -10,8 +10,9 @@ use std::process::Command;
 use git2::Repository;
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_store::{
-    GitStore, MemoryPresence, MemoryRemote, Operation, RecordId, StoreErrorKind, Transaction,
-    fetch_and_merge, memory_presence, push_to_remote, read_remote_config, write_remote_config,
+    GitStore, MemoryPresence, MemoryRemote, Operation, RecordId, RemoteCheck, StoreErrorKind,
+    Transaction, fetch_and_merge, memory_presence, push_to_remote, read_remote_config,
+    sync_state, write_remote_config,
 };
 
 fn repo_with_store() -> (tempfile::TempDir, GitStore) {
@@ -467,8 +468,9 @@ fn presence_of_an_untouched_repository_is_absent_with_nothing_to_ask() {
 }
 
 /// Asking must not be mistaken for having. `GitStore::open` creates
-/// `refs/memory/staged`, so a repository somebody merely *looked* at has a
-/// memory ref and no memory — which is why the count is of records.
+/// `refs/memory/main` with an empty genesis, so a repository somebody merely
+/// *looked* at has a memory ref and no memory — which is why the count is of
+/// records.
 #[test]
 fn presence_counts_records_rather_than_refs() {
     let (dir, _store) = repo_with_store();
@@ -588,4 +590,137 @@ fn presence_of_an_unreachable_remote_is_its_own_answer() {
         matches!(presence, MemoryPresence::Unreachable { .. }),
         "a remote that cannot be asked must not answer for the remote: {presence:?}"
     );
+}
+
+// --- sync state: what is unpublished, and is anything waiting --------------
+
+fn remote_at(dir: &tempfile::TempDir) -> MemoryRemote {
+    MemoryRemote {
+        url: dir.path().to_string_lossy().into_owned(),
+        refspec: None,
+    }
+}
+
+/// With no remote there is nothing to be out of step with, and a count would
+/// be inventing a comparison nobody asked for.
+#[test]
+fn sync_state_without_a_remote_counts_nothing() {
+    let (_dir, store) = repo_with_store();
+    put(&store, "note-1", "one");
+
+    let state = sync_state(&store, true).unwrap();
+
+    assert!(!state.remote_configured);
+    assert_eq!(state.unpublished, 0);
+    assert_eq!(state.remote, RemoteCheck::NotAsked);
+}
+
+/// Nothing exchanged yet: everything here is unpublished, and it is counted as
+/// records rather than as the commits that wrote them.
+#[test]
+fn everything_is_unpublished_before_the_first_exchange() {
+    let (dir, store) = repo_with_store();
+    let remote_dir = bare_remote();
+    write_remote_config(store.git_dir(), &remote_at(&remote_dir)).unwrap();
+    put(&store, "note-1", "one");
+    put(&store, "note-2", "two");
+    put(&store, "note-1", "one, edited");
+
+    let state = sync_state(&store, false).unwrap();
+
+    assert!(state.remote_configured);
+    assert_eq!(
+        state.unpublished, 2,
+        "two records, whatever number of commits it took to write them"
+    );
+    assert_eq!(state.remote, RemoteCheck::NotAsked);
+    let _ = dir;
+}
+
+#[test]
+fn a_push_leaves_nothing_unpublished_and_a_later_edit_is_counted() {
+    let (_dir, store) = repo_with_store();
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+    write_remote_config(store.git_dir(), &remote).unwrap();
+    put(&store, "note-1", "one");
+    put(&store, "note-2", "two");
+
+    push_to_remote(store.git_dir(), &remote, false).unwrap();
+    let published = sync_state(&store, false).unwrap();
+    assert_eq!(published.unpublished, 0, "it was just published");
+
+    put(&store, "note-2", "two, edited");
+    put(&store, "note-3", "three");
+    let after = sync_state(&store, false).unwrap();
+
+    assert_eq!(
+        after.unpublished, 2,
+        "one record changed and one added since the push"
+    );
+}
+
+/// Asking the remote is opt-in, and not asking says so rather than passing for
+/// "nothing is waiting".
+#[test]
+fn the_network_is_only_touched_when_it_is_asked_for() {
+    let (_dir, store) = repo_with_store();
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+    write_remote_config(store.git_dir(), &remote).unwrap();
+    put(&store, "note-1", "one");
+    push_to_remote(store.git_dir(), &remote, false).unwrap();
+
+    assert_eq!(sync_state(&store, false).unwrap().remote, RemoteCheck::NotAsked);
+    assert_eq!(sync_state(&store, true).unwrap().remote, RemoteCheck::UpToDate);
+}
+
+/// The case the indicator exists for: somebody else published, and this
+/// repository has not fetched it.
+#[test]
+fn a_remote_that_moved_on_is_waiting() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put(&theirs, "note-1", "one");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+    assert_eq!(
+        sync_state(&ours, true).unwrap().remote,
+        RemoteCheck::UpToDate,
+        "we have just fetched everything there is"
+    );
+
+    put(&theirs, "note-2", "two");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let state = sync_state(&ours, true).unwrap();
+    assert_eq!(state.remote, RemoteCheck::Waiting);
+    assert_eq!(state.unpublished, 0, "we wrote nothing of our own");
+}
+
+/// A remote nobody can reach is its own answer. Reporting `UpToDate` would tell
+/// somebody their memory is safely published when nothing was asked at all.
+#[test]
+fn an_unreachable_remote_does_not_pass_for_being_in_step() {
+    let (dir, store) = repo_with_store();
+    put(&store, "note-1", "one");
+    write_remote_config(
+        store.git_dir(),
+        &MemoryRemote {
+            url: dir.path().join("no-such-remote").to_string_lossy().into_owned(),
+            refspec: None,
+        },
+    )
+    .unwrap();
+
+    let state = sync_state(&store, true).unwrap();
+
+    assert_eq!(state.remote, RemoteCheck::Unreachable);
+    assert_eq!(state.unpublished, 1, "the count beside it is still true");
 }

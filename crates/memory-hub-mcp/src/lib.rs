@@ -634,6 +634,7 @@ impl Session {
             "memory_backlinks" => self.backlinks(arguments),
             "memory_transport_status" => self.transport_status(),
             "memory_presence" => self.presence(),
+            "memory_sync_state" => self.sync_state(arguments),
             "memory_remote_set" => self.remote_set(arguments),
             "memory_remote_remove" => self.remote_remove(),
             "memory_fetch" => self.fetch(arguments),
@@ -1277,6 +1278,23 @@ impl Session {
             "refspec": remote.as_ref().and_then(|remote| remote.refspec.clone()),
             "codeOriginUrl": code_origin,
         })))
+    }
+
+    fn sync_state(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        // Absent means "do not touch the network". A status question that
+        // reached for a remote by default would make opening a project wait on
+        // one, and the count that matters most does not need it.
+        let ask_remote = arguments
+            .get("ask_remote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let state = self
+            .service
+            .sync_state(ask_remote)
+            .map_err(ToolFailure::service)?;
+        Ok(ToolOutcome::read(
+            serde_json::to_value(state).unwrap_or(Value::Null),
+        ))
     }
 
     fn presence(&self) -> Result<ToolOutcome, ToolCallFailure> {
@@ -1987,6 +2005,16 @@ pub fn list_tools() -> Value {
         "memory_transport_status",
         "Check if a memory remote is configured and report sync status.",
         object_schema(&[], &[]),
+    ));
+    tools.push(tool(
+        "memory_sync_state",
+        "Say what is here and not on the memory remote, and whether anything is waiting there. \
+         Counts records rather than commits. Pass `ask_remote` to let it reach the network; \
+         without it the answer is computed locally and says the remote was not asked.",
+        object_schema(
+            &[("ask_remote", json!({"type": "boolean", "default": false}))],
+            &[],
+        ),
     ));
     tools.push(tool(
         "memory_presence",

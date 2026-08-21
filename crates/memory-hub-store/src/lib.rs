@@ -19,11 +19,12 @@ pub use memory_hub_engine::{
 };
 pub use store::{EXPORT_SCHEMA_VERSION, GitStore, bundle};
 pub use transport::{
-    ConflictEntry, FetchResult, MemoryPresence, MemoryRemote, PushPolicyResult, RemoteMemory,
-    can_fast_forward, check_push_policy, cleanup_temp_ref_pub, fast_forward_to, fetch_and_merge,
-    fetch_remote_revision, memory_presence, probe_remote_memory, push_to_remote,
-    read_code_origin_url, read_remote_config, remove_remote_config, validate_refspec,
-    validate_remote_url, write_remote_config,
+    ConflictEntry, FetchResult, MemoryPresence, MemoryRemote, PushPolicyResult, RemoteCheck,
+    RemoteMemory, SyncState, can_fast_forward, check_push_policy, cleanup_temp_ref_pub,
+    fast_forward_to, fetch_and_merge, fetch_remote_revision, memory_presence,
+    probe_remote_memory, push_to_remote, read_code_origin_url, read_known_remote_revision,
+    read_remote_config, record_known_remote_revision, remote_memory_tip, remove_remote_config,
+    sync_state, validate_refspec, validate_remote_url, write_remote_config,
 };
 
 /// The one ref a project's memory lives on: the tip of the transaction commit

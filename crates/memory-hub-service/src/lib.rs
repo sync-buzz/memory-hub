@@ -1857,6 +1857,21 @@ impl MemoryService {
         memory_hub_store::read_code_origin_url(&git_dir).map_err(ServiceError::store)
     }
 
+    /// Whether this repository's memory is in step with its remote.
+    ///
+    /// `ask_remote` decides whether the network is touched at all. The count of
+    /// unpublished records never needs it, so a window opening offline still
+    /// has something true to say.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the store cannot be read. A remote that
+    /// cannot be reached is part of the answer, not an error.
+    pub fn sync_state(&self, ask_remote: bool) -> Result<memory_hub_store::SyncState> {
+        let store = self.git_store()?;
+        memory_hub_store::sync_state(&store, ask_remote).map_err(ServiceError::store)
+    }
+
     /// Whether this repository's memory is here, elsewhere, or nowhere.
     ///
     /// Deliberately independent of the project's storage declaration: the
@@ -1902,7 +1917,7 @@ impl MemoryService {
     /// `git_store()` would answer this too, and would refuse for a project
     /// that has not declared a storage yet — which is the project every one of
     /// the callers above is about. Opening a store also creates
-    /// `refs/memory/staged`, and a repository that has been *asked* about its
+    /// `refs/memory/main`, and a repository that has been *asked* about its
     /// memory must not come away looking like one that has some.
     fn memory_git_dir(&self) -> Result<std::path::PathBuf> {
         memory_hub_store::GitStore::discover_git_dir(&self.project).map_err(ServiceError::store)

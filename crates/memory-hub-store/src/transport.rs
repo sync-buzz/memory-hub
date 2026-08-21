@@ -280,6 +280,213 @@ pub fn probe_remote_memory(git_dir: &Path, url: &str) -> Result<RemoteMemory, St
     }
 }
 
+/// Where the last-known remote revision is kept.
+///
+/// Beside the remote it is about, in the repository's own Git config, because
+/// it is a fact about this clone's exchanges with that remote and not about the
+/// memory itself. **Not a ref**: `refs/memory/main` is the only ref this engine
+/// keeps, and a remote-tracking ref would be a second one.
+const KNOWN_KEY: &str = "memory-hub.remote.known";
+
+/// What the remote holds, as far as this repository knows.
+///
+/// Written after a successful exchange in either direction — a push knows
+/// because it just put it there, a fetch knows because it just read it. One
+/// stored value answers both questions the window asks: what is here and not
+/// there, and whether anything is there and not here.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if the configuration cannot be read.
+pub fn read_known_remote_revision(git_dir: &Path) -> Result<Option<Revision>, StoreError> {
+    let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
+    let config = repo
+        .config()
+        .map_err(|e| StoreError::repository("read config", e))?;
+    match config.get_string(KNOWN_KEY) {
+        Ok(value) => Ok(Some(Revision::new(value))),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(StoreError::repository("read known remote revision", e)),
+    }
+}
+
+/// Record what the remote holds after an exchange that proved it.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if the configuration cannot be written.
+pub fn record_known_remote_revision(
+    git_dir: &Path,
+    revision: &Revision,
+) -> Result<(), StoreError> {
+    let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
+    let mut config = repo
+        .config()
+        .map_err(|e| StoreError::repository("read config", e))?;
+    config
+        .set_str(KNOWN_KEY, revision.as_str())
+        .map_err(|e| StoreError::repository("record known remote revision", e))
+}
+
+/// What the remote had to say, when it was asked at all.
+///
+/// Four states rather than a `bool`, because "not asked" and "could not be
+/// asked" are not "nothing is waiting", and a window that collapsed them would
+/// tell somebody their memory is published when nobody could reach the remote.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCheck {
+    /// The network was deliberately not touched.
+    NotAsked,
+    /// The remote holds something this repository does not.
+    Waiting,
+    /// The remote holds nothing new.
+    UpToDate,
+    /// The question could not be put.
+    Unreachable,
+}
+
+/// Whether synchronisation is needed, and in which direction.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncState {
+    pub remote_configured: bool,
+    /// **Records**, not commits, that are here and not on the remote.
+    ///
+    /// Every save is a commit, so a count of commits would say `12` for twelve
+    /// edits of one record — a number that is true of the history and not of
+    /// anything a person would recognise as theirs.
+    pub unpublished: usize,
+    pub remote: RemoteCheck,
+}
+
+/// Answer whether this repository's memory is in step with its remote.
+///
+/// `ask_remote` decides whether the network is touched. The unpublished count
+/// never needs it — it is computed against the last revision known to be on the
+/// remote, whose objects are here because they got here by being exchanged.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the repository cannot be read. A remote that
+/// cannot be reached is [`RemoteCheck::Unreachable`], not an error: the count
+/// beside it is still true and still worth showing.
+pub fn sync_state(store: &GitStore, ask_remote: bool) -> Result<SyncState, StoreError> {
+    let git_dir = store.git_dir();
+    let Some(remote) = read_remote_config(git_dir)? else {
+        return Ok(SyncState {
+            remote_configured: false,
+            unpublished: 0,
+            remote: RemoteCheck::NotAsked,
+        });
+    };
+
+    let local = store.current()?.revision().clone();
+    let known = read_known_remote_revision(git_dir)?;
+
+    let unpublished = match &known {
+        // Nothing has been exchanged yet, so everything here is unpublished.
+        // Counted as records for the same reason the diff below is.
+        None => store.current()?.records()?.len(),
+        Some(known) if *known == local => 0,
+        Some(known) => store.diff(known, &local)?.len(),
+    };
+
+    let remote = if ask_remote {
+        match remote_memory_tip(git_dir, &remote.url) {
+            Ok(Some(tip)) if known.as_ref() == Some(&tip) => RemoteCheck::UpToDate,
+            // A tip we already have and have already merged past is not news.
+            Ok(Some(tip)) => {
+                if contains_revision(store, &tip, &local)? {
+                    RemoteCheck::UpToDate
+                } else {
+                    RemoteCheck::Waiting
+                }
+            }
+            // A remote carrying no memory has nothing to send.
+            Ok(None) => RemoteCheck::UpToDate,
+            Err(_) => RemoteCheck::Unreachable,
+        }
+    } else {
+        RemoteCheck::NotAsked
+    };
+
+    Ok(SyncState {
+        remote_configured: true,
+        unpublished,
+        remote,
+    })
+}
+
+/// Whether `local` already contains `tip` — the tip is an ancestor of what is
+/// here, so there is nothing to fetch even though the revisions differ.
+///
+/// A tip whose object is not in this repository at all has definitionally not
+/// been merged, and `find_commit` failing is that answer rather than a fault.
+fn contains_revision(
+    store: &GitStore,
+    tip: &Revision,
+    local: &Revision,
+) -> Result<bool, StoreError> {
+    let repo =
+        Repository::open(store.git_dir()).map_err(|e| StoreError::repository("open", e))?;
+    let (Ok(tip_oid), Ok(local_oid)) = (tip.oid(), local.oid()) else {
+        return Ok(false);
+    };
+    if repo.find_commit(tip_oid).is_err() {
+        return Ok(false);
+    }
+    repo.graph_descendant_of(local_oid, tip_oid)
+        .map_err(|e| StoreError::repository("check descendant", e))
+}
+
+/// The revision `refs/memory/main` points at on the remote, without fetching
+/// anything. `None` when the remote carries no memory at all.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the remote cannot be reached or refuses.
+pub fn remote_memory_tip(git_dir: &Path, url: &str) -> Result<Option<Revision>, StoreError> {
+    validate_remote_url(url)?;
+    let child = Command::new("git")
+        .arg("-C")
+        .arg(git_dir)
+        .args(["ls-remote", "--refs"])
+        .arg("--")
+        .arg(url)
+        .arg(MAIN_REF)
+        .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            StoreError::new(
+                StoreErrorKind::TransportFailed,
+                "failed to spawn git ls-remote",
+                serde_json::json!({"detail": e.to_string()}),
+            )
+        })?;
+    let output = wait_with_deadline(child, PROBE_TIMEOUT)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(classify_read_error(
+            "git ls-remote",
+            output.status.code().unwrap_or(-1),
+            &stderr,
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .split_whitespace()
+        .next()
+        .filter(|oid| !oid.is_empty())
+        .map(Revision::new))
+}
+
 /// How long a diagnostic waits for a remote to answer.
 ///
 /// Closing stdin stops `git` asking for a password, but nothing stops a host
@@ -416,11 +623,12 @@ pub fn memory_presence(project: &Path) -> Result<MemoryPresence, StoreError> {
 
 /// How much memory this repository actually holds.
 ///
-/// Records, not refs: `refs/memory/staged` is created by the first store that
-/// opens the repository — including a previous call to this function — so the
-/// presence of a ref says nothing about whether any memory was ever written.
-/// Listing the refs first keeps the common empty case from opening a store at
-/// all, which is what stops the question from answering itself.
+/// Records, not refs: `refs/memory/main` is created, with a genesis commit and
+/// nothing in it, by the first store that opens the repository — including a
+/// previous call to this function — so the presence of a ref says nothing about
+/// whether any memory was ever written. Listing the refs first keeps the common
+/// empty case from opening a store at all, which is what stops the question
+/// from answering itself.
 fn local_record_count(git_dir: &Path) -> Result<usize, StoreError> {
     let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
     let mut refs = repo
@@ -568,6 +776,19 @@ impl TempRefGuard<'_> {
 /// Returns [`StoreError`] with kind `TransportFailed`, `AuthenticationFailed`,
 /// `NamespaceRejected`, `FastForwardRequired`, or `Diverged`.
 pub fn fetch_and_merge(
+    store: &GitStore,
+    remote: &MemoryRemote,
+) -> Result<FetchResult, StoreError> {
+    let result = merge_from_remote(store, remote)?;
+    // Recorded here rather than at each of the five ways the merge can end,
+    // every one of which has learned the same thing: this is what the remote
+    // holds. Best effort — the memory has already arrived, and a status field
+    // that could not be written is not worth failing the fetch over.
+    let _ = record_known_remote_revision(store.git_dir(), &result.remote_revision);
+    Ok(result)
+}
+
+fn merge_from_remote(
     store: &GitStore,
     remote: &MemoryRemote,
 ) -> Result<FetchResult, StoreError> {
@@ -766,6 +987,11 @@ pub fn push_to_remote(
     force: bool,
 ) -> Result<(), StoreError> {
     validate_remote_url(&remote.url)?;
+    // Read before the push, recorded after it: what lands on the remote is what
+    // `refs/memory/main` pointed at when git was handed the refspec. A custom
+    // refspec is not recorded at all — it may move anything, so nothing here
+    // can claim to know what the remote ended up with.
+    let pushed = current_main_revision(git_dir).ok().flatten();
     let refspecs: Vec<String> = if let Some(custom) = &remote.refspec {
         validate_refspec(custom)?;
         custom.split_whitespace().map(str::to_owned).collect()
@@ -805,12 +1031,28 @@ pub fn push_to_remote(
         })?;
 
     if output.status.success() {
+        // Best effort: the memory is published either way, and a status field
+        // that could not be written is not worth failing a push over. The next
+        // exchange records it again.
+        if let (Some(pushed), None) = (&pushed, &remote.refspec) {
+            let _ = record_known_remote_revision(git_dir, pushed);
+        }
         return Ok(());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code().unwrap_or(-1);
     Err(classify_push_error(exit_code, &stderr))
+}
+
+/// What `refs/memory/main` points at, or `None` when there is no such ref yet.
+fn current_main_revision(git_dir: &Path) -> Result<Option<Revision>, StoreError> {
+    let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
+    match repo.find_reference(MAIN_REF) {
+        Ok(reference) => Ok(reference.target().map(Revision::from_oid)),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(StoreError::repository("read memory ref", e)),
+    }
 }
 
 /// Fetch remote refs/memory/main into a temporary ref.
