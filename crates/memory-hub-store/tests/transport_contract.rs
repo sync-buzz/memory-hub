@@ -11,8 +11,8 @@ use git2::Repository;
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_store::{
     GitStore, MemoryPresence, MemoryRemote, Operation, RecordId, RemoteCheck, StoreErrorKind,
-    Transaction, fetch_and_merge, memory_presence, push_to_remote, read_remote_config,
-    sync_state, write_remote_config,
+    Transaction, fetch_and_merge, memory_presence, push_to_remote, read_remote_config, sync_state,
+    write_remote_config,
 };
 
 fn repo_with_store() -> (tempfile::TempDir, GitStore) {
@@ -189,11 +189,7 @@ fn fetch_merges_different_keys() {
     .unwrap();
 
     // Bob fetches alpha.
-    fetch_and_merge(
-        &bob_store,
-        &read_remote_config(&bob_git).unwrap().unwrap(),
-    )
-    .unwrap();
+    fetch_and_merge(&bob_store, &read_remote_config(&bob_git).unwrap().unwrap()).unwrap();
     assert_eq!(
         read_record(&bob_store, "alpha").as_deref(),
         Some("alice alpha")
@@ -211,11 +207,8 @@ fn fetch_merges_different_keys() {
     .unwrap();
 
     // Bob fetches again — should merge gamma (different key).
-    let result = fetch_and_merge(
-        &bob_store,
-        &read_remote_config(&bob_git).unwrap().unwrap(),
-    )
-    .unwrap();
+    let result =
+        fetch_and_merge(&bob_store, &read_remote_config(&bob_git).unwrap().unwrap()).unwrap();
 
     assert!(result.merged || result.fast_forward);
     assert_eq!(
@@ -230,7 +223,7 @@ fn fetch_merges_different_keys() {
 }
 
 #[test]
-fn fetch_same_key_conflict_returns_both_versions() {
+fn the_same_key_changed_on_both_sides_is_resolved_in_favour_of_whoever_fetches() {
     let (_alice_dir, alice_store) = repo_with_store();
     let remote_dir = bare_remote();
 
@@ -269,11 +262,7 @@ fn fetch_same_key_conflict_returns_both_versions() {
         },
     )
     .unwrap();
-    fetch_and_merge(
-        &bob_store,
-        &read_remote_config(&bob_git).unwrap().unwrap(),
-    )
-    .unwrap();
+    fetch_and_merge(&bob_store, &read_remote_config(&bob_git).unwrap().unwrap()).unwrap();
 
     // Both Alice and Bob modify the same key independently.
     put(&alice_store, "shared", "alice updated");
@@ -286,17 +275,22 @@ fn fetch_same_key_conflict_returns_both_versions() {
 
     put(&bob_store, "shared", "bob updated");
 
-    // Bob fetches — should get a conflict.
-    let result = fetch_and_merge(
-        &bob_store,
-        &read_remote_config(&bob_git).unwrap().unwrap(),
-    )
-    .unwrap();
+    // Bob fetches. Both rewrote the whole of a one-line record, so this is a
+    // genuine collision — and it is resolved rather than refused: Bob is the
+    // one at the keyboard, so Bob's text stays and he is told whose it is not.
+    let result =
+        fetch_and_merge(&bob_store, &read_remote_config(&bob_git).unwrap().unwrap()).unwrap();
 
-    assert!(!result.conflicts.is_empty());
-    let conflict = &result.conflicts[0];
-    assert_eq!(conflict.key, "shared");
-    assert_ne!(conflict.local_content_hash, conflict.remote_content_hash);
+    assert!(
+        result.conflicts.is_empty(),
+        "a same-key collision is merged, not handed back"
+    );
+    assert_eq!(keys_of(&result.overlaps), vec!["shared".to_owned()]);
+    assert!(
+        result.overlaps[0].body,
+        "the body is what they both rewrote"
+    );
+    assert_eq!(body_of(&bob_store, "shared"), "bob updated");
 }
 
 #[test]
@@ -530,8 +524,14 @@ fn presence_of_a_fresh_clone_names_the_code_origin_it_can_be_fetched_from() {
     let presence = memory_presence(&clone_path).unwrap();
 
     match presence {
-        MemoryPresence::NotFetched { url: found, configured } => {
-            assert!(!configured, "a fresh clone has no memory remote configured yet");
+        MemoryPresence::NotFetched {
+            url: found,
+            configured,
+        } => {
+            assert!(
+                !configured,
+                "a fresh clone has no memory remote configured yet"
+            );
             assert!(
                 found.contains(remote_dir.path().to_string_lossy().as_ref()),
                 "the answer has to name the address to fetch from, got {found}"
@@ -593,6 +593,24 @@ fn presence_of_an_unreachable_remote_is_its_own_answer() {
 }
 
 // --- sync state: what is unpublished, and is anything waiting --------------
+
+fn keys_of(overlaps: &[memory_hub_store::Overlap]) -> Vec<String> {
+    overlaps.iter().map(|it| it.key.clone()).collect()
+}
+
+fn body_of(store: &GitStore, key: &str) -> String {
+    let view = store.current().unwrap();
+    let Some((_, record)) = view
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|(id, _)| id.display_value() == key)
+    else {
+        panic!("no record named {key}")
+    };
+    let memory_hub_core::StoredRecord::Plaintext { envelope } = record;
+    envelope.content.clone()
+}
 
 fn remote_at(dir: &tempfile::TempDir) -> MemoryRemote {
     MemoryRemote {
@@ -671,8 +689,14 @@ fn the_network_is_only_touched_when_it_is_asked_for() {
     put(&store, "note-1", "one");
     push_to_remote(store.git_dir(), &remote, false).unwrap();
 
-    assert_eq!(sync_state(&store, false).unwrap().remote, RemoteCheck::NotAsked);
-    assert_eq!(sync_state(&store, true).unwrap().remote, RemoteCheck::UpToDate);
+    assert_eq!(
+        sync_state(&store, false).unwrap().remote,
+        RemoteCheck::NotAsked
+    );
+    assert_eq!(
+        sync_state(&store, true).unwrap().remote,
+        RemoteCheck::UpToDate
+    );
 }
 
 /// The case the indicator exists for: somebody else published, and this
@@ -713,7 +737,11 @@ fn an_unreachable_remote_does_not_pass_for_being_in_step() {
     write_remote_config(
         store.git_dir(),
         &MemoryRemote {
-            url: dir.path().join("no-such-remote").to_string_lossy().into_owned(),
+            url: dir
+                .path()
+                .join("no-such-remote")
+                .to_string_lossy()
+                .into_owned(),
             refspec: None,
         },
     )
@@ -723,4 +751,424 @@ fn an_unreachable_remote_does_not_pass_for_being_in_step() {
 
     assert_eq!(state.remote, RemoteCheck::Unreachable);
     assert_eq!(state.unpublished, 1, "the count beside it is still true");
+}
+
+// --- three-way merge: what used to be a conflict and is not one ------------
+
+/// Two people editing different ends of one document is the ordinary case, and
+/// it used to be reported as a conflict because the merge had only two points
+/// to compare. With the common ancestor, both edits survive and nobody is asked
+/// anything.
+#[test]
+fn edits_to_different_parts_of_one_record_both_survive() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+    let shared = "# Guide\n\nIntroduction.\n\nMiddle.\n\nConclusion.\n";
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put(&theirs, "guide", shared);
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    // They rewrite the opening; we rewrite the closing.
+    put(
+        &theirs,
+        "guide",
+        "# Guide\n\nA much better introduction.\n\nMiddle.\n\nConclusion.\n",
+    );
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put(
+        &ours,
+        "guide",
+        "# Guide\n\nIntroduction.\n\nMiddle.\n\nA much better conclusion.\n",
+    );
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    assert!(result.conflicts.is_empty(), "this is not a conflict");
+    assert!(result.overlaps.is_empty(), "nothing collided");
+    assert!(result.merged);
+    let body = body_of(&ours, "guide");
+    assert!(
+        body.contains("A much better introduction."),
+        "their edit survived: {body}"
+    );
+    assert!(
+        body.contains("A much better conclusion."),
+        "our edit survived: {body}"
+    );
+}
+
+/// The genuine collision: the same lines rewritten on both sides. One version
+/// has to lose, it is theirs, and the merge says so rather than absorbing it.
+#[test]
+fn the_same_lines_rewritten_on_both_sides_keep_this_sides_text_and_are_reported() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put(&theirs, "guide", "# Guide\n\nThe original sentence.\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    put(&theirs, "guide", "# Guide\n\nTheir replacement.\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put(&ours, "guide", "# Guide\n\nOur replacement.\n");
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    assert!(
+        result.conflicts.is_empty(),
+        "a collision is resolved, not refused"
+    );
+    assert_eq!(
+        keys_of(&result.overlaps),
+        vec!["guide".to_owned()],
+        "somebody has to be told whose sentence is not in front of them"
+    );
+    let body = body_of(&ours, "guide");
+    assert!(body.contains("Our replacement."), "we are here: {body}");
+    assert!(
+        !body.contains("<<<<<<<"),
+        "a resolved merge leaves no markers: {body}"
+    );
+}
+
+/// A collision on one record must not hold up every other record in the same
+/// fetch — which is exactly what the old wholesale refusal did.
+#[test]
+fn a_collision_on_one_record_does_not_hold_up_the_rest() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put(&theirs, "guide", "one line\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    put(&theirs, "guide", "their line\n");
+    put(&theirs, "their-own-note", "only they wrote this\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put(&ours, "guide", "our line\n");
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    assert_eq!(keys_of(&result.overlaps), vec!["guide".to_owned()]);
+    assert_eq!(
+        body_of(&ours, "their-own-note"),
+        "only they wrote this\n",
+        "the record nobody argued about arrived in the same fetch"
+    );
+}
+
+// --- the merge is three-way for every member, not only the body -----------
+
+/// Write a record and say something about it beyond its text.
+fn put_described(store: &GitStore, key: &str, content: &str, title: &str, tags: &[&str]) {
+    let revision = store.current().unwrap().revision().clone();
+    let mut envelope = Envelope::new(key, "note", content).unwrap();
+    envelope.title = Some(title.to_owned());
+    envelope.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
+    store
+        .apply(&Transaction {
+            id: format!(
+                "described-{key}-{}",
+                PUT_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ),
+            expected_revision: revision,
+            operations: vec![Operation::put(StoredRecord::Plaintext {
+                envelope: Box::new(envelope),
+            })],
+        })
+        .unwrap();
+}
+
+fn envelope_of(store: &GitStore, key: &str) -> memory_hub_core::Envelope {
+    let view = store.current().unwrap();
+    let (_, record) = view
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|(id, _)| id.display_value() == key)
+        .unwrap_or_else(|| panic!("no record named {key}"));
+    let StoredRecord::Plaintext { envelope } = record;
+    *envelope
+}
+
+/// A member this side never touched has one change in it — theirs — and taking
+/// ours there is not resolving a conflict but discarding their work.
+#[test]
+fn a_member_only_they_moved_is_taken_from_them() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put_described(&theirs, "guide", "Line one.\n", "Guide", &["draft"]);
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    // They retitle it and tag it. We only append a line, and never touch either.
+    put_described(
+        &theirs,
+        "guide",
+        "Line one.\n",
+        "The Guide",
+        &["draft", "reviewed"],
+    );
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put_described(
+        &ours,
+        "guide",
+        "Line one.\nLine two.\n",
+        "Guide",
+        &["draft"],
+    );
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    assert!(
+        result.overlaps.is_empty(),
+        "nobody contested anything: {:?}",
+        result.overlaps
+    );
+    let merged = envelope_of(&ours, "guide");
+    assert_eq!(
+        merged.title.as_deref(),
+        Some("The Guide"),
+        "their title was the only change to it"
+    );
+    assert!(
+        merged.tags.contains(&"reviewed".to_owned()),
+        "and the tag they added survived: {:?}",
+        merged.tags
+    );
+    assert!(
+        merged.content.contains("Line two."),
+        "while our own line is still here: {}",
+        merged.content
+    );
+}
+
+/// Where both sides moved the same member, this side keeps its version — and
+/// the member is named, because that decision was made while nobody was asked.
+#[test]
+fn a_member_both_moved_keeps_ours_and_is_named() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put_described(&theirs, "guide", "Body.\n", "Guide", &[]);
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    put_described(&theirs, "guide", "Body.\n", "Their Title", &[]);
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put_described(&ours, "guide", "Body.\n", "Our Title", &[]);
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    assert_eq!(keys_of(&result.overlaps), vec!["guide".to_owned()]);
+    assert_eq!(
+        result.overlaps[0].fields,
+        vec!["title".to_owned()],
+        "the member that lost is named, not merely counted"
+    );
+    assert!(
+        !result.overlaps[0].body,
+        "the body was identical, so nothing collided there"
+    );
+    assert_eq!(
+        envelope_of(&ours, "guide").title.as_deref(),
+        Some("Our Title")
+    );
+}
+
+/// A colleague who moved a file moved it for the project. A fetch that dropped
+/// that leaves this corpus pointing at a path their commit emptied.
+#[test]
+fn a_document_the_other_side_moved_arrives_at_its_new_path() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let reference = |store: &GitStore, path: &str, tag: Option<&str>| {
+        let revision = store.current().unwrap().revision().clone();
+        let mut envelope = memory_hub_core::Envelope::reference(
+            "intro",
+            "doc",
+            path,
+            memory_hub_core::ContentHash::for_content("the same bytes"),
+        )
+        .unwrap();
+        if let Some(tag) = tag {
+            envelope.tags = vec![tag.to_owned()];
+        }
+        store
+            .apply(&Transaction {
+                id: format!("reference-{}", PUT_COUNTER.fetch_add(1, Ordering::SeqCst)),
+                expected_revision: revision,
+                operations: vec![Operation::put(StoredRecord::Plaintext {
+                    envelope: Box::new(envelope),
+                })],
+            })
+            .unwrap();
+    };
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    reference(&theirs, "docs/guides/intro.md", None);
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    // They move the document. We tag it, and never touch where it lives.
+    reference(&theirs, "docs/handbook/intro.md", None);
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    reference(&ours, "docs/guides/intro.md", Some("read"));
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    assert!(result.overlaps.is_empty(), "{:?}", result.overlaps);
+    let merged = envelope_of(&ours, "intro");
+    assert_eq!(
+        merged.content_ref.as_ref().map(|it| it.path.as_str()),
+        Some("docs/handbook/intro.md"),
+        "the move reached us; the local scan is what files it back if this \
+         working tree keeps the document elsewhere"
+    );
+    assert_eq!(merged.tags, vec!["read".to_owned()], "and our tag stayed");
+}
+
+// --- undoing a fetch -------------------------------------------------------
+
+/// A merge is an ordinary commit on top of what was here, so going back is
+/// naming the revision that was here.
+#[test]
+fn memory_goes_back_to_where_a_fetch_found_it() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put(&theirs, "guide", "one line\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    put(&theirs, "guide", "their line\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put(&ours, "guide", "our line\n");
+
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+    assert_eq!(keys_of(&result.overlaps), vec!["guide".to_owned()]);
+
+    memory_hub_store::rewind_to(
+        ours.git_dir(),
+        &result.local_revision_before,
+        &result.local_revision_after,
+    )
+    .unwrap();
+
+    assert_eq!(
+        ours.current().unwrap().revision(),
+        &result.local_revision_before,
+        "memory stands where the fetch found it"
+    );
+    assert_eq!(
+        body_of(&ours, "guide"),
+        "our line\n",
+        "and what it holds is what we wrote, with the merge undone"
+    );
+}
+
+/// Backwards along its own history and nowhere else. A revision off to one side
+/// is not a state this memory was ever in, and arriving at one would be a
+/// corpus nobody wrote.
+#[test]
+fn memory_does_not_go_anywhere_it_has_not_been() {
+    let (_ours_dir, ours) = repo_with_store();
+    put(&ours, "guide", "ours\n");
+
+    // Another repository's history entirely: a real revision, and not one of
+    // this memory's.
+    let (_elsewhere_dir, elsewhere) = repo_with_store();
+    put(&elsewhere, "guide", "somebody else's\n");
+    let foreign = elsewhere.current().unwrap().revision().clone();
+
+    let here = ours.current().unwrap().revision().clone();
+    let refused = memory_hub_store::rewind_to(ours.git_dir(), &foreign, &here);
+
+    assert!(
+        refused.is_err(),
+        "that is not a state this memory passed through"
+    );
+    assert_eq!(
+        ours.current().unwrap().revision(),
+        &here,
+        "a refused rewind leaves memory where it was"
+    );
+}
+
+/// An undo names the state to return to, and what makes that safe is that
+/// nothing has happened since. A record written after the fetch is not part of
+/// what the fetch did.
+#[test]
+fn memory_does_not_go_back_over_something_written_since() {
+    let remote_dir = bare_remote();
+    let remote = remote_at(&remote_dir);
+
+    let (_theirs_dir, theirs) = repo_with_store();
+    write_remote_config(theirs.git_dir(), &remote).unwrap();
+    put(&theirs, "guide", "one line\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+
+    let (_ours_dir, ours) = repo_with_store();
+    write_remote_config(ours.git_dir(), &remote).unwrap();
+    fetch_and_merge(&ours, &remote).unwrap();
+
+    put(&theirs, "guide", "their line\n");
+    push_to_remote(theirs.git_dir(), &remote, false).unwrap();
+    put(&ours, "guide", "our line\n");
+    let result = fetch_and_merge(&ours, &remote).unwrap();
+
+    // Somebody carries on working after the fetch.
+    put(&ours, "a-thought", "written after the merge\n");
+    let now = ours.current().unwrap().revision().clone();
+
+    let refused = memory_hub_store::rewind_to(
+        ours.git_dir(),
+        &result.local_revision_before,
+        &result.local_revision_after,
+    );
+
+    assert!(refused.is_err(), "that would take the new record with it");
+    assert_eq!(
+        ours.current().unwrap().revision(),
+        &now,
+        "and memory stays where it is"
+    );
+    assert_eq!(body_of(&ours, "a-thought"), "written after the merge\n");
 }

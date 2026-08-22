@@ -17,8 +17,7 @@ use crate::error::GitStoreError;
 use crate::types::{GitRecordId, GitRevision};
 use crate::{
     ApplyResult, ChangeKind, ExportBundle, ExportMode, MAIN_REF, Operation, RecordChange, RecordId,
-    Revision, StoreError, StoreErrorKind, StoreView,
-    Transaction, TransactionPolicy,
+    Revision, StoreError, StoreErrorKind, StoreView, Transaction, TransactionPolicy,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -31,8 +30,8 @@ const CONTRACT_PAUSE_BEFORE_REF_UPDATE: &str = "MEMORY_HUB_CONTRACT_PAUSE_BEFORE
 mod chain;
 mod records;
 use chain::{
-    changes_since, find_transaction, genesis_commit, memory_commit,
-    require_retained_revision, transaction_commit,
+    changes_since, find_transaction, genesis_commit, memory_commit, require_retained_revision,
+    transaction_commit,
 };
 use records::{build_tree, decode_record, snapshot_tree, verify_record_location};
 
@@ -120,7 +119,7 @@ impl GitStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the staged ref cannot be read.
+    /// Returns [`StoreError`] if the memory ref cannot be read.
     pub fn current(&self) -> Result<StoreView<'_>, StoreError> {
         let repository = self.repository()?;
         let revision = current_oid(&repository)?;
@@ -225,7 +224,7 @@ impl GitStore {
                 transaction,
                 &request_hash,
                 &changed_ids.iter().cloned().collect::<Vec<_>>(),
-                )?;
+            )?;
             pause_before_ref_update()?;
             match repository.reference_matching(
                 MAIN_REF,
@@ -250,7 +249,6 @@ impl GitStore {
             serde_json::json!({"attempts": MAX_CAS_ATTEMPTS}),
         ))
     }
-
 
     /// Compare record identities between two immutable snapshots.
     ///
@@ -563,7 +561,7 @@ impl GitStore {
 }
 
 /// Test-only process failpoint used by the public behavioral contract. The
-/// marker proves that all new objects exist while the staged ref still points
+/// marker proves that all new objects exist while the memory ref still points
 /// at the previous revision; the contract runner then terminates the process.
 fn pause_before_ref_update() -> Result<(), StoreError> {
     let Some(marker) = std::env::var_os(CONTRACT_PAUSE_BEFORE_REF_UPDATE) else {

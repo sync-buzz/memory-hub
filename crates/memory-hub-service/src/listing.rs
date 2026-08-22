@@ -40,6 +40,15 @@ pub struct ListingQuery {
     /// still reachable — by asking for its kind, or by raising this — because
     /// the tools that maintain schema exist.
     pub include_service: bool,
+    /// Whether the records that *are* folders are listed among the documents.
+    ///
+    /// They are not, by default. A record carrying `is_folder` is the folder
+    /// its type's documents are filed in rather than one of them, so returning
+    /// it beside them answers a question nobody asked and makes every client
+    /// that draws a list filter it out again — once, correctly, in each of
+    /// them. What a folder has to say is reached through `memory_list_folders`,
+    /// which names it, and through search, which finds its text like any other.
+    pub include_folders: bool,
     pub sort: ListingSort,
     pub descending: bool,
     pub metadata_only: bool,
@@ -131,6 +140,7 @@ impl Default for ListingQuery {
             folder_subtree: false,
             presence: PresenceFilter::Present,
             include_service: false,
+            include_folders: false,
             sort: ListingSort::Key,
             descending: false,
             metadata_only: false,
@@ -158,6 +168,9 @@ impl ListingQuery {
             && !self.include_service
             && self.kind.as_deref() != Some(TYPE_KIND)
         {
+            return false;
+        }
+        if envelope.is_folder && !self.include_folders {
             return false;
         }
         if !self

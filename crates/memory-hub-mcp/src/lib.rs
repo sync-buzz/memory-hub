@@ -620,6 +620,9 @@ impl Session {
             "memory_list_records" => self.list_records(arguments),
             "memory_list_folders" => self.list_folders(arguments),
             "memory_rename_folder" => self.rename_folder(arguments),
+            "memory_move_document" => self.move_document(arguments),
+            "memory_create_folder" => self.create_folder(arguments),
+            "memory_delete_folder" => self.delete_folder(arguments),
             "memory_diff" => self.diff(arguments),
             "memory_export" => self.export(arguments),
             "memory_import" => self.import(arguments),
@@ -639,6 +642,7 @@ impl Session {
             "memory_remote_remove" => self.remote_remove(),
             "memory_fetch" => self.fetch(arguments),
             "memory_push" => self.push(arguments),
+            "memory_rewind" => self.rewind(arguments),
             "memory_model_status" => Ok(self.model_status()),
             "memory_delete_type" => self.delete_type(arguments),
             "memory_list_types" => self.list_types(),
@@ -835,7 +839,11 @@ impl Session {
         let folder = arguments.get("folder").and_then(Value::as_str);
         let folders = self
             .service
-            .list_folders(folder, folder_subtree(arguments))
+            .list_folders(
+                folder,
+                folder_subtree(arguments),
+                arguments.get("kind").and_then(Value::as_str),
+            )
             .map_err(ToolFailure::service)?;
         let rendered: Vec<Value> = folders
             .iter()
@@ -859,6 +867,56 @@ impl Session {
         let result = self
             .service
             .rename_folder(from, to, transaction_id)
+            .map_err(ToolFailure::service)?;
+        let changed = result
+            .changed_keys
+            .iter()
+            .map(|key| RecordNotice::keyed(key, "written"))
+            .collect();
+        Ok(ToolOutcome::changing(json!(result), changed))
+    }
+
+    fn delete_folder(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let folder = required_string(arguments, "folder")?;
+        let transaction_id = required_string(arguments, "transaction_id")?;
+        let removed = self
+            .service
+            .delete_folder(folder, transaction_id)
+            .map_err(ToolFailure::service)?;
+        Ok(ToolOutcome::changing(
+            json!({"removed": removed}),
+            Vec::new(),
+        ))
+    }
+
+    fn create_folder(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let folder = required_string(arguments, "folder")?;
+        let kind = required_string(arguments, "kind")?;
+        let transaction_id = required_string(arguments, "transaction_id")?;
+        let result = self
+            .service
+            .create_folder(folder, kind, transaction_id)
+            .map_err(ToolFailure::service)?;
+        let changed = result
+            .changed_keys
+            .iter()
+            .map(|key| RecordNotice::keyed(key, "written"))
+            .collect();
+        Ok(ToolOutcome::changing(json!(result), changed))
+    }
+
+    fn move_document(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let key = required_string(arguments, "key")?;
+        // Not `required_string`: the empty string is the root, which is a
+        // destination somebody can mean, and that helper reads empty as absent.
+        let folder = arguments
+            .get("folder")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcFailure::invalid_argument("folder"))?;
+        let transaction_id = required_string(arguments, "transaction_id")?;
+        let result = self
+            .service
+            .move_document(key, folder, transaction_id)
             .map_err(ToolFailure::service)?;
         let changed = result
             .changed_keys
@@ -1349,6 +1407,12 @@ impl Session {
                 "fastForward": result.fast_forward,
                 "merged": result.merged,
                 "conflicts": result.conflicts,
+                // The records both sides moved the same thing in, and what of
+                // theirs is not in the answer: `body` when the same lines were
+                // rewritten, `fields` naming the members that lost. Nothing is
+                // gone — the other version is still a commit — but somebody has
+                // to be told, and told what.
+                "overlaps": result.overlaps,
             }),
             revision_changed: changed,
             changed: records,
@@ -1368,6 +1432,29 @@ impl Session {
             "warnings": outcome.policy.warnings,
             "staleCount": outcome.policy.stale_count,
         })))
+    }
+
+    /// Put memory back where it stood, undoing what has happened since.
+    ///
+    /// What a fetch is undone with: a merge is an ordinary commit on top of
+    /// what was here, and `localRevisionBefore` from that fetch is the revision
+    /// to name. Backwards along this memory's own history and nowhere else, so
+    /// it cannot arrive at a state the project was never in.
+    ///
+    /// Every record may have changed, so this reports a moved revision without
+    /// naming keys — whoever is holding a list should read it again.
+    fn rewind(&mut self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let revision = required_string(arguments, "revision")?;
+        let expected = required_string(arguments, "expected_revision")?;
+        let now = self
+            .service
+            .rewind(revision, expected)
+            .map_err(ToolFailure::service)?;
+        Ok(ToolOutcome {
+            content: json!({"revision": now}),
+            revision_changed: true,
+            changed: Vec::new(),
+        })
     }
 
     /// Remove a type, and detach the folder it was over.
@@ -1442,6 +1529,10 @@ fn listing_query(arguments: &Value) -> ListingQuery {
             .unwrap_or(false),
         include_service: arguments
             .get("include_service")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        include_folders: arguments
+            .get("include_folders")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         ..ListingQuery::default()
@@ -1689,6 +1780,10 @@ fn builtin_instructions() -> String {
     s.push_str("over the full filtered set.\n");
     s.push_str("Type definitions are left out of both this and search; ask for ");
     s.push_str("`kind: \"__type__\"` or set `include_service` to see them.\n");
+    s.push_str("The record that *is* a folder is left out too — it is what the folder ");
+    s.push_str("says rather than a document filed in it. `memory_list_folders` names it ");
+    s.push_str("as `described_by`, search finds its text like any other, and ");
+    s.push_str("`include_folders` puts it back in the list.\n");
     s.push_str("- **memory_list_folders**: List folders from both sources at once — ");
     s.push_str("folders records are filed in, and real directories of an attached ");
     s.push_str("documentation folder, including empty ones no record can reveal. ");
@@ -1712,6 +1807,22 @@ fn builtin_instructions() -> String {
     s.push_str("the write then applies only while the record's content still hashes to ");
     s.push_str("that value, and returns `conflict` otherwise. Omit it for the ");
     s.push_str("unconditional write.\n");
+    s.push_str("- **memory_move_document** (`key`, `folder`): File one record in another ");
+    s.push_str("folder, `\"\"` for the root. Use this rather than writing `folder` in a Put: ");
+    s.push_str("for a record whose content is a repository file the folder is the ");
+    s.push_str("directory that file is in, and a Put would leave the two disagreeing ");
+    s.push_str("while this moves the file too. Such a document may only move within its ");
+    s.push_str("type's storage, and nothing is overwritten.\n");
+    s.push_str("- **memory_create_folder** (`folder`, `kind`): Make an empty folder under a ");
+    s.push_str("type. A directory for a type whose documents are files, and the record that ");
+    s.push_str("carries `is_folder` for a type whose documents are its records.\n");
+    s.push_str("- **memory_delete_folder** (`folder`): Take a folder and everything filed ");
+    s.push_str("under it, at any depth and whatever its type — a folder exists while ");
+    s.push_str("something is in it. Directories are removed only while empty, so a file no ");
+    s.push_str("scan reached is left alone. Answers with how many records went.\n");
+    s.push_str("- **memory_rename_folder** (`from`, `to`): Move every record under a folder ");
+    s.push_str("at once, renaming the directory too where the documents are files. A type's ");
+    s.push_str("own storage root is `memory_migrate_storage`, not this.\n");
 
     s.push_str("\n### History & Reconciliation\n\n");
     s.push_str("- **memory_diff**: Compare two revisions.\n");
@@ -1831,24 +1942,26 @@ pub fn list_tools() -> Value {
                     ),
                     ("metadata_only", json!({"type":"boolean","default":false})),
                     ("include_service", json!({"type":"boolean","default":false})),
+                    ("include_folders", json!({"type":"boolean","default":false})),
                 ],
                 &[],
             ),
         ),
         tool(
             "memory_list_folders",
-            "List the project's folders from both sources at once: folders records are filed in, and real directories of an attached documentation folder — including empty ones, which no record can reveal. Each entry says where it is known from (`in_records`, `in_storage`), how many documents are filed directly in it, and `described_by`: the key of the record that is the folder, if one is. `folder` and `folder_scope` select a region exactly as in `memory_list_records`. Read live, never stored: Git keeps no empty directories, so this describes the working tree in front of you.",
+            "List the project's folders from both sources at once: folders records are filed in, and real directories of an attached documentation folder — including empty ones, which no record can reveal. Each entry says where it is known from (`in_records`, `in_storage`), how many documents are filed directly in it, and `described_by`: the key of the record that is the folder, if one is. `folder` and `folder_scope` select a region exactly as in `memory_list_records`; `kind` narrows to one type's folders, which is what a client drawing a tree per type needs — folders are a namespace the whole project shares, so without it every type appears to have all of them. Read live, never stored: Git keeps no empty directories, so this describes the working tree in front of you.",
             object_schema(
                 &[
                     ("folder", string_schema()),
                     ("folder_scope", string_schema()),
+                    ("kind", string_schema()),
                 ],
                 &[],
             ),
         ),
         tool(
             "memory_rename_folder",
-            "Rename a folder of `refs`, rewriting `folder` on every record filed under it in one transaction — including the record that is the folder. Refused for a directory of an attached folder: rename the directory itself and the next scan follows it.",
+            "Rename a folder, rewriting `folder` on every record filed under it in one transaction — including the record that is the folder. For a directory of an attached folder the directory is renamed too, and the locators follow it; the keys do not, so no link breaks. A type's own storage root is not renamed here — moving that is `memory_migrate_storage`.",
             object_schema(
                 &[
                     ("from", string_schema()),
@@ -1856,6 +1969,41 @@ pub fn list_tools() -> Value {
                     ("transaction_id", string_schema()),
                 ],
                 &["from", "to", "transaction_id"],
+            ),
+        ),
+        tool(
+            "memory_move_document",
+            "File one record in another folder. `folder` is the destination, `\"\"` the root. A record that carries its own body moves by metadata alone; a record whose body is a repository file has the file moved with it, because its folder is the directory that file is in. Such a record may only move within its type's storage, and nothing is overwritten: a destination already holding a document of that name is refused. Renaming a whole folder is `memory_rename_folder`.",
+            object_schema(
+                &[
+                    ("key", string_schema()),
+                    ("folder", string_schema()),
+                    ("transaction_id", string_schema()),
+                ],
+                &["key", "folder", "transaction_id"],
+            ),
+        ),
+        tool(
+            "memory_create_folder",
+            "Make a folder that nothing is in yet, under the type named by `kind`. One operation for both storages: for a type whose documents are files it creates the directory, and for a type whose documents are its records it writes the record that carries `is_folder` — which *is* the folder it is filed in, titled with the folder's last segment and left with no body for somebody to fill in. Note the one difference nothing can remove: Git keeps no empty directories, so a folder made in an attached directory is a fact about that working tree until something is filed in it, while one made in the records travels at once.",
+            object_schema(
+                &[
+                    ("folder", string_schema()),
+                    ("kind", string_schema()),
+                    ("transaction_id", string_schema()),
+                ],
+                &["folder", "kind", "transaction_id"],
+            ),
+        ),
+        tool(
+            "memory_delete_folder",
+            "Take a folder and everything filed under it, at any depth and whatever its type — a folder exists while something is in it, so sparing another type's records would empty it rather than delete it. Records go in one transaction and a record whose body is a repository file takes that file with it. Directories are then removed only while they are empty: a folder holding a file no scan has reached is left standing rather than taken along. Answers with how many records went. Refused for a type's own storage root, which is `memory_delete_type`.",
+            object_schema(
+                &[
+                    ("folder", string_schema()),
+                    ("transaction_id", string_schema()),
+                ],
+                &["folder", "transaction_id"],
             ),
         ),
         tool(
@@ -1872,7 +2020,13 @@ pub fn list_tools() -> Value {
         tool(
             "memory_export",
             "Export a deterministic record bundle",
-            object_schema(&[("revision", string_schema())], &["revision"]),
+            object_schema(
+                &[
+                    ("revision", string_schema()),
+                    ("expected_revision", string_schema()),
+                ],
+                &["revision", "expected_revision"],
+            ),
         ),
         tool(
             "memory_import",
@@ -2052,6 +2206,17 @@ pub fn list_tools() -> Value {
         object_schema(
             &[("force", json!({"type": "boolean", "default": false}))],
             &[],
+        ),
+    ));
+    tools.push(tool(
+        "memory_rewind",
+        "Put this project's memory back where it stood at `revision`, undoing everything since — what a fetch is undone with, naming the `localRevisionBefore` that fetch reported. Only backwards along memory's own history: a revision it never passed through is refused, so this cannot arrive at a state nobody wrote. `expected_revision` is where memory should still stand, and a tip that has moved past it means somebody has written since — the undo is refused rather than carrying their record away. Nothing is destroyed, the commits after it stay in the repository, and it moves this clone alone — a revision already pushed is still on the remote and the next fetch brings it back.",
+        object_schema(
+            &[
+                ("revision", string_schema()),
+                ("expected_revision", string_schema()),
+            ],
+            &["revision", "expected_revision"],
         ),
     ));
     tools.push(tool(

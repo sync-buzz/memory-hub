@@ -96,9 +96,41 @@ impl TransactionPolicy for SchemaPolicy {
         // The registry is read from the same state the rules are checked
         // against. Passing one in would let a caller validate against types
         // that are no longer there.
-        let registry = SchemaRegistry::from_type_definitions(filter_type_definitions(existing)?)
+        //
+        // **The state a transaction is checked against is the one it produces**,
+        // so the types it introduces are in the registry beside the ones
+        // already stored. A transaction is atomic: a record and the definition
+        // of its kind arriving together either both land or neither does, and
+        // validating the record against the corpus from before would refuse
+        // exactly the write that makes it valid.
+        //
+        // This used to work by accident and only on an empty corpus — with no
+        // types at all, validation is skipped entirely — so describing a
+        // project whose memory already held a type failed while describing one
+        // with no memory succeeded.
+        // Collapsed by kind, and the transaction's version wins: a transaction
+        // that rewrites a definition is checked against what it writes, not
+        // against the one it replaces. The registry refuses a kind declared
+        // twice, so the two lists cannot simply be concatenated.
+        // Two registries, because two questions are asked and they are asked of
+        // different moments. What a record must satisfy is the schema *after*
+        // this transaction. What a type is being moved away from is the schema
+        // *before* it — a guard reading the merged one would compare a
+        // definition against itself and wave every storage move through.
+        let corpus = filter_type_definitions(existing)?;
+        let stored = SchemaRegistry::from_type_definitions(corpus.clone())
             .map_err(|error| schema_registry_error(&error))?;
-        validate_operations_against_schema(*self, &registry, transaction, existing)?;
+        let mut definitions: BTreeMap<String, TypeDefinition> = corpus
+            .into_iter()
+            .map(|definition| (definition.kind_name.clone(), definition))
+            .collect();
+        for definition in filter_type_definitions_of(transaction)? {
+            definitions.insert(definition.kind_name.clone(), definition);
+        }
+        let effective =
+            SchemaRegistry::from_type_definitions(definitions.into_values().collect::<Vec<_>>())
+                .map_err(|error| schema_registry_error(&error))?;
+        validate_operations_against_schema(*self, &stored, &effective, transaction, existing)?;
         require_one_record_per_folder(transaction, existing)
     }
 }
@@ -117,6 +149,37 @@ fn filter_type_definitions(
                 Some(TypeDefinition::from_content(&envelope.content))
             }
             StoredRecord::Plaintext { .. } => None,
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            StoreError::new(
+                StoreErrorKind::InvalidRecord,
+                "type definition record has malformed JSON",
+                serde_json::json!({"detail": error.to_string()}),
+            )
+        })
+}
+
+/// The type definitions a transaction is introducing.
+///
+/// Later than the stored ones on purpose: a transaction that rewrites a
+/// definition is validated against the version it writes, not the one it
+/// replaces. `SchemaRegistry` takes the last of a repeated kind, and this list
+/// is appended after the corpus for exactly that reason.
+fn filter_type_definitions_of(
+    transaction: &Transaction,
+) -> Result<Vec<TypeDefinition>, StoreError> {
+    transaction
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            Operation::Put {
+                record: StoredRecord::Plaintext { envelope },
+                ..
+            } if envelope.kind == TYPE_KIND => {
+                Some(TypeDefinition::from_content(&envelope.content))
+            }
+            Operation::Put { .. } | Operation::Delete { .. } => None,
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -164,7 +227,8 @@ fn schema_registry_error(error: &ValidationError) -> StoreError {
 /// mode, unknown kinds are rejected; in non-strict mode, they pass.
 fn validate_operations_against_schema(
     policy: SchemaPolicy,
-    registry: &SchemaRegistry,
+    stored: &SchemaRegistry,
+    effective: &SchemaRegistry,
     transaction: &Transaction,
     existing: &[(RecordId, StoredRecord)],
 ) -> Result<(), StoreError> {
@@ -192,12 +256,19 @@ fn validate_operations_against_schema(
                     }),
                 )
             })?;
-            require_no_silent_storage_move(registry, &definition, existing, transaction)?;
-        } else if !registry.is_empty() {
-            registry
-                .validate_record(envelope, policy.strict)
+            // `stored`: the question is what this type is moving *away* from.
+            require_no_silent_storage_move(stored, &definition, existing, transaction)?;
+        } else if !effective.is_empty() {
+            // The record that is a folder is held to the kind existing and to
+            // nothing the kind declares. It is not a document of that type —
+            // it is what the folder those documents are in has to say — so a
+            // type with a required field would otherwise make its folders
+            // undescribable without inventing values for fields that are about
+            // documents.
+            effective
+                .validate_record_shallow(envelope, policy.strict, !envelope.is_folder)
                 .map_err(|error| schema_validation_error(&envelope.kind, &error))?;
-            require_shape_of_its_storage(registry, envelope, existing)?;
+            require_shape_of_its_storage(effective, envelope, existing)?;
         }
     }
     Ok(())
@@ -270,7 +341,7 @@ fn require_one_record_per_folder(
 
 /// The folder a record is filed in, with the root spelled as the empty string
 /// so it takes part in the same lookup as every other path.
-fn folder_path(envelope: &Envelope) -> &str {
+pub(crate) fn folder_path(envelope: &Envelope) -> &str {
     envelope.folder.as_deref().unwrap_or("")
 }
 
@@ -286,6 +357,13 @@ fn folder_path(envelope: &Envelope) -> &str {
 /// Only records that are new are checked. A migration rewrites existing records
 /// into the shape of the storage they are moving to *before* the definition
 /// that names it, so an existing key is exactly the case this must not refuse.
+///
+/// **The record that is a folder is not one of that type's documents**, so this
+/// does not reach it. It is *about* a folder rather than in one: it names no
+/// file because there is no file to name, and the scan has nothing to keep
+/// honest about it. Requiring one would mean a folder could only be described
+/// by putting a document in somebody's repository, which is the one thing
+/// attaching a folder promises not to do.
 fn require_shape_of_its_storage(
     registry: &SchemaRegistry,
     envelope: &Envelope,
@@ -294,7 +372,18 @@ fn require_shape_of_its_storage(
     let Ok(storage) = registry.storage_for(&envelope.kind) else {
         return Ok(());
     };
-    if !storage.is_external() || envelope.content_ref.is_some() {
+    if !storage.is_external() {
+        return Ok(());
+    }
+    // The record that is a folder carries no file — that is the point of it —
+    // but the folder it stands for still has to be one of this type's. Nothing
+    // else checks: the rule below is about a document's locator, and this
+    // record has none, so without this a folder record could describe a
+    // directory belonging to somebody else's type, or to no type at all.
+    if envelope.is_folder {
+        return require_folder_of_its_storage(envelope, storage.folder());
+    }
+    if envelope.content_ref.is_some() {
         return Ok(());
     }
     let id = RecordId::plaintext(&envelope.key);
@@ -311,6 +400,36 @@ fn require_shape_of_its_storage(
             "key": envelope.key,
             "storage": storage.folder(),
             "recovery_action": "write_the_document_and_scan",
+        }),
+    ))
+}
+
+/// The folder a folder record stands for is one of its type's, or it is none.
+///
+/// It stands for the folder it is filed in, so this is that one member: at the
+/// storage root or under it. A record describing `elsewhere/notes` as a folder
+/// of a type stored in `docs/` is describing something that type does not have,
+/// and a tree drawn per type would either hide it or hang it nowhere.
+fn require_folder_of_its_storage(
+    envelope: &Envelope,
+    root: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let folder = folder_path(envelope);
+    if folder == root || folder.starts_with(&format!("{root}/")) {
+        return Ok(());
+    }
+    Err(StoreError::new(
+        StoreErrorKind::InvalidRecord,
+        format!("a folder of this type lives under `{root}`"),
+        serde_json::json!({
+            "field": "folder",
+            "kind": envelope.kind,
+            "key": envelope.key,
+            "folder": folder,
+            "storage": root,
         }),
     ))
 }

@@ -29,7 +29,7 @@ pub use listing::{
 pub use policy::{SchemaPolicy, load_registry};
 pub use records::{DEFAULT_RECORDS_PATH, RecordsIn};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -43,10 +43,13 @@ use memory_hub_index::{
 use memory_hub_reconcile::{DivergenceMode, ReconcileReport, Reconciler};
 use memory_hub_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition, TypeStorage};
 use memory_hub_store::{
-    ApplyResult, ExportBundle, ExportMode, FetchResult, GitStore,
-    MemoryRemote, Operation, PushPolicyResult, RecordChange, RecordId,
-    RecordStore, Revision, StoreDescription, StoreView, Transaction, TransactionPolicy,
+    ApplyResult, ExportBundle, ExportMode, FetchResult, GitStore, MemoryRemote, Operation,
+    PushPolicyResult, RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreView,
+    Transaction, TransactionPolicy,
 };
+
+use crate::attach::key_for;
+use crate::policy::folder_path;
 
 /// Result alias for every use case.
 pub type Result<T> = std::result::Result<T, ServiceError>;
@@ -283,9 +286,7 @@ impl MemoryService {
     /// Returns [`ServiceError`] when the type keeps its content in its records
     /// — there is no source to reach.
     fn source_for_kind(&self, kind: &str) -> Result<FolderSource<'_>> {
-        let storage = self.schema_registry()?.storage_for(kind).map_err(|error| {
-            ServiceError::invalid_argument("kind", format!("type `{kind}`: {}", error.message))
-        })?;
+        let storage = self.storage_of_kind(kind)?;
         let attachment = attachment_for(&storage).ok_or_else(|| {
             ServiceError::invalid_argument(
                 "key",
@@ -1094,7 +1095,10 @@ impl MemoryService {
         // written: it is the record's key under the folder, keys are arbitrary
         // strings, and the envelope validator that would catch a bad one runs
         // after the file is already on disk.
-        let locator = format!("{}/{}{NEW_DOCUMENT_SUFFIX}", attachment.folder, envelope.key);
+        let locator = format!(
+            "{}/{}{NEW_DOCUMENT_SUFFIX}",
+            attachment.folder, envelope.key
+        );
         memory_hub_core::validate_locator("content_ref.path", &locator).map_err(|error| {
             ServiceError::invalid_argument(
                 "key",
@@ -1191,11 +1195,34 @@ impl MemoryService {
     /// # Errors
     ///
     /// Returns [`ServiceError`] when the store is locked or unreadable.
-    pub fn list_folders(&self, folder: Option<&str>, subtree: bool) -> Result<Vec<FolderEntry>> {
+    pub fn list_folders(
+        &self,
+        folder: Option<&str>,
+        subtree: bool,
+        kind: Option<&str>,
+    ) -> Result<Vec<FolderEntry>> {
+        // Asked once, and asked at all: a kind this project does not hold is a
+        // question with no answer, not a project with no folders. Answering
+        // `[]` would let a client draw an empty tree for a typo and never learn
+        // why it was empty.
+        let storage = match kind {
+            Some(wanted) => Some(self.storage_of_kind(wanted)?),
+            None => None,
+        };
+
         let (_, envelopes) = self.corpus(None)?;
         let mut entries: BTreeMap<String, FolderEntry> = BTreeMap::new();
 
         for (_, envelope) in &envelopes {
+            // One type's folders, when that is the question. A client drawing a
+            // tree per type has to ask it: folders are a namespace the whole
+            // project shares — nothing stops a decision from being filed in
+            // `docs/guides` next to the documents — so a tree that hung every
+            // folder under every type would show each of them several times, in
+            // places its records are not.
+            if kind.is_some_and(|wanted| wanted != envelope.kind) {
+                continue;
+            }
             // A type definition is schema rather than a document, and counting
             // it as one would put a number in front of a person that no folder
             // of theirs contains.
@@ -1212,10 +1239,17 @@ impl MemoryService {
             // that promises documents nobody can then see is worse than one
             // that says nothing. The folder itself stays — the record is filed
             // there whether or not this branch has its bytes.
-            if !envelope
-                .content_ref
-                .as_ref()
-                .is_some_and(|reference| reference.presence == Presence::NotOnBranch)
+            //
+            // The record that *is* this folder is not among the documents in
+            // it, for the same reason it is not in a listing of them: it is
+            // what the folder says, not something filed there. Counting it
+            // would put a number in front of a person that is one more than
+            // the rows they can see.
+            if !envelope.is_folder
+                && !envelope
+                    .content_ref
+                    .as_ref()
+                    .is_some_and(|reference| reference.presence == Presence::NotOnBranch)
             {
                 entry.records += 1;
             }
@@ -1226,7 +1260,17 @@ impl MemoryService {
             }
         }
 
+        // Directories, and only the ones belonging to the type that was asked
+        // about. A type whose documents are its own records has no storage, so
+        // asking for its folders answers from the records alone — which is the
+        // whole of the answer there, because a folder it does not file anything
+        // in does not exist.
         for attachment in self.attachments()? {
+            if storage.is_some()
+                && storage.as_ref().and_then(attachment_for) != Some(attachment.clone())
+            {
+                continue;
+            }
             let source = FolderSource::new(&self.project, attachment.clone());
             for path in source.folders()? {
                 entries
@@ -1236,11 +1280,383 @@ impl MemoryService {
             }
         }
 
+        // **The folders between**, which nothing is filed in directly.
+        //
+        // A record filed in `a/b/c` puts `a/b/c` in this answer and says
+        // nothing about `a/b`, because no record is in it. But `a/b` is there —
+        // something is under it, which is the whole of what makes a folder
+        // exist — and leaving it out hands a client a path whose parent it was
+        // never told about. Whatever draws a tree then has a row it cannot hang
+        // anywhere, so the folder is invisible while its records are counted
+        // under it.
+        //
+        // A directory answers for its own ancestors, because the walk reaches
+        // every level. Only the records need this.
+        let between: Vec<String> = entries
+            .keys()
+            .flat_map(|path| {
+                path.match_indices('/')
+                    .map(|(at, _)| path[..at].to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|ancestor| !entries.contains_key(ancestor))
+            .collect();
+        for path in between {
+            entries
+                .entry(path.clone())
+                .or_insert_with(|| FolderEntry::empty(&path))
+                // Known from the records, which is what this member means: the
+                // corpus is why anybody knows this folder is there. It holds no
+                // documents of its own, and `records` says so.
+                .in_records = true;
+        }
+
         let mut folders: Vec<FolderEntry> = entries.into_values().collect();
         if let Some(wanted) = folder {
             folders.retain(|entry| folder_in_scope(wanted, subtree, &entry.path));
         }
         Ok(folders)
+    }
+
+    /// Make a folder that nothing is in yet.
+    ///
+    /// One operation for both storages, and the caller does not say which it is
+    /// talking to — that is the whole point. What a folder *is* differs
+    /// underneath and must not differ above: a client that had to ask where a
+    /// type keeps its documents before it could offer "New Folder" would be a
+    /// client reimplementing this decision, differently, every time.
+    ///
+    /// **In a directory it is a directory**, created empty. **In the records it
+    /// is a record** — the one carrying `is_folder`, which *is* the folder it is
+    /// filed in. There is no third thing and nothing is invented: a folder with
+    /// nothing else in it is a real folder in both, for each storage's own
+    /// ordinary reason.
+    ///
+    /// One difference survives and cannot be removed here. Git keeps no empty
+    /// directories, so a folder made in an attached directory is a fact about
+    /// this working tree until something is filed in it, while one made in the
+    /// records travels immediately. Closing that would mean writing a marker
+    /// into somebody's repository, which is the one thing attaching a folder
+    /// promises not to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when `folder` is not a normalized
+    /// repository-relative path, when the type is not one this project holds,
+    /// when a directory type is asked for a folder outside its storage, or when
+    /// the folder is already there.
+    pub fn create_folder(
+        &self,
+        folder: &str,
+        kind: &str,
+        transaction_id: &str,
+    ) -> Result<ApplyResult> {
+        if folder.is_empty() {
+            return Err(ServiceError::invalid_argument(
+                "folder",
+                "the root is always there and is not a folder to create",
+            ));
+        }
+        memory_hub_core::validate_locator("folder", folder)
+            .map_err(|error| ServiceError::invalid_argument("folder", error.message.clone()))?;
+
+        let storage = self.storage_of_kind(kind)?;
+
+        match attachment_for(&storage) {
+            Some(attachment) => self.create_directory(&attachment, folder),
+            None => self.create_folder_record(folder, kind, transaction_id),
+        }
+    }
+
+    /// A directory of the working tree, created empty.
+    ///
+    /// Answers with the revision as it stands rather than a write of its own:
+    /// no record changed, because a directory is not something the corpus
+    /// holds. A caller that redrew from this gets the same records and one more
+    /// folder, which is exactly what happened.
+    fn create_directory(&self, attachment: &Attachment, folder: &str) -> Result<ApplyResult> {
+        // Inside the storage, on the same terms a document is. A directory made
+        // beside somebody's attached folder is Sync deciding where their
+        // repository keeps things.
+        if folder != attachment.folder && !folder.starts_with(&format!("{}/", attachment.folder)) {
+            return Err(ServiceError::invalid_argument(
+                "folder",
+                format!(
+                    "that folder is not inside `{}`, which is where this type's documents live",
+                    attachment.folder
+                ),
+            ));
+        }
+
+        let path = self.project.join(folder);
+        if path.exists() {
+            return Err(ServiceError::invalid_argument(
+                "folder",
+                "a directory is already there",
+            ));
+        }
+        std::fs::create_dir_all(&path).map_err(|error| {
+            ServiceError::new(
+                "repository",
+                format!("could not create {}: {error}", path.display()),
+                serde_json::json!({"folder": folder}),
+            )
+        })?;
+
+        Ok(ApplyResult {
+            revision: self.current_revision()?,
+            changed_keys: Vec::new(),
+        })
+    }
+
+    /// The record that is the folder, written so the folder exists.
+    ///
+    /// Titled with the folder's own last segment and left with no body: a
+    /// folder made a moment ago has nothing to say about itself yet, and
+    /// inventing a sentence would be this layer writing somebody's
+    /// documentation. Both are theirs to change afterwards, because the record
+    /// is an ordinary document.
+    fn create_folder_record(
+        &self,
+        folder: &str,
+        kind: &str,
+        transaction_id: &str,
+    ) -> Result<ApplyResult> {
+        let (revision, envelopes) = self.corpus(None)?;
+        if envelopes
+            .iter()
+            .any(|(_, envelope)| envelope.is_folder && folder_path(envelope) == folder)
+        {
+            return Err(ServiceError::invalid_argument(
+                "folder",
+                "a folder already has the record that stands for it",
+            ));
+        }
+
+        let taken: BTreeSet<&str> = envelopes
+            .iter()
+            .map(|(_, envelope)| envelope.key.as_str())
+            .collect();
+        // Derived the way the scan derives one, so a folder made here and a
+        // folder that arrived with a directory are named alike.
+        let key = unique_key(&key_for(&Attachment::new(String::new()), folder), &|key| {
+            taken.contains(key)
+        });
+
+        let mut envelope = Envelope::new(&key, kind, String::new())
+            .map_err(|error| ServiceError::invalid_argument("kind", error.message))?;
+        envelope.title = Some(
+            folder
+                .rsplit_once('/')
+                .map_or(folder, |(_, name)| name)
+                .to_owned(),
+        );
+        envelope.folder = Some(folder.to_owned());
+        envelope.is_folder = true;
+
+        self.apply_transaction(
+            transaction_id,
+            revision,
+            vec![Operation::put(StoredRecord::Plaintext {
+                envelope: Box::new(envelope),
+            })],
+        )
+    }
+
+    /// Take a folder and everything filed under it.
+    ///
+    /// **Everything, whatever its type.** A folder exists while something is in
+    /// it, so a deletion that spared another type's records would not delete
+    /// the folder — it would empty it of one type and leave it standing, which
+    /// is not what anybody asking for this meant. The caller is expected to
+    /// have said so first; this reports how many went so it can be checked
+    /// against what was shown.
+    ///
+    /// Records go in one transaction, and a record whose body is a repository
+    /// file takes that file with it, as any deletion does.
+    ///
+    /// **Directories are then removed only while they are empty.** Not
+    /// recursively: a folder may hold a file no scan has reached yet — written
+    /// a moment ago, or excluded from the corpus for a reason of its own — and
+    /// a recursive remove would take somebody's work along with the records
+    /// Memory knew about. What is left standing is a directory with something
+    /// in it, which is the honest outcome and visible in the file tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when `folder` is not a normalized
+    /// repository-relative path, when it is a type's own storage root — that is
+    /// removing the type, not a folder — or when the write fails.
+    pub fn delete_folder(&self, folder: &str, transaction_id: &str) -> Result<usize> {
+        if folder.is_empty() {
+            return Err(ServiceError::invalid_argument(
+                "folder",
+                "the root is not a folder that can be deleted",
+            ));
+        }
+        memory_hub_core::validate_locator("folder", folder)
+            .map_err(|error| ServiceError::invalid_argument("folder", error.message.clone()))?;
+
+        for attachment in self.attachments()? {
+            if folder == attachment.folder || attachment.folder.starts_with(&format!("{folder}/")) {
+                return Err(ServiceError::invalid_argument(
+                    "folder",
+                    "this folder is where a type keeps its documents: removing it is \
+                     `delete_type`, which leaves every file where it is",
+                ));
+            }
+        }
+
+        let (revision, envelopes) = self.corpus(None)?;
+        let doomed: Vec<Operation> = envelopes
+            .iter()
+            .filter(|(_, envelope)| {
+                envelope.kind != TYPE_KIND
+                    && folder_in_scope(folder, true, envelope.folder.as_deref().unwrap_or(""))
+            })
+            .map(|(key, _)| Operation::Delete {
+                id: RecordId::plaintext(key),
+            })
+            .collect();
+
+        let removed = doomed.len();
+        if removed > 0 {
+            self.apply_transaction(transaction_id, revision, doomed)?;
+        }
+
+        // Deepest first, so a directory whose only contents were subdirectories
+        // is empty by the time it is tried.
+        let mut directories: Vec<String> = self
+            .attachments()?
+            .into_iter()
+            .filter(|attachment| folder.starts_with(&format!("{}/", attachment.folder)))
+            .flat_map(|attachment| {
+                FolderSource::new(&self.project, attachment)
+                    .folders()
+                    .unwrap_or_default()
+            })
+            .filter(|path| path == folder || path.starts_with(&format!("{folder}/")))
+            .collect();
+        directories.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        for path in directories {
+            // Ignored on purpose: a directory that is not empty is one holding
+            // something Memory does not know about, and leaving it is the point.
+            let _ = std::fs::remove_dir(self.project.join(&path));
+        }
+
+        Ok(removed)
+    }
+
+    /// File one record in another folder.
+    ///
+    /// Two things happen or one, depending on where the record keeps its body,
+    /// and the caller says neither: it names a record and a folder, and where
+    /// the content lives is the project's own declaration.
+    ///
+    /// A record that carries its body has a folder that is metadata, so the
+    /// move is that one field. A record whose body is a repository file has a
+    /// folder that *is* the directory of that file — one fact, one place — so
+    /// the file moves and the record follows it. Moving only the field would
+    /// leave the two disagreeing, which is the state this operation exists to
+    /// make unreachable.
+    ///
+    /// **The document first, the record second**, the same order writing and
+    /// deleting use and for the same reason: an interruption between the two
+    /// has to leave something a scan can read. A file moved without its record
+    /// is exactly what a person renaming a directory in Finder leaves behind,
+    /// and the next scan settles it. The other order leaves a record pointing
+    /// at a path with nothing at it, and the scan hands the file at the old
+    /// path back as a *new* record — the move undone, under a new key, with
+    /// none of the links.
+    ///
+    /// A file-backed document may only move **within its type's storage**. The
+    /// folder is what makes a file a document of that type, so a move out of it
+    /// is not a move but a change of type with a file copy attached, and the
+    /// two should not wear one name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the record does not exist, when `folder`
+    /// is not a normalized repository-relative path, when the destination is
+    /// where the record already is, when a file-backed record is asked to
+    /// leave its storage, or when the move or the write fails.
+    pub fn move_document(
+        &self,
+        key: &str,
+        folder: &str,
+        transaction_id: &str,
+    ) -> Result<ApplyResult> {
+        if !folder.is_empty() {
+            memory_hub_core::validate_locator("folder", folder)
+                .map_err(|error| ServiceError::invalid_argument("folder", error.message.clone()))?;
+        }
+
+        let view = self.get_record(key, None)?;
+        let Some(StoredRecord::Plaintext { envelope }) = view.record else {
+            return Err(ServiceError::invalid_argument("key", "no such record"));
+        };
+        let mut envelope = *envelope;
+
+        // The root is the absence of a folder rather than a folder named by the
+        // empty string: that is how every other member of an envelope spells
+        // "filed nowhere", and storing `""` would make two spellings of it.
+        let destination = (!folder.is_empty()).then(|| folder.to_owned());
+        if envelope.folder == destination {
+            return Err(ServiceError::invalid_argument(
+                "folder",
+                "the record is already filed there",
+            ));
+        }
+
+        if let Some(reference) = envelope.content_ref.clone() {
+            let source = self.source_for_kind(&envelope.kind)?;
+            let name = reference
+                .path
+                .rsplit_once('/')
+                .map_or(reference.path.as_str(), |(_, name)| name);
+            let moved = match &destination {
+                Some(folder) => format!("{folder}/{name}"),
+                // A document cannot be filed at the repository root while its
+                // type's storage is a directory: the root is outside it. Said
+                // as the locator it would have, so the refusal below names the
+                // path rather than the absence of one.
+                None => name.to_owned(),
+            };
+
+            source.relocate(&reference.path, &moved)?;
+            envelope.content_ref = Some(ContentRef {
+                path: moved.clone(),
+                ..reference.clone()
+            });
+            envelope.folder = destination;
+
+            let written = self.apply_transaction(
+                transaction_id,
+                view.revision,
+                vec![Operation::put(StoredRecord::Plaintext {
+                    envelope: Box::new(envelope),
+                })],
+            );
+            // **Put back what was moved**, when the write it was for did not
+            // happen. The file goes first so that an *interruption* leaves what
+            // renaming a directory in Finder leaves, which the next scan
+            // settles. A *refusal* is not that: the store answered, nothing is
+            // in flight, and a document that quietly changed folders because a
+            // write was turned down is a working tree nobody asked to edit.
+            if written.is_err() {
+                source.relocate(&moved, &reference.path)?;
+            }
+            return written;
+        }
+
+        envelope.folder = destination;
+        self.apply_transaction(
+            transaction_id,
+            view.revision,
+            vec![Operation::put(StoredRecord::Plaintext {
+                envelope: Box::new(envelope),
+            })],
+        )
     }
 
     /// Rename a folder of `refs`, moving every record filed under it at once.
@@ -1250,17 +1666,30 @@ impl MemoryService {
     /// the moment one of those writes fails, and the record that stands for
     /// the folder is one of the records that can be left behind.
     ///
-    /// Refused for a folder of an attached directory. Renaming there means
-    /// renaming a directory on disk — which a person does the ordinary way,
-    /// with Git watching — and the scan reads it back as what it is. Doing it
-    /// from here would either write into somebody else's folder or leave the
-    /// records disagreeing with the files.
+    /// One operation for both storages, and the caller does not say which it is
+    /// talking to. In the records it is `folder` rewritten on everything under
+    /// the path. In a directory it is the directory renamed *and* the same
+    /// rewrite, because those records' folders are their files' directories and
+    /// the two may not disagree.
+    ///
+    /// The directory is renamed first, for the reason every write here uses
+    /// that order: an interruption then leaves a moved directory with stale
+    /// records, which is what somebody renaming a folder in Finder leaves and
+    /// what the next scan settles. The other order leaves records pointing at
+    /// nothing while the files sit at the old path, and the scan hands those
+    /// back as new records.
+    ///
+    /// **The storage's own root is not renamed here.** A type's documents live
+    /// where its definition says, so moving that is a change to the type rather
+    /// than to a folder — `migrate_storage` is the operation, and it asks the
+    /// questions this one has no business asking.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError`] when either path is not a normalized
-    /// repository-relative folder, when the folder belongs to an attachment,
-    /// or when the store refuses the write.
+    /// repository-relative folder, when the rename would move a storage root,
+    /// when it would carry documents out of their storage, when something is
+    /// already at the destination, or when the store refuses the write.
     pub fn rename_folder(&self, from: &str, to: &str, transaction_id: &str) -> Result<ApplyResult> {
         for (field, value) in [("from", from), ("to", to)] {
             if value.is_empty() {
@@ -1278,21 +1707,76 @@ impl MemoryService {
                 "a rename to the same path is not a rename",
             ));
         }
+        let mut directory = None;
         for attachment in self.attachments()? {
-            // Either way round. Inside an attachment it is a directory on
-            // disk. Above one it *contains* a directory on disk, and renaming
-            // it in metadata alone would leave the records claiming a path the
-            // attachment root contradicts.
-            let inside =
-                from == attachment.folder || from.starts_with(&format!("{}/", attachment.folder));
-            let above = attachment.folder.starts_with(&format!("{from}/"));
-            if inside || above {
+            let below = format!("{}/", attachment.folder);
+            // A storage root, either way round. Renaming it *is* the folder the
+            // type declares; renaming something above it would move that root
+            // without the definition hearing about it.
+            if from == attachment.folder || attachment.folder.starts_with(&format!("{from}/")) {
                 return Err(ServiceError::invalid_argument(
                     "from",
-                    "a directory of the repository is at or under this folder: rename the \
-                     directory itself and the next scan will follow it",
+                    "this folder is where a type keeps its documents: moving it is \
+                     `migrate_storage`, not a rename",
                 ));
             }
+            if from.starts_with(&below) {
+                // Out of the storage is not a rename. The folder is what makes
+                // these files documents of their type, and carrying them out of
+                // it would quietly unmake that.
+                if !to.starts_with(&below) {
+                    return Err(ServiceError::invalid_argument(
+                        "to",
+                        format!(
+                            "that folder is not inside `{}`, which is where these documents live",
+                            attachment.folder
+                        ),
+                    ));
+                }
+                directory = Some(attachment);
+                break;
+            }
+        }
+
+        // The directory first, and only then the records — see the note above.
+        //
+        // **Only if there is one.** A folder inside an attached directory can
+        // exist in the records alone: a decision filed next to the documents
+        // puts `docs/guides` in the corpus without anybody creating the
+        // directory, and Git keeps no empty ones, so a fresh clone has the
+        // records and not the folder. Renaming is still exactly what was asked
+        // for there — it is the records that carry it — and refusing because
+        // the filesystem has nothing to move would make a folder unrenamable
+        // on the machine that has least of it.
+        if directory.is_some() && self.project.join(from).exists() {
+            let source = self.project.join(from);
+            let destination = self.project.join(to);
+            if destination.exists() {
+                return Err(ServiceError::invalid_argument(
+                    "to",
+                    "something is already at that path",
+                ));
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    ServiceError::new(
+                        "repository",
+                        format!("could not create {}: {error}", parent.display()),
+                        serde_json::json!({"to": to}),
+                    )
+                })?;
+            }
+            std::fs::rename(&source, &destination).map_err(|error| {
+                ServiceError::new(
+                    "repository",
+                    format!(
+                        "could not move {} to {}: {error}",
+                        source.display(),
+                        destination.display()
+                    ),
+                    serde_json::json!({"from": from, "to": to}),
+                )
+            })?;
         }
 
         let (revision, envelopes) = self.corpus(None)?;
@@ -1301,6 +1785,17 @@ impl MemoryService {
             .filter_map(|(_, mut envelope)| {
                 let moved = renamed_folder(envelope.folder.as_deref()?, from, to)?;
                 envelope.folder = Some(moved);
+                // A record whose body is a file has just had that file moved
+                // under it. The locator follows; the key does not, so no link
+                // breaks.
+                if let Some(reference) = &envelope.content_ref
+                    && let Some(relocated) = renamed_folder(&reference.path, from, to)
+                {
+                    envelope.content_ref = Some(ContentRef {
+                        path: relocated,
+                        ..reference.clone()
+                    });
+                }
                 Some(Operation::put(StoredRecord::Plaintext {
                     envelope: Box::new(envelope),
                 }))
@@ -1725,6 +2220,34 @@ impl MemoryService {
 
     /// Load the `__type__` corpus.
     ///
+    /// Where one type keeps its documents, refusing a type there is none of.
+    ///
+    /// [`SchemaRegistry::storage_for`] answers `WithRecords` for a kind it has
+    /// never heard of, which is right where it is used — a corpus with no
+    /// schema validates nothing, on purpose — and wrong for an operation naming
+    /// a type. A folder made under a misspelt kind would be a folder nothing
+    /// can ever be filed in, reported as success.
+    ///
+    /// A corpus holding no types at all is left alone, for the same reason
+    /// validation leaves it alone: there is no schema to contradict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] with kind `invalid_argument` when the project
+    /// holds types and this is not one of them.
+    fn storage_of_kind(&self, kind: &str) -> Result<TypeStorage> {
+        let registry = self.schema_registry()?;
+        if !registry.is_empty() && kind != TYPE_KIND && registry.get(kind).is_none() {
+            return Err(ServiceError::invalid_argument(
+                "kind",
+                format!("`{kind}` is not a type this project holds"),
+            ));
+        }
+        registry
+            .storage_for(kind)
+            .map_err(|error| ServiceError::invalid_argument("kind", error.message))
+    }
+
     /// # Errors
     ///
     /// Returns [`ServiceError`] when the registry cannot be read.
@@ -1938,6 +2461,43 @@ impl MemoryService {
         memory_hub_store::fetch_and_merge(&store, &remote).map_err(ServiceError::store)
     }
 
+    /// Put memory back where it stood, undoing what has happened since.
+    ///
+    /// What a fetch is undone with. A merge is an ordinary commit on top of
+    /// what was here, so going back is naming the revision that was here — and
+    /// [`FetchResult::local_revision_before`] is where a caller gets it.
+    ///
+    /// **Backwards along its own history, and nowhere else.** The target has to
+    /// be an ancestor of the current tip: a revision off to one side is not a
+    /// state this memory was ever in. Nothing is destroyed either way — the
+    /// commits after it stay in the repository, so this is recoverable by the
+    /// same operation in the other direction.
+    ///
+    /// **Only while nothing has happened since.** `expected` is where memory
+    /// should still stand — the revision the fetch produced — and a tip that has
+    /// moved past it means somebody has written, so the undo is refused rather
+    /// than carrying their record away with the merge.
+    ///
+    /// It moves this clone alone. A revision already pushed is still on the
+    /// remote, and the next fetch brings it back; undoing something published
+    /// is a conversation with the people it was published to, not an operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the records do not live in Git, when the
+    /// revision is not one this memory passed through, or when the ref cannot
+    /// be moved.
+    pub fn rewind(&self, revision: &str, expected: &str) -> Result<Revision> {
+        let store = self.git_store()?;
+        memory_hub_store::rewind_to(
+            store.git_dir(),
+            &Revision::new(revision),
+            &Revision::new(expected),
+        )
+        .map_err(ServiceError::store)?;
+        self.current_revision()
+    }
+
     /// Push memory refs to the remote, subject to the stale-record policy.
     ///
     /// # Errors
@@ -1980,7 +2540,6 @@ impl MemoryService {
                 )
             })
     }
-
 }
 
 /// One record as of a revision.

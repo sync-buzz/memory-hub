@@ -123,8 +123,30 @@ impl SchemaRegistry {
         envelope: &Envelope,
         strict: bool,
     ) -> Result<(), ValidationError> {
+        self.validate_record_shallow(envelope, strict, true)
+    }
+
+    /// Validate a record, optionally without the fields its type declares.
+    ///
+    /// `fields` is false for a record that is not a document of its kind — the
+    /// one carrying `is_folder`, which is the folder its type's documents are
+    /// filed in rather than one of them. The kind still has to exist, and the
+    /// envelope is still checked; what is skipped is the product fields, which
+    /// describe documents and have nothing to say about a folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] on the same terms as
+    /// [`validate_record`](Self::validate_record).
+    pub fn validate_record_shallow(
+        &self,
+        envelope: &Envelope,
+        strict: bool,
+        fields: bool,
+    ) -> Result<(), ValidationError> {
         match self.get(&envelope.kind) {
-            Some(definition) => definition.validate(envelope),
+            Some(definition) if fields => definition.validate(envelope),
+            Some(definition) => definition.validate_envelope(envelope),
             None if strict => Err(ValidationError::with_data(
                 ValidationErrorKind::UnknownKind,
                 "kind",

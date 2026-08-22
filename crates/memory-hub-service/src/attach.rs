@@ -193,6 +193,26 @@ pub trait DocumentSource {
     /// not write, and `repository` when the removal itself fails.
     fn remove(&self, locator: &str) -> Result<(), ServiceError>;
 
+    /// Move a document from one locator to another, keeping its bytes.
+    ///
+    /// Its own operation rather than a read, a write and a removal, and for
+    /// two reasons. A document is whatever the folder holds — a diagram, a PDF
+    /// — and the read that answers text would return nothing for most of them;
+    /// rewriting the bytes to move a file is also work proportional to the
+    /// document when the filesystem can do it in one step.
+    ///
+    /// **Nothing is overwritten.** A destination that is already occupied is
+    /// refused, because the two documents are two records and the move would
+    /// silently take one of them with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] with kind `unsupported` when the source does
+    /// not write, `invalid_argument` when either locator is outside this
+    /// storage or the destination is taken, and `repository` when the move
+    /// itself fails.
+    fn relocate(&self, from: &str, to: &str) -> Result<(), ServiceError>;
+
     /// The folders the source has, whether or not anything Memory knows about
     /// is in them. Repository-relative and ordered, the attachment's own root
     /// among them: a record filed directly in `docs/` is in a folder like any
@@ -396,6 +416,61 @@ impl DocumentSource for FolderSource<'_> {
         // empty directories, so an empty one is a fact about this working tree
         // and nothing anybody clones; removing it would also, for the last
         // document in an attachment, delete the folder somebody attached.
+    }
+
+    fn relocate(&self, from: &str, to: &str) -> Result<(), ServiceError> {
+        for locator in [from, to] {
+            if !self.attachment.covers(locator) {
+                return Err(ServiceError::new(
+                    "invalid_argument",
+                    "that locator is not inside this storage",
+                    serde_json::json!({
+                        "locator": locator,
+                        "folder": self.attachment.folder,
+                    }),
+                ));
+            }
+        }
+
+        let source = self.project.join(from);
+        let destination = self.project.join(to);
+
+        // Asked before the move rather than relied on afterwards: `rename`
+        // replaces an existing file on Unix without a word, and the file it
+        // would replace is another record's document.
+        if destination.exists() {
+            return Err(ServiceError::new(
+                "invalid_argument",
+                "a document is already at that locator",
+                serde_json::json!({"locator": to}),
+            ));
+        }
+
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ServiceError::new(
+                    "repository",
+                    format!("could not create {}: {error}", parent.display()),
+                    serde_json::json!({"locator": to}),
+                )
+            })?;
+        }
+
+        std::fs::rename(&source, &destination).map_err(|error| {
+            ServiceError::new(
+                "repository",
+                format!(
+                    "could not move {} to {}: {error}",
+                    source.display(),
+                    destination.display()
+                ),
+                serde_json::json!({"from": from, "to": to}),
+            )
+        })
+        // The directory it came from is left alone for the same reason
+        // `remove` leaves it: Git keeps no empty directories, and the last
+        // document out of an attachment root must not take the attachment
+        // with it.
     }
 
     fn list(&self) -> Result<Vec<SourceDocument>, ServiceError> {

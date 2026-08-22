@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use memory_hub_core::StoredRecord;
 use memory_hub_engine::{
-    ApplyResult, Capabilities, Capability, HistoryStore, Ownership, PortableStore,
-    RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreError, Transaction,
+    ApplyResult, Capabilities, Capability, HistoryStore, Ownership, PortableStore, RecordChange,
+    RecordId, RecordStore, Revision, StoreDescription, StoreError, Transaction,
 };
 
 use crate::GitStore;

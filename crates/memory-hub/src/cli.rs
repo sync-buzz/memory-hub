@@ -46,7 +46,10 @@ enum RecordsIn {
 /// else. Derived rather than defaulted, because the answer has to be the same
 /// every time the same project is opened: a fixed default would have `mcp` in a
 /// repository reading a folder that `reconcile` never wrote.
-fn records_in(project: &std::path::Path, records: Option<RecordsIn>) -> memory_hub_service::RecordsIn {
+fn records_in(
+    project: &std::path::Path,
+    records: Option<RecordsIn>,
+) -> memory_hub_service::RecordsIn {
     let chosen = records.unwrap_or_else(|| {
         if GitStore::discover_git_dir(project).is_ok() {
             RecordsIn::GitMetadata

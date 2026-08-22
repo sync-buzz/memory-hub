@@ -206,4 +206,3 @@ fn a_migration_keeps_the_media_type_true() -> TestResult {
     );
     Ok(())
 }
-

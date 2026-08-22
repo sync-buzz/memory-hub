@@ -169,10 +169,23 @@ Three consequences worth stating plainly:
   anything else is filed there, and stops existing when nothing is, by the same
   rule as any other folder.
 
-In an attached documentation folder, the record that is the folder is usually a
-file that is already there: `docs/guides/api/README.md`. Marking it costs
-nothing and it moves with its directory like any other document. A folder
-description that must not depend on the branch goes in `refs` instead.
+**It is not one of that type's documents, and three rules follow from saying
+so.** It carries its own text even where the type's documents are files — a
+folder is described without a file appearing in anybody's repository, which is
+what attaching a folder promises. It is left out of `memory_list_records` and
+its counts, the way a type definition is, because it is what the folder says
+rather than something filed in it; `include_folders` puts it back for the tools
+that maintain folders. And the product fields the type declares are not asked of
+it: they describe documents, and a type with a required field would otherwise
+make its own folders undescribable.
+
+Search is the exception, and deliberately: its text is indexed and found like
+any other, because a description nobody can find is a description nobody wrote.
+
+Nothing stops a folder from being described by a file instead — marking an
+existing `docs/guides/api/README.md` works and it moves with its directory like
+any other document. That is a choice somebody makes about their repository, not
+something Memory does on their behalf.
 
 ### Listing folders
 
@@ -204,16 +217,61 @@ directories, so an empty `docs/api/` is a fact about one working tree and is
 simply absent from a fresh clone. A remembered list would raise, on one machine,
 a folder that does not exist on another.
 
+### Making a folder
+
+```json
+{ "folder": "docs/guides", "kind": "doc", "transaction_id": "make-1" }
+```
+
+`memory_create_folder` makes a folder nothing is in yet. One operation for both
+storages, and the caller does not say which it is talking to — what a folder
+*is* differs underneath and must not differ above, or every client reimplements
+the difference, differently.
+
+For a type whose documents are files it creates the directory and writes no
+record: a directory is not something the corpus holds. For a type whose
+documents are its records it writes the record that carries `is_folder` — which
+*is* the folder it is filed in — titled with the folder's own last segment and
+left with no body. Both are ordinary afterwards: the record is a document
+somebody can write in, and the directory is a directory.
+
+The folder has to be inside the storage of the type that is named. A directory
+made beside somebody's attached folder would be Memory deciding where their
+repository keeps things.
+
+**One difference survives and cannot be removed.** Git keeps no empty
+directories, so a folder made in an attached directory is a fact about that
+working tree until something is filed in it, while one made in the records
+travels immediately. Closing that would mean writing a marker into somebody's
+repository, which is the one thing attaching a folder promises not to do.
+
+### Deleting a folder
+
+```json
+{ "folder": "docs/guides", "transaction_id": "forget-1" }
+```
+
+`memory_delete_folder` takes a folder and everything filed under it, at any
+depth and **whatever its type**. A folder exists while something is in it, so
+sparing another type's records would empty the folder rather than delete it —
+which is not what anybody asking for this meant. It answers with how many
+records went, so a client that named a number before asking can check it against
+what happened.
+
+Records go in one transaction, and a record whose body is a repository file
+takes that file with it, as any deletion does.
+
+**Directories are then removed only while they are empty**, and never
+recursively. A folder may hold a file no scan has reached — written a moment
+ago, or outside the corpus for a reason of its own — and taking it along with
+the records Memory knew about would be destroying something it was never asked
+about. What is left standing is a directory with something in it, which is the
+honest outcome and visible in the file tree.
+
+Refused for a type's own storage root: removing that is `memory_delete_type`,
+which takes the definition and its records and leaves every file where it is.
+
 ### Renaming a folder
-
-In an attached folder, rename the directory. Git records it, the scan reads it
-as every document in it moving at once, and the record that is the folder moves
-with them. Records filed there by metadata alone — a decision next to the
-documents — are carried along too, so long as the moves agree on one pair of
-paths; when they do not, nothing is touched and `memory_doctor` reports it,
-because a guess about somebody's directory is worse than a question.
-
-In `refs` there is no directory to rename, so there is an operation:
 
 ```json
 { "from": "decisions/storage", "to": "decisions/persistence",
@@ -222,8 +280,61 @@ In `refs` there is no directory to rename, so there is an operation:
 
 `memory_rename_folder` rewrites `folder` on every record under `from` in one
 transaction. One, because N of them leave the folder half-renamed the moment
-one fails. It is refused for a directory of an attached folder: renaming there
-means renaming the directory, which a person does the ordinary way.
+one fails.
+
+Where the documents are files the directory is renamed too, first, and the
+locators follow it in the same rewrite — the keys do not, so no link breaks.
+The directory moves before the records for the reason every write here uses
+that order: an interruption then leaves what somebody renaming a folder in
+Finder leaves, which the next scan settles, rather than records pointing at
+nothing while the files sit at the old path.
+
+Renaming the directory in Finder still works and always did: the scan reads it
+as every document in it moving at once, and carries the records filed there by
+metadata alone — a decision next to the documents — so long as the moves agree
+on one pair of paths. When they do not, nothing is touched and `memory_doctor`
+reports it, because a guess about somebody's directory is worse than a question.
+
+**A type's own storage root is not renamed here.** A type's documents live where
+its definition says, so moving that is a change to the type: `memory_migrate_storage`
+is the operation, and it asks the questions this one has no business asking.
+
+### Moving one record
+
+Renaming a folder moves everything in it. Moving one record out of it is the
+other operation, and the caller says the same thing either way:
+
+```json
+{ "key": "d-storage", "folder": "decisions/persistence",
+  "transaction_id": "move-1" }
+```
+
+`memory_move_document` files one record somewhere else. `""` is the root.
+
+What happens underneath depends on where that record keeps its body, and the
+caller does not say which — where content lives is the project's own
+declaration, never a parameter of the operation. A record carrying its own body
+has a folder that is metadata, so the move is that one field. A record whose
+body is a repository file has a folder that *is* the directory of that file, so
+the file moves and the record follows it. Moving only the field would leave the
+two disagreeing, which is the state this operation exists to make unreachable.
+
+**The document first, the record second**, the order writing and deleting also
+use. An interruption between the two has to leave something the scan can read: a
+file moved without its record is exactly what somebody renaming a directory in
+Finder leaves behind, and the next scan settles it. The other order leaves a
+record pointing at nothing while the file sits at the old path, which the scan
+hands back as a *new* record — the move undone, under a new key, with none of
+the links.
+
+Two refusals, both because the alternative is silent damage. A file-backed
+document may only move **within its type's storage**: the folder is what makes
+the file a document of that type, so leaving it is not a move but a change of
+type with a file copy attached, and the two should not wear one name. And
+nothing is overwritten — a destination already holding a document of that name
+is refused, because that document is another record. The record that is a folder
+is refused on its own terms as well: it arrives in a folder that may already
+have one, and two of them is the question with no answer from further up.
 
 ## Branches
 

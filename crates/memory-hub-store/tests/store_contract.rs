@@ -5,8 +5,7 @@ use std::thread;
 use git2::{Repository, Signature};
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_store::{
-    ChangeKind, GitStore, MAIN_REF, Operation, RecordId, Revision, StoreErrorKind,
-    Transaction,
+    ChangeKind, GitStore, MAIN_REF, Operation, RecordId, Revision, StoreErrorKind, Transaction,
 };
 
 fn repository() -> Result<(tempfile::TempDir, GitStore), Box<dyn std::error::Error>> {
@@ -95,7 +94,12 @@ fn atomic_batch_preserves_old_snapshot_and_code_state() -> Result<(), Box<dyn st
         store.snapshot(&unrelated).err().map(|error| error.kind),
         Some(StoreErrorKind::RevisionNotFound)
     );
-    git.reference(MAIN_REF, unrelated_tree, true, "test: corrupt the memory ref")?;
+    git.reference(
+        MAIN_REF,
+        unrelated_tree,
+        true,
+        "test: corrupt the memory ref",
+    )?;
     assert_eq!(
         store.current().err().map(|error| error.kind),
         Some(StoreErrorKind::RevisionNotFound)
@@ -269,8 +273,7 @@ fn retry_is_idempotent_and_reuse_with_other_input_is_rejected()
 }
 
 #[test]
-fn diff_and_export_import_are_stable() -> Result<(), Box<dyn std::error::Error>>
-{
+fn diff_and_export_import_are_stable() -> Result<(), Box<dyn std::error::Error>> {
     let (_directory, store) = repository()?;
     let empty = store.current()?.revision().clone();
     let first = store.apply(&transaction(

@@ -373,7 +373,6 @@ fn get_record(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure
     Ok(json!({"revision": revision, "record": snapshot.records.get(key)}))
 }
 
-
 fn diff(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
     let from_revision = required_string(arguments, "from_revision")?;
     let to_revision = required_string(arguments, "to_revision")?;

@@ -543,6 +543,17 @@ fn existing_records_not_revalidated_on_type_update() {
 // Cross-type relationship validation in registry
 // ---------------------------------------------------------------------------
 
+/// A type pointing at a kind nothing defines is refused **as it is written**.
+///
+/// It used to be written successfully and to poison the corpus instead: the
+/// registry was built from the previous revision, so nothing checked the
+/// definition arriving, and every *later* transaction failed while building a
+/// registry that now included it. The failure named a type the caller had not
+/// touched, in a write that had nothing to do with it.
+///
+/// Refusing it here is the same rule stated at the moment it can still be
+/// acted on, and it falls out of validating a transaction against the state it
+/// produces rather than the one before it.
 #[test]
 fn type_with_dangling_relationship_target_rejected() {
     let (_dir, store) = setup();
@@ -554,17 +565,8 @@ fn type_with_dangling_relationship_target_rejected() {
       }
     }"#;
     let record = type_record("orphan", bad_content);
-    // The type definition itself passes validate_self (target is non-empty),
-    // but the registry construction rejects it because "nonexistent_kind" is
-    // not defined. Since the registry is built from the PREVIOUS revision
-    // (which has no types), the registry is empty and validation is skipped.
-    // The type record is written successfully.
-    apply(&store, "tx-orphan", vec![Operation::put(record)]).unwrap();
 
-    // Now the NEXT transaction will try to build a registry from the revision
-    // that contains the orphan type — this should fail.
-    let record2 = envelope("any/1", "any_kind", "content", Some("T"), json!({}));
-    let error = apply(&store, "tx-after-orphan", vec![Operation::put(record2)]).unwrap_err();
+    let error = apply(&store, "tx-orphan", vec![Operation::put(record)]).unwrap_err();
     assert_eq!(error.kind, StoreErrorKind::InvalidRecord);
     assert!(
         error.data["reason"]
@@ -572,6 +574,10 @@ fn type_with_dangling_relationship_target_rejected() {
             .unwrap()
             .contains("nonexistent_kind")
     );
+
+    // And the corpus is untouched, so the next write is about its own subject.
+    let after = envelope("any/1", "any_kind", "content", Some("T"), json!({}));
+    apply(&store, "tx-after-orphan", vec![Operation::put(after)]).unwrap();
 }
 
 // ---------------------------------------------------------------------------

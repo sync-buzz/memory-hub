@@ -9,8 +9,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use memory_hub_core::{FreshnessState, PolicyMode, PolicyResolver, StoredRecord};
+use memory_hub_core::{
+    ContentRef, Envelope, FreshnessState, PolicyMode, PolicyResolver, Presence, StoredRecord,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::GitStoreError;
 use crate::types::GitRevision;
@@ -41,7 +44,53 @@ pub struct FetchResult {
     pub remote_revision: Revision,
     pub fast_forward: bool,
     pub merged: bool,
+    /// What could not be reconciled at all.
+    ///
+    /// **Always empty as things stand.** Every same-key difference is now
+    /// merged against the common ancestor, and the one that collides is
+    /// resolved rather than handed back. The field stays because it is part of
+    /// the shape published to clients, and because a storage kind whose records
+    /// are not text would have nothing to merge line by line.
     pub conflicts: Vec<ConflictEntry>,
+    /// The records where both sides had moved the same thing, and this side's
+    /// version was kept.
+    ///
+    /// Reported rather than absorbed. Nothing is lost — the other version is
+    /// still a commit in the history — but somebody has to be told that their
+    /// colleague's sentence is not the one in front of them.
+    #[serde(default)]
+    pub overlaps: Vec<Overlap>,
+}
+
+/// One record both sides moved, and what of theirs is not in the answer.
+///
+/// Named rather than counted, because "a record was merged over" is not
+/// something anybody can act on. Knowing it was the title tells a person where
+/// to look; knowing it was the body tells them to read it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Overlap {
+    pub key: String,
+    /// The same lines of the body were rewritten on both sides.
+    #[serde(default)]
+    pub body: bool,
+    /// Members of the envelope both sides moved: `title`, `folder`, a product
+    /// field's own name. Empty when only the body collided.
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+impl Overlap {
+    fn of(key: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this record cost nobody anything, and so is not worth reporting.
+    fn is_quiet(&self) -> bool {
+        !self.body && self.fields.is_empty()
+    }
 }
 
 /// A same-key conflict discovered during merge.
@@ -315,10 +364,7 @@ pub fn read_known_remote_revision(git_dir: &Path) -> Result<Option<Revision>, St
 /// # Errors
 ///
 /// Returns [`StoreError`] if the configuration cannot be written.
-pub fn record_known_remote_revision(
-    git_dir: &Path,
-    revision: &Revision,
-) -> Result<(), StoreError> {
+pub fn record_known_remote_revision(git_dir: &Path, revision: &Revision) -> Result<(), StoreError> {
     let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
     let mut config = repo
         .config()
@@ -428,8 +474,7 @@ fn contains_revision(
     tip: &Revision,
     local: &Revision,
 ) -> Result<bool, StoreError> {
-    let repo =
-        Repository::open(store.git_dir()).map_err(|e| StoreError::repository("open", e))?;
+    let repo = Repository::open(store.git_dir()).map_err(|e| StoreError::repository("open", e))?;
     let (Ok(tip_oid), Ok(local_oid)) = (tip.oid(), local.oid()) else {
         return Ok(false);
     };
@@ -702,14 +747,86 @@ pub fn cleanup_temp_ref_pub(git_dir: &Path) -> Result<(), StoreError> {
 pub fn fast_forward_to(git_dir: &Path, remote_revision: &Revision) -> Result<(), StoreError> {
     let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
     let remote_oid = remote_revision.oid()?;
-    repo.reference(
-        MAIN_REF,
-        remote_oid,
-        true,
-        "memory-hub: fetch fast-forward",
-    )
-    .map_err(|e| StoreError::repository("fast-forward staged ref", e))?;
+    repo.reference(MAIN_REF, remote_oid, true, "memory-hub: fetch fast-forward")
+        .map_err(|e| StoreError::repository("fast-forward memory ref", e))?;
     Ok(())
+}
+
+/// Put memory back where it stood, undoing what has happened since.
+///
+/// **Backwards along its own history, and nowhere else.** The target has to be
+/// an ancestor of the current tip, which is what makes this an undo rather than
+/// a way to set the ref at anything: a revision off to one side is not a state
+/// this memory was ever in, and arriving at one would be a corpus nobody wrote.
+///
+/// Nothing is destroyed. The commits after the target stay in the repository
+/// and stay reachable by their own revisions — this moves a ref, which is all
+/// that "where memory stands" ever was. What it undoes is therefore recoverable
+/// by the same operation in the other direction.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the repository cannot be read, when the target
+/// is not an ancestor of the current tip, or when the ref update fails.
+pub fn rewind_to(
+    git_dir: &Path,
+    revision: &Revision,
+    expected: &Revision,
+) -> Result<(), StoreError> {
+    let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
+    let target = revision.oid()?;
+    let tip = reference_target(&repo, MAIN_REF)?.ok_or_else(|| {
+        StoreError::new(
+            StoreErrorKind::InvalidArgument,
+            "this project's memory has no history to go back through",
+            serde_json::json!({}),
+        )
+    })?;
+
+    // **Only while memory still stands where the caller thinks it does.** An
+    // undo names the state to return to, and what makes that safe is that
+    // nothing has happened since — a record written after the fetch is not part
+    // of what the fetch did, and going back would take it along without anybody
+    // asking. The same compare-and-swap every write here uses, for the same
+    // reason.
+    if tip != expected.oid()? {
+        return Err(StoreError::new(
+            StoreErrorKind::Conflict,
+            "memory has moved since: something was written after what you are undoing",
+            serde_json::json!({
+                "expected": expected.to_string(),
+                "current": tip.to_string(),
+            }),
+        ));
+    }
+
+    if target != tip
+        && !repo
+            .graph_descendant_of(tip, target)
+            .map_err(|e| StoreError::repository("check ancestor", e))?
+    {
+        return Err(StoreError::new(
+            StoreErrorKind::InvalidArgument,
+            "that revision is not one this memory passed through",
+            serde_json::json!({
+                "revision": revision.to_string(),
+                "current": tip.to_string(),
+            }),
+        ));
+    }
+
+    repo.reference(MAIN_REF, target, true, "memory-hub: rewind")
+        .map_err(|e| StoreError::repository("rewind memory ref", e))?;
+    Ok(())
+}
+
+/// The commit a ref points at, or `None` when the ref is not there.
+fn reference_target(repo: &Repository, name: &str) -> Result<Option<git2::Oid>, StoreError> {
+    match repo.find_reference(name) {
+        Ok(reference) => Ok(reference.target()),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(StoreError::repository("find reference", e)),
+    }
 }
 
 /// Check whether a fast-forward is possible from local to remote.
@@ -775,10 +892,7 @@ impl TempRefGuard<'_> {
 ///
 /// Returns [`StoreError`] with kind `TransportFailed`, `AuthenticationFailed`,
 /// `NamespaceRejected`, `FastForwardRequired`, or `Diverged`.
-pub fn fetch_and_merge(
-    store: &GitStore,
-    remote: &MemoryRemote,
-) -> Result<FetchResult, StoreError> {
+pub fn fetch_and_merge(store: &GitStore, remote: &MemoryRemote) -> Result<FetchResult, StoreError> {
     let result = merge_from_remote(store, remote)?;
     // Recorded here rather than at each of the five ways the merge can end,
     // every one of which has learned the same thing: this is what the remote
@@ -788,10 +902,7 @@ pub fn fetch_and_merge(
     Ok(result)
 }
 
-fn merge_from_remote(
-    store: &GitStore,
-    remote: &MemoryRemote,
-) -> Result<FetchResult, StoreError> {
+fn merge_from_remote(store: &GitStore, remote: &MemoryRemote) -> Result<FetchResult, StoreError> {
     let git_dir = store.git_dir();
     let local_before = store.current()?.revision().clone();
 
@@ -836,6 +947,7 @@ fn merge_from_remote(
             fast_forward: true,
             merged: false,
             conflicts: Vec::new(),
+            overlaps: Vec::new(),
         });
     }
 
@@ -845,13 +957,8 @@ fn merge_from_remote(
 
     if is_ff {
         // Fast-forward: remote is ahead of local.
-        repo.reference(
-            MAIN_REF,
-            remote_oid,
-            true,
-            "memory-hub: fetch fast-forward",
-        )
-        .map_err(|e| StoreError::repository("fast-forward staged ref", e))?;
+        repo.reference(MAIN_REF, remote_oid, true, "memory-hub: fetch fast-forward")
+            .map_err(|e| StoreError::repository("fast-forward memory ref", e))?;
         guard.disarm();
         cleanup_temp_ref(&repo)?;
         Ok(FetchResult {
@@ -861,6 +968,7 @@ fn merge_from_remote(
             fast_forward: true,
             merged: false,
             conflicts: Vec::new(),
+            overlaps: Vec::new(),
         })
     } else {
         // Not a fast-forward. Check if local is empty (genesis only, no records).
@@ -873,7 +981,7 @@ fn merge_from_remote(
                 true,
                 "memory-hub: fetch fast-forward from empty",
             )
-            .map_err(|e| StoreError::repository("fast-forward staged ref", e))?;
+            .map_err(|e| StoreError::repository("fast-forward memory ref", e))?;
             guard.disarm();
             cleanup_temp_ref(&repo)?;
             return Ok(FetchResult {
@@ -883,6 +991,7 @@ fn merge_from_remote(
                 fast_forward: true,
                 merged: false,
                 conflicts: Vec::new(),
+                overlaps: Vec::new(),
             });
         }
         // Diverged with actual local data: perform record-level merge.
@@ -1191,8 +1300,17 @@ fn merge_records(
     let all_keys: BTreeSet<&RecordId> =
         local_map.keys().chain(remote_map.keys()).copied().collect();
 
+    // What both sides had before they diverged. Absent only when the two
+    // histories share no commit at all, which a memory that has ever been
+    // exchanged does not — and where it is absent, every same-key difference
+    // is a record two people wrote independently, which the merge below treats
+    // as an empty common ancestor rather than refusing.
+    let base_records = merge_base_records(store, local_revision, remote_revision)?;
+    let base_map: BTreeMap<&RecordId, &StoredRecord> =
+        base_records.iter().map(|(id, r)| (id, r)).collect();
+
     let mut operations = Vec::new();
-    let mut conflicts = Vec::new();
+    let mut overlaps: Vec<Overlap> = Vec::new();
 
     for key in &all_keys {
         let local = local_map.get(key);
@@ -1203,12 +1321,19 @@ fn merge_records(
                 if records_equal(local, remote) {
                     continue;
                 }
-                // Same-key conflict — collect both content hashes.
-                conflicts.push(ConflictEntry {
-                    key: key.display_value(),
-                    local_content_hash: content_hash_of(local),
-                    remote_content_hash: content_hash_of(remote),
-                });
+                // Both sides moved. What was common to them is the third point
+                // a merge needs, and it is what turns most of these from a
+                // conflict into an ordinary join where nobody loses anything.
+                let base = base_map.get(key).copied();
+                match reconcile(base, local, remote)? {
+                    Reconciled::Unchanged => {}
+                    Reconciled::Merged { record, overlap } => {
+                        if !overlap.is_quiet() {
+                            overlaps.push(overlap);
+                        }
+                        operations.push(Operation::put(record));
+                    }
+                }
             }
             (Some(_) | None, None) => {
                 // Key exists only locally or neither — keep as-is / nothing to do.
@@ -1221,18 +1346,6 @@ fn merge_records(
         }
     }
 
-    if !conflicts.is_empty() {
-        // Return conflicts without merging — caller resolves.
-        return Ok(FetchResult {
-            local_revision_before: local_revision.clone(),
-            local_revision_after: local_revision.clone(),
-            remote_revision: remote_revision.clone(),
-            fast_forward: false,
-            merged: false,
-            conflicts,
-        });
-    }
-
     if operations.is_empty() {
         // No changes — identical content despite different commit history.
         return Ok(FetchResult {
@@ -1242,6 +1355,7 @@ fn merge_records(
             fast_forward: false,
             merged: true,
             conflicts: Vec::new(),
+            overlaps,
         });
     }
 
@@ -1259,7 +1373,386 @@ fn merge_records(
         fast_forward: false,
         merged: true,
         conflicts: Vec::new(),
+        overlaps,
     })
+}
+
+/// What both sides held before they diverged.
+///
+/// The third point a merge needs. Without it, "this record has a paragraph the
+/// other does not" has two readings — one side added it, or the other side
+/// removed it — and no way to choose between them; that ambiguity is the whole
+/// reason a two-way comparison can only report a conflict.
+///
+/// An empty answer is a valid one: two histories with no commit in common mean
+/// every shared key was written independently by two people, which merges as
+/// though from an empty ancestor.
+fn merge_base_records(
+    store: &GitStore,
+    local: &Revision,
+    remote: &Revision,
+) -> Result<Vec<(RecordId, StoredRecord)>, StoreError> {
+    let repo = Repository::open(store.git_dir()).map_err(|e| StoreError::repository("open", e))?;
+    let (Ok(local_oid), Ok(remote_oid)) = (local.oid(), remote.oid()) else {
+        return Ok(Vec::new());
+    };
+    let Ok(base) = repo.merge_base(local_oid, remote_oid) else {
+        return Ok(Vec::new());
+    };
+    store.read_records_unchecked(&Revision::from_oid(base))
+}
+
+/// What became of one record that both sides changed.
+///
+/// There is no "cannot be reconciled" here, and that is the point of the whole
+/// change: every same-key difference now becomes one record. What used to be a
+/// third answer is now the overlap this one carries — the merge happened, and
+/// somebody is owed the news of what a colleague wrote that is not in it.
+enum Reconciled {
+    /// The two differ in nothing that is kept, so there is nothing to write.
+    Unchanged,
+    /// A single record, and what the other side lost to it.
+    Merged {
+        record: StoredRecord,
+        overlap: Overlap,
+    },
+}
+
+/// Join one record's two versions, keeping this side only where they collide.
+///
+/// **Every member is asked the same three-way question**, because "this side
+/// wins" is a rule about disagreement and most differences are not one. A field
+/// this side never touched has exactly one change in it — theirs — and taking
+/// ours there would not be resolving a conflict but discarding a colleague's
+/// work that nothing here was contesting.
+///
+/// So, member by member: if ours still equals the common ancestor, only they
+/// moved and theirs is the answer; if theirs equals it, only we moved. Where
+/// both moved and disagree, *then* this side keeps its version — whoever is
+/// fetching is at the keyboard, can see the result and can put it right, while
+/// the other party is not here to be asked — and the member is named in the
+/// overlap so the decision is reported rather than absorbed.
+///
+/// The body is the same rule at a finer grain: merged line by line by Git, so a
+/// paragraph added here and a paragraph added there both survive, and only the
+/// same lines rewritten twice make a collision.
+///
+/// Sets — tags, links, the source paths — merge per member, and cannot collide:
+/// with two states to be in, a member the two sides disagree about is one that
+/// exactly one of them moved.
+fn reconcile(
+    base: Option<&StoredRecord>,
+    local: &StoredRecord,
+    remote: &StoredRecord,
+) -> Result<Reconciled, StoreError> {
+    let (StoredRecord::Plaintext { envelope: ours }, StoredRecord::Plaintext { envelope: theirs }) =
+        (local, remote);
+    // Absent when the two histories share no commit: every difference then
+    // reads as something both sides wrote independently, which is a collision
+    // by this rule and resolved as one.
+    let was: Option<&Envelope> = match base {
+        Some(StoredRecord::Plaintext { envelope }) => Some(envelope),
+        None => None,
+    };
+
+    let mut overlap = Overlap::of(&ours.key);
+    let mut merged = (**ours).clone();
+
+    // A record whose bytes are a file in the working tree does not merge them
+    // here: that file is merged by Git along with the branch it belongs to, and
+    // doing it a second time would be two answers to one question. Its digest
+    // is what the local scan resolved, so it stays local for the same reason.
+    if !ours.is_reference() && !theirs.is_reference() {
+        let (content, collided) = merge_bodies(
+            was.map_or("", |envelope| envelope.content.as_str()),
+            &ours.content,
+            &theirs.content,
+        )?;
+        merged.content = content;
+        merged.refresh_content_hash();
+        overlap.body = collided;
+    }
+
+    merged.kind = pick(
+        "kind",
+        was.map(|e| &e.kind),
+        &ours.kind,
+        &theirs.kind,
+        &mut overlap,
+    );
+    merged.title = pick(
+        "title",
+        was.map(|e| &e.title),
+        &ours.title,
+        &theirs.title,
+        &mut overlap,
+    );
+    merged.folder = pick(
+        "folder",
+        was.map(|e| &e.folder),
+        &ours.folder,
+        &theirs.folder,
+        &mut overlap,
+    );
+    merged.is_folder = pick(
+        "is_folder",
+        was.map(|e| &e.is_folder),
+        &ours.is_folder,
+        &theirs.is_folder,
+        &mut overlap,
+    );
+    merged.archive = pick(
+        "archive",
+        was.map(|e| &e.archive),
+        &ours.archive,
+        &theirs.archive,
+        &mut overlap,
+    );
+    merged.freshness = pick(
+        "freshness",
+        was.map(|e| &e.freshness),
+        &ours.freshness,
+        &theirs.freshness,
+        &mut overlap,
+    );
+    merged.media_type = pick(
+        "media_type",
+        was.map(|e| &e.media_type),
+        &ours.media_type,
+        &theirs.media_type,
+        &mut overlap,
+    );
+
+    merged.tags = merge_members(was.map(|e| e.tags.as_slice()), &ours.tags, &theirs.tags);
+    merged.links = merge_members(was.map(|e| e.links.as_slice()), &ours.links, &theirs.links);
+    merged.source_paths.scope = merge_members(
+        was.map(|e| e.source_paths.scope.as_slice()),
+        &ours.source_paths.scope,
+        &theirs.source_paths.scope,
+    );
+    merged.source_paths.observed = merge_members(
+        was.map(|e| e.source_paths.observed.as_slice()),
+        &ours.source_paths.observed,
+        &theirs.source_paths.observed,
+    );
+
+    // The product fields the record's type declares live here, flattened onto
+    // the envelope. They are the project's own data and merge like any other
+    // member, one key at a time.
+    merged.extensions = merge_keys(
+        was.map(|e| &e.extensions),
+        &ours.extensions,
+        &theirs.extensions,
+        &mut overlap,
+    );
+
+    merged.content_ref = merge_content_ref(
+        was.and_then(|e| e.content_ref.as_ref()),
+        ours.content_ref.as_ref(),
+        theirs.content_ref.as_ref(),
+        &mut overlap,
+    );
+
+    if merged == **ours && overlap.is_quiet() {
+        return Ok(Reconciled::Unchanged);
+    }
+    Ok(Reconciled::Merged {
+        record: StoredRecord::Plaintext {
+            envelope: Box::new(merged),
+        },
+        overlap,
+    })
+}
+
+/// One member, answered by which side actually moved it.
+///
+/// The whole of the rule in four lines, and it is deliberately not "ours wins":
+/// ours wins *the disagreement*, and a member only one side touched is not one.
+fn pick<T: Clone + PartialEq>(
+    member: &'static str,
+    was: Option<&T>,
+    ours: &T,
+    theirs: &T,
+    overlap: &mut Overlap,
+) -> T {
+    if ours == theirs {
+        return ours.clone();
+    }
+    match was {
+        // We are still where the ancestor left us, so the only change here is
+        // theirs and there is nothing to resolve.
+        Some(was) if was == ours => theirs.clone(),
+        // They never moved.
+        Some(was) if was == theirs => ours.clone(),
+        // Both moved, or there is no ancestor to tell. This is the collision,
+        // and it is the one place the fetcher's version wins.
+        _ => {
+            overlap.fields.push(member.to_owned());
+            ours.clone()
+        }
+    }
+}
+
+/// A set, merged by asking each member whether it was added or removed.
+///
+/// Order is this side's, with what they added appended: a set has no order to
+/// disagree about, and keeping ours stable means a fetch that changes nothing a
+/// person can see does not reorder their tags.
+///
+/// No collision is possible. A member is present or it is not, so if the two
+/// sides disagree about one, exactly one of them differs from the ancestor —
+/// and that one is the change.
+fn merge_members<T: Clone + PartialEq>(was: Option<&[T]>, ours: &[T], theirs: &[T]) -> Vec<T> {
+    let had = |member: &T| was.is_some_and(|was| was.contains(member));
+    let mut merged: Vec<T> = ours
+        .iter()
+        // Ours, minus what they removed: it was there before and is not there
+        // now on their side, so removing it is their change.
+        .filter(|member| theirs.contains(member) || !had(member))
+        .cloned()
+        .collect();
+    // Theirs, minus what we removed, and minus what we already have.
+    let added: Vec<T> = theirs
+        .iter()
+        .filter(|member| !merged.contains(member) && !had(member))
+        .cloned()
+        .collect();
+    merged.extend(added);
+    merged
+}
+
+/// A map, merged one key at a time by the same rule as any other member.
+fn merge_keys(
+    was: Option<&BTreeMap<String, Value>>,
+    ours: &BTreeMap<String, Value>,
+    theirs: &BTreeMap<String, Value>,
+    overlap: &mut Overlap,
+) -> BTreeMap<String, Value> {
+    let mut merged = BTreeMap::new();
+    let names: BTreeSet<&String> = ours.keys().chain(theirs.keys()).collect();
+    for name in names {
+        let chosen = pick_optional(
+            name,
+            was.and_then(|was| was.get(name)),
+            ours.get(name),
+            theirs.get(name),
+            overlap,
+        );
+        if let Some(value) = chosen {
+            merged.insert(name.clone(), value);
+        }
+    }
+    merged
+}
+
+/// [`pick`] where absence is one of the states a member can be in.
+///
+/// A field somebody removed and a field somebody added are the same question
+/// asked from opposite ends, so `None` takes part in the comparison rather than
+/// short-circuiting it.
+fn pick_optional<T: Clone + PartialEq>(
+    member: &str,
+    was: Option<&T>,
+    ours: Option<&T>,
+    theirs: Option<&T>,
+    overlap: &mut Overlap,
+) -> Option<T> {
+    if ours == theirs {
+        return ours.cloned();
+    }
+    match was {
+        Some(_) | None if was == ours => theirs.cloned(),
+        _ if was == theirs => ours.cloned(),
+        _ => {
+            overlap.fields.push(member.to_owned());
+            ours.cloned()
+        }
+    }
+}
+
+/// Where a record's bytes are, merged — and whether they are here, not.
+///
+/// **The locator travels.** It is a fact about the document that everybody
+/// shares: a colleague who moved a file moved it for the project, and a fetch
+/// that dropped that would leave this corpus pointing at a path their commit
+/// emptied. What the local scan then makes of it is the scan's business — it
+/// pairs a record with the file carrying its digest and files the locator back
+/// where this working tree keeps it, or asks, and until then `presence` says
+/// the document is not on this branch.
+///
+/// **`presence` does not travel**, and that is the one member held back. It is
+/// this working tree's answer to "is the file here", which is a different
+/// answer on every branch and on every machine; accepting theirs would import
+/// somebody else's checkout as a fact about ours.
+fn merge_content_ref(
+    was: Option<&ContentRef>,
+    ours: Option<&ContentRef>,
+    theirs: Option<&ContentRef>,
+    overlap: &mut Overlap,
+) -> Option<ContentRef> {
+    // Compared without it, so a record identical but for whose branch is
+    // checked out is not a difference at all.
+    let bare = |reference: &ContentRef| ContentRef {
+        presence: Presence::Present,
+        ..reference.clone()
+    };
+    let merged = pick_optional(
+        "content_ref",
+        was.map(bare).as_ref(),
+        ours.map(bare).as_ref(),
+        theirs.map(bare).as_ref(),
+        overlap,
+    );
+    merged.map(|reference| ContentRef {
+        presence: ours.map_or(Presence::Present, |ours| ours.presence),
+        ..reference
+    })
+}
+
+/// Three-way merge of one body, resolved in this side's favour where it must be.
+///
+/// Two passes in the colliding case, and the second is what makes the first
+/// worth doing: asked to resolve, libgit2 reports the result as automergeable
+/// whether or not anything collided, so the plain pass is the only way to learn
+/// that somebody's lines were dropped. The ordinary case costs one pass.
+fn merge_bodies(ancestor: &str, ours: &str, theirs: &str) -> Result<(String, bool), StoreError> {
+    let merged = merge_once(ancestor, ours, theirs, None)?;
+    if merged.1 {
+        return Ok((merged.0, false));
+    }
+    let resolved = merge_once(ancestor, ours, theirs, Some(FileFavor::Ours))?;
+    Ok((resolved.0, true))
+}
+
+/// One pass, answering the merged text and whether it needed no help.
+fn merge_once(
+    ancestor: &str,
+    ours: &str,
+    theirs: &str,
+    favor: Option<FileFavor>,
+) -> Result<(String, bool), StoreError> {
+    let mut base = MergeFileInput::new();
+    base.content(ancestor.as_bytes());
+    let mut mine = MergeFileInput::new();
+    mine.content(ours.as_bytes());
+    let mut yours = MergeFileInput::new();
+    yours.content(theirs.as_bytes());
+
+    let mut options = MergeFileOptions::new();
+    if let Some(favor) = favor {
+        options.favor(favor);
+    }
+
+    let result = git2::merge_file(&base, &mine, &yours, Some(&mut options))
+        .map_err(|e| StoreError::repository("merge record bodies", e))?;
+    let text = String::from_utf8(result.content().to_vec()).map_err(|_| {
+        StoreError::new(
+            StoreErrorKind::InvalidArgument,
+            "a merged record body is not valid UTF-8",
+            serde_json::json!({}),
+        )
+    })?;
+    Ok((text, result.is_automergeable()))
 }
 
 /// Check whether two stored records have identical content.
@@ -1284,23 +1777,33 @@ fn without_foreign_presence(record: &StoredRecord) -> StoredRecord {
 
 /// Whether two records say the same thing.
 ///
-/// The content digest, and deliberately not the whole envelope: `presence` is
-/// local state that rides along in the record, and comparing it would turn
-/// "these two machines are on different branches" into a conflict on every
-/// record whose content is a repository file.
+/// **The whole envelope**, save one member. This used to be the content digest
+/// alone, which made a record retitled, refiled, retagged or relinked on the
+/// other side *equal* to ours — so the merge below skipped it and their work
+/// was dropped without anybody merging anything. A record is what it says about
+/// itself as much as what it holds.
+///
+/// `presence` is the exception, and stays out for the reason it always did: it
+/// is this working tree's answer to whether the file is here, so comparing it
+/// would turn "these two machines are on different branches" into a difference
+/// on every record whose content is a repository file.
+///
+/// Two clones per shared key, which a fetch can afford: it is already reading
+/// and writing Git objects for every one of them, and a comparison spelled out
+/// member by member is a comparison somebody forgets to extend.
 fn records_equal(a: &StoredRecord, b: &StoredRecord) -> bool {
-    match (a, b) {
-        (StoredRecord::Plaintext { envelope: ea }, StoredRecord::Plaintext { envelope: eb }) => {
-            ea.content_hash == eb.content_hash
-        }
-    }
+    let (StoredRecord::Plaintext { envelope: ours }, StoredRecord::Plaintext { envelope: theirs }) =
+        (a, b);
+    as_shared(ours) == as_shared(theirs)
 }
 
-/// Extract a content hash for conflict reporting.
-fn content_hash_of(record: &StoredRecord) -> String {
-    match record {
-        StoredRecord::Plaintext { envelope } => envelope.content_hash.as_str().to_owned(),
+/// An envelope with the sender's opinion of our working tree dropped.
+fn as_shared(envelope: &Envelope) -> Envelope {
+    let mut envelope = envelope.clone();
+    if let Some(reference) = &mut envelope.content_ref {
+        reference.presence = Presence::Present;
     }
+    envelope
 }
 
 fn cleanup_temp_ref(repo: &Repository) -> Result<(), StoreError> {
@@ -1341,7 +1844,7 @@ fn random_suffix() -> String {
         })
 }
 
-use git2::Repository;
+use git2::{FileFavor, MergeFileInput, MergeFileOptions, Repository};
 use std::collections::BTreeSet;
 
 #[cfg(test)]

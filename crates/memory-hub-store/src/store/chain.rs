@@ -57,14 +57,7 @@ pub(super) fn genesis_commit(
         .map_err(|error| serialization_error("serialize genesis", error))?;
     let signature = Signature::now("Memory Hub", "memory-hub@localhost")
         .map_err(|error| StoreError::repository("create genesis signature", error))?;
-    create_commit(
-        repository,
-        &signature,
-        &signature,
-        &message,
-        tree,
-        &[],
-    )
+    create_commit(repository, &signature, &signature, &message, tree, &[])
 }
 
 pub(super) fn transaction_commit(

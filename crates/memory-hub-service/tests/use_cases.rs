@@ -1681,7 +1681,7 @@ fn a_directory_is_a_folder_even_when_no_record_is_in_it() -> TestResult {
     std::fs::write(project.path().join("docs/assets/logo.svg"), "<svg/>")?;
     service.scan_attachments("attach")?;
 
-    let folders = service.list_folders(None, false)?;
+    let folders = service.list_folders(None, false, None)?;
     let at = |path: &str| {
         folders
             .iter()
@@ -1720,7 +1720,7 @@ fn a_folder_whose_documents_this_branch_hides_stays_visible() -> TestResult {
     std::fs::remove_file(project.path().join("docs/guides/intro.md"))?;
     service.scan_attachments("switched")?;
 
-    let folders = service.list_folders(Some("docs/guides"), false)?;
+    let folders = service.list_folders(Some("docs/guides"), false, None)?;
     let [guides] = folders.as_slice() else {
         return Err("expected exactly the folder that was asked for".into());
     };
@@ -1789,7 +1789,7 @@ fn the_record_that_is_a_folder_can_be_replaced() -> TestResult {
             folder_record("guides-index", "docs/guides")?,
         ],
     )?;
-    let folders = service.list_folders(Some("docs/guides"), false)?;
+    let folders = service.list_folders(Some("docs/guides"), false, None)?;
     assert_eq!(
         folders.first().and_then(|entry| entry.described.as_deref()),
         Some("guides-index")
@@ -1809,12 +1809,16 @@ fn a_folder_exists_while_the_record_that_is_it_is_there() -> TestResult {
             filed("note-1", "note", "docs/guides")?,
         ],
     )?;
-    let folders = service.list_folders(Some("docs/guides"), false)?;
+    let folders = service.list_folders(Some("docs/guides"), false, None)?;
     let [guides] = folders.as_slice() else {
         return Err("expected the folder".into());
     };
     assert_eq!(guides.described.as_deref(), Some("api-guides"));
-    assert_eq!(guides.records, 2, "the record that is the folder is in it");
+    assert_eq!(
+        guides.records, 1,
+        "the count is of documents filed in the folder, and the record that is \
+         the folder is not one of them — it is what the folder says"
+    );
 
     let expected = service.current_revision()?;
     service.apply_transaction(
@@ -1822,7 +1826,7 @@ fn a_folder_exists_while_the_record_that_is_it_is_there() -> TestResult {
         expected,
         vec![Operation::delete(RecordId::plaintext("api-guides"))],
     )?;
-    let folders = service.list_folders(Some("docs/guides"), false)?;
+    let folders = service.list_folders(Some("docs/guides"), false, None)?;
     let [guides] = folders.as_slice() else {
         return Err("the folder is still there: a document is filed in it".into());
     };
@@ -1830,7 +1834,7 @@ fn a_folder_exists_while_the_record_that_is_it_is_there() -> TestResult {
         guides.described, None,
         "the description is what was deleted"
     );
-    assert_eq!(guides.records, 1);
+    assert_eq!(guides.records, 1, "the document filed there is untouched");
 
     let expected = service.current_revision()?;
     service.apply_transaction(
@@ -1839,7 +1843,9 @@ fn a_folder_exists_while_the_record_that_is_it_is_there() -> TestResult {
         vec![Operation::delete(RecordId::plaintext("note-1"))],
     )?;
     assert!(
-        service.list_folders(Some("docs/guides"), false)?.is_empty(),
+        service
+            .list_folders(Some("docs/guides"), false, None)?
+            .is_empty(),
         "nothing is filed there and no directory exists: the folder is gone"
     );
     Ok(())
@@ -1916,21 +1922,6 @@ fn renaming_a_refs_folder_carries_everything_under_it() -> TestResult {
     Ok(())
 }
 
-/// Renaming there means renaming a directory, which a person does the ordinary
-/// way. Doing it from here would leave the records disagreeing with the files.
-#[test]
-fn renaming_a_directory_of_an_attached_folder_is_refused() -> TestResult {
-    let (project, service) = attached_project()?;
-    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
-    service.scan_attachments("attach")?;
-
-    let error = service
-        .rename_folder("docs/guides", "docs/handbook", "rename")
-        .expect_err("an attached directory is not renamed through Memory");
-    assert_eq!(error.kind, "invalid_argument");
-    Ok(())
-}
-
 /// A renamed directory moves its files, and the scan follows them. What it must
 /// also carry is the record filed there that has no file of its own.
 #[test]
@@ -1959,6 +1950,608 @@ fn renaming_a_directory_carries_the_records_filed_in_it() -> TestResult {
         envelope_of(&service, "d-guides")?.folder.as_deref(),
         Some("docs/handbook"),
         "metadata does not travel unless somebody carries it"
+    );
+    Ok(())
+}
+
+/// For a record that carries its own body the folder is metadata, so filing it
+/// somewhere else is that one field and nothing on disk.
+#[test]
+fn moving_a_record_of_refs_rewrites_one_field() -> TestResult {
+    let (_project, service) = service()?;
+    seed(&service, vec![filed("d-storage", "note", "decisions")?])?;
+
+    service.move_document("d-storage", "decisions/persistence", "move")?;
+
+    let envelope = envelope_of(&service, "d-storage")?;
+    assert_eq!(envelope.folder.as_deref(), Some("decisions/persistence"));
+    assert!(
+        envelope.content_ref.is_none(),
+        "a record that carries its body gains no file by being moved"
+    );
+    Ok(())
+}
+
+/// The root is the absence of a folder rather than a folder named by the empty
+/// string, because that is how every other member spells "filed nowhere".
+#[test]
+fn moving_a_record_to_the_root_unfiles_it() -> TestResult {
+    let (_project, service) = service()?;
+    seed(&service, vec![filed("d-storage", "note", "decisions")?])?;
+
+    service.move_document("d-storage", "", "move")?;
+
+    assert_eq!(envelope_of(&service, "d-storage")?.folder, None);
+    Ok(())
+}
+
+/// The folder of a record whose body is a repository file *is* the directory
+/// that file is in. Moving one means moving the other, or the two disagree.
+#[test]
+fn moving_a_document_carries_its_file() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    service.move_document("guides-intro", "docs/handbook", "move")?;
+
+    let envelope = envelope_of(&service, "guides-intro")?;
+    assert_eq!(envelope.folder.as_deref(), Some("docs/handbook"));
+    assert_eq!(
+        envelope.content_ref.as_ref().map(|it| it.path.as_str()),
+        Some("docs/handbook/intro.md"),
+        "the locator follows the file"
+    );
+    assert!(
+        project.path().join("docs/handbook/intro.md").is_file(),
+        "the file is where the record says it is"
+    );
+    assert!(
+        !project.path().join("docs/guides/intro.md").exists(),
+        "and is no longer where it was"
+    );
+    // The key is untouched, so every link pointing at this document still
+    // points at it. That is the whole difference between a move and a delete
+    // followed by the scan handing the file back as something new.
+    assert_eq!(envelope.key, "guides-intro");
+    Ok(())
+}
+
+/// The folder is what makes a file a document of its type. A move out of it is
+/// not a move but a change of type with a file copy attached.
+#[test]
+fn a_document_may_not_leave_its_storage() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    let error = service
+        .move_document("guides-intro", "elsewhere", "move")
+        .expect_err("a document does not leave the folder its type is over");
+    assert_eq!(error.kind, "invalid_argument");
+    assert!(
+        project.path().join("docs/guides/intro.md").is_file(),
+        "a refused move leaves the file where it was"
+    );
+    Ok(())
+}
+
+/// `rename` replaces an existing file on Unix without a word, and the file it
+/// would replace is another record's document.
+#[test]
+fn a_move_onto_another_document_is_refused() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "the one being moved\n")?;
+    write_doc_at(project.path(), "handbook/intro.md", "the one in the way\n")?;
+    service.scan_attachments("attach")?;
+
+    let error = service
+        .move_document("guides-intro", "docs/handbook", "move")
+        .expect_err("nothing is overwritten");
+    assert_eq!(error.kind, "invalid_argument");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("docs/handbook/intro.md"))?,
+        "the one in the way\n",
+        "the document that was there is untouched"
+    );
+    Ok(())
+}
+
+/// Moving the record that is a folder changes which folder it stands for, and
+/// the folder it arrives in may already have one. Two of them is a question
+/// with no answer, so the write is refused rather than resolved later.
+#[test]
+fn moving_a_folder_record_onto_another_is_refused() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![
+            folder_record("storage-index", "decisions/storage")?,
+            folder_record("naming-index", "decisions/naming")?,
+        ],
+    )?;
+
+    let error = service
+        .move_document("storage-index", "decisions/naming", "move")
+        .expect_err("a folder already has the record that stands for it");
+    assert_eq!(error.kind, "invalid_record");
+    assert_eq!(
+        envelope_of(&service, "storage-index")?.folder.as_deref(),
+        Some("decisions/storage"),
+        "the refused move left it where it was"
+    );
+    Ok(())
+}
+
+/// Folders are a namespace the whole project shares, so a client drawing a tree
+/// per type has to be able to ask for one type's.
+#[test]
+fn one_types_folders_are_answerable_on_their_own() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![
+            put(
+                &type_key("note"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "note"}))?,
+            )?,
+            put(
+                &type_key("spec"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "spec"}))?,
+            )?,
+            filed("n-1", "note", "decisions")?,
+            filed("s-1", "spec", "plans")?,
+        ],
+    )?;
+
+    let paths = |kind: Option<&str>| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(service
+            .list_folders(None, false, kind)?
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect())
+    };
+
+    assert_eq!(paths(Some("note"))?, vec!["decisions".to_owned()]);
+    assert_eq!(paths(Some("spec"))?, vec!["plans".to_owned()]);
+    assert_eq!(
+        paths(None)?,
+        vec!["decisions".to_owned(), "plans".to_owned()],
+        "asking about no type in particular is still asking about the project"
+    );
+    Ok(())
+}
+
+/// A type whose documents are its own records has no directories, so its
+/// folders are the ones its records are filed in and nothing else — the
+/// directories of somebody else's attached folder are not its.
+#[test]
+fn a_types_folders_do_not_include_another_types_directories() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+    let expected = service.current_revision()?;
+    service.apply_transaction("file", expected, vec![filed("n-1", "note", "decisions")?])?;
+
+    let notes: Vec<String> = service
+        .list_folders(None, false, Some("note"))?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+
+    assert_eq!(notes, vec!["decisions".to_owned()]);
+    assert!(
+        service
+            .list_folders(None, false, Some("doc"))?
+            .iter()
+            .any(|entry| entry.path == "docs/guides" && entry.in_storage),
+        "and the attached type still gets its own directories"
+    );
+    Ok(())
+}
+
+/// A record and the definition of its kind, arriving together.
+///
+/// A transaction is atomic, so it is checked against the state it produces. It
+/// used to be checked against the state before it, which worked only while the
+/// corpus held no types at all — with none, validation is skipped entirely. So
+/// describing a project whose memory was empty succeeded and describing one
+/// that already held a single type failed, saying the kind had no definition
+/// while the definition was in the same transaction.
+#[test]
+fn a_kind_defined_by_the_same_transaction_is_a_kind_that_exists() -> TestResult {
+    let (_project, service) = service()?;
+    // Something, so the corpus is not empty and validation actually runs.
+    seed(
+        &service,
+        vec![put(
+            &type_key("note"),
+            "__type__",
+            &serde_json::to_string(&json!({"kind_name": "note"}))?,
+        )?],
+    )?;
+
+    let expected = service.current_revision()?;
+    service.apply_transaction(
+        "define-and-write",
+        expected,
+        vec![
+            put(
+                &type_key("decision"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "decision"}))?,
+            )?,
+            put("d-storage", "decision", "Git objects")?,
+        ],
+    )?;
+
+    assert_eq!(envelope_of(&service, "d-storage")?.kind, "decision");
+    Ok(())
+}
+
+/// A folder exists while something is in it, so deleting one takes everything
+/// filed under it — at any depth, and whatever its type.
+#[test]
+fn deleting_a_folder_takes_everything_under_it() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![
+            put(
+                &type_key("note"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "note"}))?,
+            )?,
+            put(
+                &type_key("spec"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "spec"}))?,
+            )?,
+            folder_record("guides-note", "docs/guides")?,
+            filed("n-1", "note", "docs/guides")?,
+            filed("n-2", "note", "docs/guides/api")?,
+            // Another type's record, filed next to the documents. Sparing it
+            // would leave the folder standing, which is not a deletion.
+            filed("s-1", "spec", "docs/guides")?,
+            filed("n-3", "note", "docs/other")?,
+        ],
+    )?;
+
+    let removed = service.delete_folder("docs/guides", "forget")?;
+    assert_eq!(removed, 4, "three records and the one that was the folder");
+
+    assert!(
+        service
+            .list_folders(Some("docs/guides"), true, None)?
+            .is_empty(),
+        "nothing is filed there any more, so the folder is gone"
+    );
+    assert_eq!(
+        envelope_of(&service, "n-3")?.folder.as_deref(),
+        Some("docs/other"),
+        "a folder that merely starts with the same letters is a different folder"
+    );
+    Ok(())
+}
+
+/// The files go with their records, and the directories go only while nothing
+/// Memory does not know about is left in them.
+#[test]
+fn deleting_a_folder_takes_its_files_and_leaves_what_it_never_saw() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    write_doc_at(project.path(), "guides/api/auth.md", "body\n")?;
+    service.scan_attachments("attach")?;
+    // Written after the scan, so no record names it.
+    write_doc_at(project.path(), "guides/api/scratch.md", "not scanned\n")?;
+
+    service.delete_folder("docs/guides", "forget")?;
+
+    assert!(!project.path().join("docs/guides/intro.md").exists());
+    assert!(!project.path().join("docs/guides/api/auth.md").exists());
+    assert!(
+        project.path().join("docs/guides/api/scratch.md").is_file(),
+        "a file no scan reached is somebody's, and stays"
+    );
+    assert!(
+        project.path().join("docs/guides/api").is_dir(),
+        "so the directory holding it stays too"
+    );
+    Ok(())
+}
+
+/// Removing where a type keeps its documents is removing the type, and that is
+/// a different operation with a different promise about the files.
+#[test]
+fn deleting_a_storage_root_as_a_folder_is_refused() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    let error = service
+        .delete_folder("docs", "forget")
+        .expect_err("that is delete_type");
+    assert_eq!(error.kind, "invalid_argument");
+    assert!(project.path().join("docs/intro.md").is_file());
+    Ok(())
+}
+
+/// A folder of an attached type is described without a file appearing in
+/// anybody's repository.
+///
+/// The rule that a record of such a type must point at a file is about that
+/// type's *documents*. The record carrying `is_folder` is not one of them — it
+/// is what the folder those documents are in has to say — so requiring a file
+/// would mean a folder could only be described by putting a document in
+/// somebody's working tree, which is the one thing attaching a folder promises
+/// not to do.
+#[test]
+fn describing_a_directory_writes_no_file() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    let mut envelope = Envelope::new("guides-note", "doc", "What is in here")?;
+    envelope.folder = Some("docs/guides".to_owned());
+    envelope.is_folder = true;
+    let expected = service.current_revision()?;
+    service.apply_transaction(
+        "describe",
+        expected,
+        vec![Operation::put(StoredRecord::Plaintext {
+            envelope: Box::new(envelope),
+        })],
+    )?;
+
+    assert!(
+        !project.path().join("docs/guides/guides-note.md").exists(),
+        "nothing was written into the folder"
+    );
+    let listed: Vec<String> = std::fs::read_dir(project.path().join("docs/guides"))?
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_str()?.to_owned()))
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["intro.md".to_owned()],
+        "and nothing else appeared"
+    );
+
+    let folders = service.list_folders(Some("docs/guides"), false, None)?;
+    assert_eq!(folders[0].described.as_deref(), Some("guides-note"));
+    Ok(())
+}
+
+/// It is not a document of its type, so what the type declares about documents
+/// is not asked of it.
+#[test]
+fn a_folder_record_is_not_held_to_the_types_fields() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![put(
+            &type_key("spec"),
+            "__type__",
+            &serde_json::to_string(&json!({
+                "kind_name": "spec",
+                "fields": {"status": {"type": "string", "required": true}},
+            }))?,
+        )?],
+    )?;
+
+    let mut envelope = Envelope::new("plans-note", "spec", "What is planned here")?;
+    envelope.folder = Some("plans".to_owned());
+    envelope.is_folder = true;
+    let expected = service.current_revision()?;
+    service.apply_transaction(
+        "describe",
+        expected,
+        vec![Operation::put(StoredRecord::Plaintext {
+            envelope: Box::new(envelope),
+        })],
+    )?;
+
+    // And a document of that type is still held to them.
+    let expected = service.current_revision()?;
+    let refused =
+        service.apply_transaction("a-document", expected, vec![put("s-1", "spec", "A plan")?]);
+    assert!(
+        refused.is_err(),
+        "a document of the type still needs its fields"
+    );
+    Ok(())
+}
+
+/// It is what the folder says, not something filed in it.
+#[test]
+fn the_record_that_is_a_folder_is_not_listed_among_its_documents() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![
+            put(
+                &type_key("note"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "note"}))?,
+            )?,
+            folder_record("guides-note", "docs/guides")?,
+            filed("n-1", "note", "docs/guides")?,
+        ],
+    )?;
+
+    let keys = |include: bool| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(service
+            .list_records(
+                &ListingQuery {
+                    folder: Some("docs/guides".to_owned()),
+                    include_folders: include,
+                    ..ListingQuery::default()
+                },
+                None,
+            )?
+            .records
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    };
+
+    assert_eq!(keys(false)?, vec!["n-1".to_owned()]);
+    assert_eq!(
+        keys(true)?,
+        vec!["guides-note".to_owned(), "n-1".to_owned()],
+        "the tools that maintain folders can still ask for it"
+    );
+    Ok(())
+}
+
+/// One gesture, two storages. What a folder *is* differs underneath and must
+/// not differ above, or every client reimplements the difference.
+#[test]
+fn a_folder_made_in_the_records_is_the_record_that_is_it() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![put(
+            &type_key("note"),
+            "__type__",
+            &serde_json::to_string(&json!({"kind_name": "note"}))?,
+        )?],
+    )?;
+
+    service.create_folder("decisions/storage", "note", "make")?;
+
+    let folders = service.list_folders(None, false, None)?;
+    let made = folders
+        .iter()
+        .find(|entry| entry.path == "decisions/storage")
+        .ok_or("the folder was not made")?;
+    assert!(made.in_records, "it exists because a record is filed in it");
+    let key = made.described.clone().ok_or("nothing stands for it")?;
+
+    let envelope = envelope_of(&service, &key)?;
+    assert!(envelope.is_folder);
+    assert_eq!(envelope.folder.as_deref(), Some("decisions/storage"));
+    assert_eq!(
+        envelope.title.as_deref(),
+        Some("storage"),
+        "titled with its own last segment, not the whole path"
+    );
+    assert_eq!(
+        envelope.content, "",
+        "a folder made a moment ago has nothing to say about itself yet"
+    );
+    Ok(())
+}
+
+/// The same call against a type whose documents are files makes a directory,
+/// and writes no record at all.
+#[test]
+fn a_folder_made_in_a_directory_is_a_directory() -> TestResult {
+    let (project, service) = attached_project()?;
+
+    service.create_folder("docs/guides", "doc", "make")?;
+
+    assert!(project.path().join("docs/guides").is_dir());
+    let folders = service.list_folders(None, false, None)?;
+    let made = folders
+        .iter()
+        .find(|entry| entry.path == "docs/guides")
+        .ok_or("the directory was not made")?;
+    assert!(made.in_storage, "the working tree has it");
+    assert!(
+        !made.in_records && made.described.is_none(),
+        "nothing was written into the corpus for it: a directory is not a record"
+    );
+    Ok(())
+}
+
+/// A directory made beside somebody's attached folder is Memory deciding where
+/// their repository keeps things.
+#[test]
+fn a_directory_is_not_made_outside_its_types_storage() -> TestResult {
+    let (project, service) = attached_project()?;
+
+    let error = service
+        .create_folder("elsewhere/guides", "doc", "make")
+        .expect_err("a type's folders live under its storage");
+    assert_eq!(error.kind, "invalid_argument");
+    assert!(!project.path().join("elsewhere").exists());
+    Ok(())
+}
+
+/// Renaming a directory is one operation from here, not an instruction to go
+/// and do it in Finder: the directory moves and the locators follow it.
+#[test]
+fn renaming_a_directory_moves_the_files_and_the_records() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/api/auth.md", "# Auth\n")?;
+    write_doc_at(project.path(), "guides/setup.md", "# Setup\n")?;
+    service.scan_attachments("attach")?;
+
+    // A decision filed next to the documents, with no file of its own. It has
+    // nothing to follow, which is exactly why the rewrite has to carry it.
+    let expected = service.current_revision()?;
+    service.apply_transaction(
+        "file-a-note",
+        expected,
+        vec![filed("d-guides", "note", "docs/guides")?],
+    )?;
+
+    service.rename_folder("docs/guides", "docs/handbook", "rename")?;
+
+    assert!(project.path().join("docs/handbook/api/auth.md").is_file());
+    assert!(!project.path().join("docs/guides").exists());
+
+    let moved = envelope_of(&service, "guides-api-auth")?;
+    assert_eq!(moved.folder.as_deref(), Some("docs/handbook/api"));
+    assert_eq!(
+        moved.content_ref.as_ref().map(|it| it.path.as_str()),
+        Some("docs/handbook/api/auth.md"),
+        "the locator follows the file"
+    );
+    assert_eq!(
+        moved.key, "guides-api-auth",
+        "and the key does not, so no link breaks"
+    );
+    assert_eq!(
+        envelope_of(&service, "d-guides")?.folder.as_deref(),
+        Some("docs/handbook"),
+        "a record filed there by metadata alone is carried too"
+    );
+    Ok(())
+}
+
+/// A type's documents live where its definition says. Moving that is a change
+/// to the type, and it asks questions a rename has no business asking.
+#[test]
+fn renaming_a_storage_root_is_refused() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    let error = service
+        .rename_folder("docs", "documentation", "rename")
+        .expect_err("that is migrate_storage");
+    assert_eq!(error.kind, "invalid_argument");
+    assert!(project.path().join("docs/intro.md").is_file());
+    Ok(())
+}
+
+/// The folder is what makes these files documents of their type.
+#[test]
+fn a_directory_may_not_be_renamed_out_of_its_storage() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    let error = service
+        .rename_folder("docs/guides", "elsewhere/guides", "rename")
+        .expect_err("documents do not leave their storage by being renamed");
+    assert_eq!(error.kind, "invalid_argument");
+    assert!(
+        project.path().join("docs/guides/intro.md").is_file(),
+        "a refused rename leaves the directory where it was"
     );
     Ok(())
 }
@@ -1999,7 +2592,7 @@ fn a_document_can_be_the_folder_it_lives_in() -> TestResult {
     )?;
     assert_eq!(
         service
-            .list_folders(Some("docs/guides"), false)?
+            .list_folders(Some("docs/guides"), false, None)?
             .first()
             .and_then(|entry| entry.described.as_deref()),
         Some(key.as_str())
@@ -2020,7 +2613,7 @@ fn a_document_can_be_the_folder_it_lives_in() -> TestResult {
     assert!(moved.is_folder, "and it is still the folder it is in");
     assert_eq!(
         service
-            .list_folders(Some("docs/handbook"), false)?
+            .list_folders(Some("docs/handbook"), false, None)?
             .first()
             .and_then(|entry| entry.described.as_deref()),
         Some(key.as_str()),
@@ -2156,10 +2749,7 @@ fn filed(key: &str, kind: &str, folder: &str) -> Result<Operation, Box<dyn std::
 use memory_hub_service::{Attachment, DocumentSource, FolderSource};
 
 fn docs_source(project: &std::path::Path) -> FolderSource<'_> {
-    FolderSource::new(
-        project,
-        Attachment::new("docs".to_owned()),
-    )
+    FolderSource::new(project, Attachment::new("docs".to_owned()))
 }
 
 /// A write goes through the source that owns the locator. Reaching around it
@@ -2436,5 +3026,139 @@ fn removing_a_type_the_project_does_not_hold_is_refused() -> TestResult {
     let (_project, service) = attached_project()?;
     let failure = service.remove_type("nonesuch", "detach").unwrap_err();
     assert_eq!(failure.kind, "invalid_argument");
+    Ok(())
+}
+
+/// A folder inside an attached directory can exist in the records alone: Git
+/// keeps no empty directories, so a fresh clone has the records and not the
+/// folder. Renaming is what was asked for either way.
+#[test]
+fn renaming_a_folder_the_working_tree_does_not_have_still_moves_its_records() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    // Filed under `docs/guides` by metadata alone. No directory is created:
+    // nothing of this type's is in it, and this record carries its own body.
+    let expected = service.current_revision()?;
+    service.apply_transaction(
+        "file-a-note",
+        expected,
+        vec![filed("d-guides", "note", "docs/guides")?],
+    )?;
+    assert!(
+        !project.path().join("docs/guides").exists(),
+        "the directory is genuinely not there"
+    );
+
+    service.rename_folder("docs/guides", "docs/handbook", "rename")?;
+
+    assert_eq!(
+        envelope_of(&service, "d-guides")?.folder.as_deref(),
+        Some("docs/handbook"),
+        "the records carry the rename on their own"
+    );
+    Ok(())
+}
+
+/// A record filed in `a/b/c` says nothing about `a/b`, and a client handed the
+/// deeper path with no parent has a row it cannot hang anywhere.
+#[test]
+fn the_folders_between_are_answered_for_too() -> TestResult {
+    let (_project, service) = service()?;
+    seed(
+        &service,
+        vec![
+            put(
+                &type_key("note"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "note"}))?,
+            )?,
+            filed("n-1", "note", "decisions/storage/git")?,
+        ],
+    )?;
+
+    let paths: Vec<String> = service
+        .list_folders(None, false, None)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+
+    assert_eq!(
+        paths,
+        vec![
+            "decisions".to_owned(),
+            "decisions/storage".to_owned(),
+            "decisions/storage/git".to_owned(),
+        ],
+        "every folder on the way down is a folder"
+    );
+
+    let between = service
+        .list_folders(Some("decisions"), false, None)?
+        .into_iter()
+        .next()
+        .ok_or("the folder between was not answered for")?;
+    assert_eq!(
+        between.records, 0,
+        "nothing is filed in it directly, and the count says so"
+    );
+    assert!(
+        between.in_records,
+        "the corpus is why anybody knows it is there"
+    );
+    Ok(())
+}
+
+/// A kind the project does not hold is a question with no answer, not a project
+/// with no folders — a client drawing an empty tree for a typo never learns why.
+#[test]
+fn asking_for_the_folders_of_a_type_that_is_not_there_is_refused() -> TestResult {
+    let (_project, service) = service()?;
+    // A corpus that holds a type: with none at all the engine checks nothing,
+    // deliberately, and there would be no schema to contradict.
+    seed(
+        &service,
+        vec![
+            put(
+                &type_key("note"),
+                "__type__",
+                &serde_json::to_string(&json!({"kind_name": "note"}))?,
+            )?,
+            filed("n-1", "note", "decisions")?,
+        ],
+    )?;
+
+    let error = service
+        .list_folders(None, false, Some("nonesuch"))
+        .expect_err("that type is not one this project holds");
+    assert_eq!(error.kind, "invalid_argument");
+    Ok(())
+}
+
+/// It carries no file, but the folder it stands for still has to be one of its
+/// type's — otherwise it describes a directory that type does not have.
+#[test]
+fn a_folder_record_may_not_describe_a_folder_outside_its_storage() -> TestResult {
+    let (project, service) = attached_project()?;
+    write_doc_at(project.path(), "guides/intro.md", "body\n")?;
+    service.scan_attachments("attach")?;
+
+    let mut envelope = Envelope::new("stray-note", "doc", "Not ours to describe")?;
+    envelope.folder = Some("elsewhere/guides".to_owned());
+    envelope.is_folder = true;
+    let expected = service.current_revision()?;
+    let refused = service.apply_transaction(
+        "describe",
+        expected,
+        vec![Operation::put(StoredRecord::Plaintext {
+            envelope: Box::new(envelope),
+        })],
+    );
+
+    assert!(
+        refused.is_err(),
+        "a folder of this type lives under the folder the type declares"
+    );
     Ok(())
 }

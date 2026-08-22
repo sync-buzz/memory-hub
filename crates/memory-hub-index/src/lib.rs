@@ -1770,7 +1770,6 @@ fn lock_at(root: &Path, exclusive: bool) -> Result<File, IndexError> {
     Ok(file)
 }
 
-
 /// Render a value as a SQL string literal, or refuse it.
 ///
 /// The predicate handed to `LanceDB` is a SQL string, and the only safe way to

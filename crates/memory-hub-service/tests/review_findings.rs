@@ -40,8 +40,10 @@ fn open_service(
 ) -> Result<(tempfile::TempDir, MemoryService), Box<dyn std::error::Error>> {
     let project = tempfile::tempdir()?;
     Repository::init(project.path())?;
-    let mut service =
-        MemoryService::open(project.path().to_path_buf(), memory_hub_service::RecordsIn::GitMetadata);
+    let mut service = MemoryService::open(
+        project.path().to_path_buf(),
+        memory_hub_service::RecordsIn::GitMetadata,
+    );
     if provider.is_some() {
         service = service.with_provider(provider);
     }

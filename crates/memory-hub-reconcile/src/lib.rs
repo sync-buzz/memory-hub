@@ -13,9 +13,7 @@ use std::sync::Arc;
 use fs2::FileExt;
 use git2::{ErrorCode, Oid, Repository, Sort};
 use memory_hub_core::{Envelope, FreshnessState, StoredRecord};
-use memory_hub_store::{
-    GitStore, Operation, RecordId, StoreError, Transaction, TransactionPolicy,
-};
+use memory_hub_store::{GitStore, Operation, RecordId, StoreError, Transaction, TransactionPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
