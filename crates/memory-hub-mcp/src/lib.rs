@@ -2805,6 +2805,12 @@ mod tests {
 
     /// Declare a type whose documents live in the `docs` folder, and take the
     /// first scan.
+    ///
+    /// Carries the gate of the one test that calls it, and for the same reason:
+    /// without it this is a function nobody calls on Windows, which `-D
+    /// warnings` reads as dead code and refuses to compile. The two attributes
+    /// come off together the day Windows is supported.
+    #[cfg(not(windows))]
     fn attach_docs_folder(session: &mut Session, sink: &mut Vec<u8>) {
         let definition = json!({
             "kind_name": "doc",
