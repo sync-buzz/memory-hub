@@ -263,6 +263,28 @@ impl<'a> FolderSource<'a> {
     /// into the corpus under a locator that looks local, and following one that
     /// points at an ancestor would not terminate. Neither is a state a person
     /// attaching `docs/` is asking for.
+    /// A locator for a path inside the project, always `/`-separated.
+    ///
+    /// A locator is a repository path, not a filesystem one, and three separate
+    /// things go on to read it that way: the attachment's own prefix is matched
+    /// against it, `tracked` hands it to Git, and it is stored in a record that
+    /// travels to machines with other separators. Windows hands out `\` here,
+    /// and each of those three then quietly fails to match — a scan that walks
+    /// the whole folder, discards every file, and reports nothing found without
+    /// raising anything. `memory_hub_folder::paths::record_id` reads a path the
+    /// same way and for the same reason.
+    fn locator_for(&self, path: &std::path::Path) -> Option<String> {
+        let relative = path.strip_prefix(self.project).ok()?;
+        let mut parts = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(part) => parts.push(part.to_str()?),
+                _ => return None,
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("/"))
+    }
+
     fn collect(&self, directory: &std::path::Path, depth: usize, into: &mut Vec<SourceDocument>) {
         if depth > MAX_ATTACHMENT_DEPTH {
             return;
@@ -282,13 +304,10 @@ impl<'a> FolderSource<'a> {
                 self.collect(&path, depth + 1, into);
                 continue;
             }
-            let Ok(relative) = path.strip_prefix(self.project) else {
+            let Some(locator) = self.locator_for(&path) else {
                 continue;
             };
-            let Some(locator) = relative.to_str() else {
-                continue;
-            };
-            if !self.attachment.covers(locator) {
+            if !self.attachment.covers(&locator) {
                 continue;
             }
             // Hashed as bytes, not as text. A folder of documentation holds
@@ -306,7 +325,7 @@ impl<'a> FolderSource<'a> {
                 .metadata()
                 .is_ok_and(|metadata| !metadata.permissions().readonly());
             into.push(SourceDocument {
-                locator: locator.to_owned(),
+                locator,
                 hash: ContentHash::for_bytes(&content),
                 writable,
             });
@@ -332,13 +351,10 @@ impl FolderSource<'_> {
                 continue;
             }
             let path = entry.path();
-            let Ok(relative) = path.strip_prefix(self.project) else {
+            let Some(folder) = self.locator_for(&path) else {
                 continue;
             };
-            let Some(folder) = relative.to_str() else {
-                continue;
-            };
-            into.push(folder.to_owned());
+            into.push(folder);
             self.collect_folders(&path, depth + 1, into);
         }
     }
@@ -941,4 +957,45 @@ fn edit_distance(left: &str, right: &str) -> usize {
         std::mem::swap(&mut previous, &mut current);
     }
     previous[right.len()]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{Attachment, DocumentSource as _, FolderSource};
+
+    /// A locator is a repository path, and a repository path is `/`-separated
+    /// on every platform.
+    ///
+    /// This is a Windows test that runs everywhere. There, a locator was built
+    /// straight from the filesystem path, so it arrived as `docs\guide.md`; the
+    /// attachment's own prefix is matched with `docs/`, so it matched nothing,
+    /// and the walk discarded every file it had just found. The failure had no
+    /// error in it at all — a scan that reported an empty folder while looking
+    /// at a full one. Asserting the separator here is what makes that a test
+    /// failure on the platform it happens on rather than an empty answer.
+    #[test]
+    fn a_locator_is_separated_the_way_a_repository_is() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("docs/nested")).unwrap();
+        std::fs::write(project.path().join("docs/guide.md"), b"a body").unwrap();
+        std::fs::write(project.path().join("docs/nested/deeper.md"), b"another").unwrap();
+
+        let source = FolderSource::new(project.path(), Attachment::new("docs".to_owned()));
+        let locators: Vec<String> = source
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|document| document.locator)
+            .collect();
+
+        assert_eq!(
+            locators,
+            vec![
+                "docs/guide.md".to_owned(),
+                "docs/nested/deeper.md".to_owned()
+            ],
+            "both the file and the one a directory deep are named with `/`"
+        );
+    }
 }
