@@ -1034,17 +1034,23 @@ impl Session {
     /// from here.
     fn read_content(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
         let key = required_string(arguments, "key")?;
+        let window = read_window(arguments)?;
         let resolution = self
             .service
             .resolve_content(key)
             .map_err(ToolFailure::service)?;
         let content = match resolution {
-            ContentResolution::Inline { content } => json!({
-                "schemaVersion": 1,
-                "key": key,
-                "source": "record",
-                "content": content,
-            }),
+            ContentResolution::Inline { content } => {
+                let (text, extent) = windowed(&content, window.as_ref());
+                let mut body = json!({
+                    "schemaVersion": 1,
+                    "key": key,
+                    "source": "record",
+                    "content": text,
+                });
+                merge(&mut body, extent);
+                body
+            }
             ContentResolution::Resolved {
                 path,
                 content,
@@ -1067,19 +1073,23 @@ impl Session {
                     // Text goes out as text, which is what almost everything
                     // is and what every existing client already reads.
                     Content::Text(text) => {
+                        let (text, extent) = windowed(&text, window.as_ref());
                         body["content"] = json!(text);
                         body["encoding"] = json!("utf-8");
+                        merge(&mut body, extent);
                     }
                     // Bytes go out encoded, and say so. A client that only
                     // knows about text sees an encoding it does not recognise
                     // rather than a string of replacement characters.
                     Content::Bytes(bytes) => {
+                        refuse_window(window.as_ref())?;
                         body["content"] = json!(BASE64.encode(&bytes));
                         body["encoding"] = json!("base64");
                         body["bytes"] = json!(bytes.len());
                     }
                     // Nothing is fetched: the caller is told where it is.
                     Content::Link { url, media_type } => {
+                        refuse_window(window.as_ref())?;
                         body["content"] = Value::Null;
                         body["url"] = json!(url);
                         body["media_type"] = json!(media_type);
@@ -1542,6 +1552,99 @@ fn listing_query(arguments: &Value) -> ListingQuery {
     )
 }
 
+/// The stretch of a body a caller asked for, in characters.
+///
+/// Absent is the whole body, which is what every caller before this one meant
+/// and still means. A document is not always something to be read at once —
+/// a search names the place inside one that answers the question, and reading
+/// the other sixty kilobytes to get at it is the cost this exists to remove.
+struct ReadWindow {
+    offset: usize,
+    /// How many characters to return. `None` is "to the end from `offset`".
+    limit: Option<usize>,
+}
+
+/// Read a window off the wire, or `None` when the caller asked for the body.
+///
+/// A field that is present but not a whole number is a mistake rather than a
+/// reason to fall back to the whole document: a caller that meant to read a
+/// section and silently got a manual would not find out here.
+fn read_window(arguments: &Value) -> Result<Option<ReadWindow>, RpcFailure> {
+    let number = |field: &str| -> Result<Option<usize>, RpcFailure> {
+        match arguments.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .map(Some)
+                .ok_or_else(|| RpcFailure::invalid_argument(field)),
+        }
+    };
+    let offset = number("offset")?;
+    let limit = number("limit")?;
+    if limit == Some(0) {
+        return Err(RpcFailure::invalid_argument("limit"));
+    }
+    if offset.is_none() && limit.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ReadWindow {
+        offset: offset.unwrap_or(0),
+        limit,
+    }))
+}
+
+/// Refuse a window over a body that has no characters to count.
+///
+/// Base64 and a link are not text, and an offset into either would be an
+/// offset into an encoding rather than into what somebody wrote. Said as an
+/// error, because a caller that asked for one page and received the whole of
+/// something else has no way to notice.
+fn refuse_window(window: Option<&ReadWindow>) -> Result<(), ToolCallFailure> {
+    match window {
+        None => Ok(()),
+        Some(_) => Err(RpcFailure::invalid_argument("offset").into()),
+    }
+}
+
+/// Cut a body to the window asked for, and say what the whole of it is.
+///
+/// `content_chars` travels either way: a caller that read the whole document
+/// learns how big the next one it reads might be, and a caller that read a
+/// window learns whether there is more of it.
+fn windowed(body: &str, window: Option<&ReadWindow>) -> (String, Value) {
+    let chars = body.chars().count();
+    let Some(window) = window else {
+        return (body.to_owned(), json!({"content_chars": chars}));
+    };
+    let taken: String = match window.limit {
+        Some(limit) => body.chars().skip(window.offset).take(limit).collect(),
+        None => body.chars().skip(window.offset).collect(),
+    };
+    let read = taken.chars().count();
+    (
+        taken,
+        json!({
+            "content_chars": chars,
+            "offset": window.offset,
+            "read": read,
+            // Whether anything is left after this window — the question a
+            // caller reading a document a piece at a time is actually asking.
+            "truncated": window.offset.saturating_add(read) < chars,
+        }),
+    )
+}
+
+/// Copy the members of one object into another.
+fn merge(body: &mut Value, fragment: Value) {
+    let Some(fields) = fragment.as_object() else {
+        return;
+    };
+    for (name, value) in fields {
+        body[name.as_str()] = value.clone();
+    }
+}
+
 /// `metadata_only` omits content, links and paths — the shape a UI list needs
 /// without transferring every body.
 fn render_record(key: &str, envelope: &Envelope, metadata_only: bool) -> Value {
@@ -1793,7 +1896,18 @@ fn builtin_instructions() -> String {
     s.push_str("- **memory_search** (`query`): Full-text search with the same filters, ");
     s.push_str("`kinds` narrowing to several types in one ask. ");
     s.push_str("Use when you need to find records by content, not by key. ");
-    s.push_str("Returns ranked hits with snippets.\n");
+    s.push_str("A hit says which record to read and why it ranked, never the record ");
+    s.push_str("itself: `excerpt` is the window of the body around the match, ");
+    s.push_str("`excerpt_at` is where that window starts and `content_chars` is how ");
+    s.push_str("long the whole body is. Read the body by key with ");
+    s.push_str("`memory_read_content`, and for a long one pass `offset`/`limit` to ");
+    s.push_str("read from where the excerpt was found. `total` is how many records ");
+    s.push_str("matched — `total_capped: true` means counting stopped at 1000.\n");
+    s.push_str("- **memory_read_content** (`key`): The body of one record, following ");
+    s.push_str("its locator when it has one. `offset` and `limit` — characters from ");
+    s.push_str("the start of the body — read a stretch of it instead of the whole; ");
+    s.push_str("the answer says `content_chars`, and a windowed read also says `read` ");
+    s.push_str("and `truncated`.\n");
     s.push_str("- **memory_backlinks** (`key`): Find records that link TO or mention a key. ");
     s.push_str("Combines explicit `links` and body-mention detection.\n");
 
@@ -1878,7 +1992,12 @@ fn builtin_instructions() -> String {
     s.push_str("in a single transaction for atomicity.\n");
     s.push_str("3. **Use metadata_only for lists**: When listing records for display, ");
     s.push_str("set `metadata_only: true` to avoid transferring full content.\n");
-    s.push_str("4. **After resource update notifications**: Re-read ");
+    s.push_str("4. **Search, then read what search named**: search answers with ");
+    s.push_str("excerpts, so it costs the same whether the corpus is small or large. ");
+    s.push_str("Read a whole body only once you have decided you want it, and when ");
+    s.push_str("`content_chars` says it is long, read the stretch around ");
+    s.push_str("`excerpt_at` rather than all of it.\n");
+    s.push_str("5. **After resource update notifications**: Re-read ");
     s.push_str("`memory://revision/current` to stay in sync.\n");
 
     s
@@ -2053,7 +2172,13 @@ pub fn list_tools() -> Value {
         ),
         tool(
             "memory_search",
-            "Full-text search across all records with filters. Use when you need to find records by content, not by key. Returns ranked hits.",
+            "Full-text search across all records with filters. Use when you need to find records \
+             by content, not by key. Returns ranked hits: each carries `excerpt` — the window of \
+             the body around what matched — with `excerpt_at`, where that window starts, and \
+             `content_chars`, how long the whole body is. Never the body itself: read that by \
+             key with `memory_read_content`, which takes `offset`/`limit` so a long document can \
+             be read from where the excerpt was found. `total` is how many records matched, not \
+             how many were returned; `total_capped: true` means it stopped counting at 1000.",
             object_schema(
                 &[
                     ("presence", string_schema()),
@@ -2129,8 +2254,19 @@ pub fn list_tools() -> Value {
             "memory_read_content",
             "Read a record's body. A record that keeps its content answers with it; one whose \
              content is a repository file is resolved through its locator and answers with \
-             `missing: true` when this branch does not have the file.",
-            object_schema(&[("key", string_schema())], &["key"]),
+             `missing: true` when this branch does not have the file. `offset` and `limit` read \
+             a stretch of it instead — in characters, from the start of the body — which is how \
+             a long document is read from where `memory_search` found the match rather than \
+             whole. The answer always says `content_chars`, and a windowed read also says \
+             `read` and `truncated`. A body that is not text refuses a window.",
+            object_schema(
+                &[
+                    ("key", string_schema()),
+                    ("offset", json!({"type":"integer","minimum":0})),
+                    ("limit", json!({"type":"integer","minimum":1})),
+                ],
+                &["key"],
+            ),
         ),
         tool(
             "memory_write_content",
@@ -2742,6 +2878,148 @@ mod tests {
     /// is `refs` with a Git directory; the point of sourcing it from the
     /// store's own description is that a backend without one will publish no
     /// `gitDir` at all rather than a path that looks right.
+    /// Put one record with a body, for the reads below.
+    fn with_body(body: &str) -> (tempfile::TempDir, Session) {
+        let project = tempfile::tempdir().unwrap();
+        git2_for_test::init(project.path());
+        let mut session = Session::new(project.path().to_path_buf(), RecordsIn::GitMetadata);
+        session.initialized = true;
+        let base = session.store().unwrap().current_revision().unwrap();
+        let record = json!({
+            "representation": "plaintext",
+            "envelope": {
+                "envelope_version": {"major": 1, "minor": 0},
+                "key": "manual",
+                "kind": "note",
+                "content": body,
+                "content_hash": format!("sha256:{:x}", Sha256::digest(body.as_bytes())),
+                "source_paths": {}, "archive": {"archived": false},
+                "freshness": {"state": "unverified"}
+            }
+        });
+        let mut output = Vec::new();
+        session
+            .call_tool(
+                json!(1),
+                &json!({
+                    "name": "memory_apply_transaction",
+                    "arguments": {
+                        "transaction_id": "seed-body",
+                        "expected_revision": base,
+                        "operations": [{"op": "put", "record": record}]
+                    }
+                }),
+                &mut output,
+            )
+            .unwrap();
+        (project, session)
+    }
+
+    fn read(session: &mut Session, arguments: Value) -> Value {
+        let mut output = Vec::new();
+        session
+            .call_tool(
+                json!(2),
+                &json!({"name": "memory_read_content", "arguments": arguments}),
+                &mut output,
+            )
+            .unwrap()
+    }
+
+    /// A search names the place inside a document that answers the question.
+    /// Reading from there is the other half of not sending bodies with hits:
+    /// without it the saving moves to the next call rather than happening.
+    #[test]
+    fn a_body_can_be_read_a_stretch_at_a_time() {
+        let body = "первая строка. ".repeat(40);
+        let (_project, mut session) = with_body(&body);
+
+        let response = read(
+            &mut session,
+            json!({"key": "manual", "offset": 15, "limit": 14}),
+        );
+
+        let content = response
+            .pointer("/result/structuredContent/content")
+            .and_then(Value::as_str)
+            .unwrap();
+        let expected: String = body.chars().skip(15).take(14).collect();
+        assert_eq!(content, expected, "the window counts characters, not bytes");
+        let structured = response.pointer("/result/structuredContent").unwrap();
+        assert_eq!(
+            structured.get("content_chars").and_then(Value::as_u64),
+            Some(body.chars().count() as u64)
+        );
+        assert_eq!(structured.get("read").and_then(Value::as_u64), Some(14));
+        assert_eq!(
+            structured.get("truncated").and_then(Value::as_bool),
+            Some(true),
+            "there is more of the document after this window"
+        );
+    }
+
+    /// Asking for the body is what every caller before the window meant, and
+    /// still means. It now also learns how much of a document it is holding.
+    #[test]
+    fn a_read_without_a_window_is_the_whole_body() {
+        let body = "the whole of it";
+        let (_project, mut session) = with_body(body);
+
+        let response = read(&mut session, json!({"key": "manual"}));
+
+        let structured = response.pointer("/result/structuredContent").unwrap();
+        assert_eq!(
+            structured.get("content").and_then(Value::as_str),
+            Some(body)
+        );
+        assert_eq!(
+            structured.get("content_chars").and_then(Value::as_u64),
+            Some(15)
+        );
+        assert!(
+            structured.get("truncated").is_none(),
+            "nothing was cut, so nothing is said about cutting"
+        );
+    }
+
+    /// A window past the end is an empty answer rather than an error: reading
+    /// on until nothing comes back is how a caller walks a document, and the
+    /// last step of that walk is not a mistake.
+    #[test]
+    fn a_window_past_the_end_reads_nothing() {
+        let (_project, mut session) = with_body("short");
+
+        let response = read(&mut session, json!({"key": "manual", "offset": 99}));
+
+        let structured = response.pointer("/result/structuredContent").unwrap();
+        assert_eq!(structured.get("content").and_then(Value::as_str), Some(""));
+        assert_eq!(
+            structured.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    /// A window of nothing is a caller that meant something else.
+    #[test]
+    fn a_window_of_zero_characters_is_refused() {
+        let (_project, mut session) = with_body("short");
+
+        let response = read(&mut session, json!({"key": "manual", "limit": 0}));
+
+        assert_eq!(
+            response
+                .pointer("/result/structuredContent/error/kind")
+                .and_then(Value::as_str),
+            Some("invalid_argument")
+        );
+        assert_eq!(
+            response
+                .pointer("/result/structuredContent/error/data/field")
+                .and_then(Value::as_str),
+            Some("limit")
+        );
+    }
+
     /// A revision says something changed. This says what, which is the thing
     /// an editor holding one record open needs in order to re-read that record
     /// instead of throwing away everything it knows.

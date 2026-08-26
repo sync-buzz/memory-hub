@@ -21,7 +21,7 @@ use lancedb::DistanceType;
 use lancedb::connection::Connection;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use memory_hub_core::{Envelope, StoredRecord};
 use memory_hub_embed::{
     EmbeddingProvider, Fingerprint, content_hash_of, renderer::render_envelope_inner,
@@ -64,6 +64,44 @@ const RRF_K: usize = 60;
 const VECTOR_FETCH: usize = 20;
 /// Batch size for embedding during a full rebuild.
 const EMBED_BATCH: usize = 128;
+/// How much of a body travels with a hit, in characters.
+///
+/// A search answers which records to read, not what they say, and the two are
+/// not the same size: a body is however long somebody wrote it, and twenty of
+/// them are a corpus. This is the width of the window cut around the match —
+/// wide enough to tell two records with the same title apart and to show why
+/// this one ranked, narrow enough that a page of hits stays a page.
+const EXCERPT_CHARS: usize = 240;
+/// How much context is kept ahead of the match inside that window.
+const EXCERPT_LEAD: usize = EXCERPT_CHARS / 4;
+/// How far back a window is nudged to start on a word boundary.
+const EXCERPT_SNAP: usize = 24;
+/// How far the matches are counted before the count is reported as a floor.
+///
+/// `total` is a number somebody is shown, so it has to be the number of
+/// matches rather than the size of the page that was read. Counting is a
+/// second pass over the index, and past a thousand the exact figure stops
+/// being information a person acts on — so it stops there and says it stopped,
+/// which is a different statement from "there are exactly a thousand".
+const TOTAL_COUNT_CAP: usize = 1000;
+/// The one column a counting pass reads when the filters are all in the SQL.
+///
+/// Counting is a question about how many rows came back, not about what is in
+/// them: reading `content` to answer it would move the corpus through memory
+/// for a number.
+const COUNT_COLUMN: &str = "id";
+/// The columns a counting pass reads when a filter has to be applied in
+/// memory — an exotic kind or folder the SQL literal rule cannot carry, or
+/// tags, which are one delimited column and never reach the predicate.
+const COUNT_COLUMNS: &[&str] = &[
+    "id",
+    "kind",
+    "title",
+    "archived",
+    "freshness",
+    "tags",
+    "folder",
+];
 
 /// What a locator points at, as far as an index is concerned.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,7 +240,27 @@ pub struct SearchHit {
     pub id: String,
     pub kind: Option<String>,
     pub title: Option<String>,
-    pub content: Option<String>,
+    /// The window of the body around what matched, never the body itself.
+    ///
+    /// A hit says which record to read and why it ranked; the record itself is
+    /// read by key, once, by whoever decided to read it. Sending the body with
+    /// every hit sends a corpus to answer a question about it — and the two
+    /// callers there are both throw it away, one after a hundred and sixty
+    /// characters of preview and the other after deciding which key to open.
+    ///
+    /// `None` when the row carried no body: a binary document, a document this
+    /// branch does not have, or a counting pass that never read the column.
+    pub excerpt: Option<String>,
+    /// Where the window starts, in characters from the beginning of the body.
+    ///
+    /// The address of what was found, so reading on can start there instead of
+    /// at the top of a document nobody wants all of.
+    pub excerpt_at: Option<usize>,
+    /// How long the body is, in characters.
+    ///
+    /// Said so the caller can tell a note from a manual before it asks for
+    /// either, and size its read accordingly.
+    pub content_chars: usize,
     pub archived: bool,
     pub freshness: Option<String>,
     pub tags: Vec<String>,
@@ -251,11 +309,23 @@ pub enum MatchedBy {
 #[derive(Clone, Debug, Serialize)]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
+    /// How many records matched, not how many were read.
+    ///
+    /// Counted by a second, narrow pass when the first page filled — the page
+    /// itself only ever holds `limit` of them, and a total taken from its
+    /// length would be `limit + 1` for every question with more answers than
+    /// fit. Capped: see `total_capped`.
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
     pub has_more: bool,
     pub mode: SearchMode,
+    /// `true` when `total` is a floor rather than a count.
+    ///
+    /// Counting stops at [`TOTAL_COUNT_CAP`]. A caller showing "1000 found"
+    /// where the truth is "at least a thousand" is showing a number that will
+    /// not change when the corpus grows, and it should say so.
+    pub total_capped: bool,
     /// `true` when vector search was requested but unavailable (FTS-only).
     pub degraded: bool,
     /// Revision the index represented when serving this search.
@@ -783,8 +853,14 @@ impl Projection {
             .await
             .map_err(lance_error)?;
 
-        let mut hits = decode_search_hits(&batches)?;
+        let terms = excerpt_terms(&request.query);
+        let mut hits = decode_search_hits(&batches, &terms)?;
         retain_in_memory(&mut hits, &request.filters, &predicate);
+        // Whether the words channel filled the page it was given. It did not
+        // necessarily find everything — the fetch is a page, not a corpus —
+        // which is exactly when the number of matches has to be counted rather
+        // than read off the length of what came back.
+        let saturated = hits.len() >= fetch;
 
         // Part of a word is still a word somebody typed. BM25 matches whole
         // terms — `arch` does not find `architecture`, which reads as the
@@ -825,16 +901,27 @@ impl Projection {
             }
         }
 
-        let filtered_total = hits.len();
-        let has_more = filtered_total > limit + offset;
+        // A page that did not fill is the whole answer, and counting it again
+        // would be a second pass over the index to learn what is already in
+        // hand. Only a saturated one is counted — and only the words channel
+        // can saturate, since the other two run precisely when it came back
+        // thin.
+        let (total, total_capped) = if saturated {
+            self.count_matches(&table, request, &predicate).await?
+        } else {
+            (hits.len(), false)
+        };
+        let total = total.max(hits.len());
+        let has_more = total > limit + offset;
         let page: Vec<SearchHit> = hits.into_iter().skip(offset).take(limit).collect();
         Ok(SearchResult {
             hits: page,
-            total: filtered_total,
+            total,
             limit,
             offset,
             has_more,
             mode,
+            total_capped,
             degraded,
             revision: request.revision.clone(),
         })
@@ -885,9 +972,61 @@ impl Projection {
             .await
             .map_err(lance_error)?;
 
-        let mut hits = decode_search_hits(&batches)?;
+        let mut hits = decode_search_hits(&batches, &excerpt_terms(&request.query))?;
         retain_in_memory(&mut hits, &request.filters, predicate);
         Ok(hits)
+    }
+
+    /// Count the records a query matches, up to [`TOTAL_COUNT_CAP`].
+    ///
+    /// The same query as the page, asked of the same index with the same
+    /// filters, and reading none of the text: `total` is a count, and a count
+    /// that moved every matching body through memory would cost more than the
+    /// answer it produces. Returns the count and whether it stopped at the cap.
+    async fn count_matches(
+        &self,
+        table: &lancedb::Table,
+        request: &SearchRequest,
+        predicate: &Predicate,
+    ) -> Result<(usize, bool), IndexError> {
+        // Whether anything is left for memory to decide. When the predicate
+        // carried every filter — which is the ordinary case — the rows that
+        // come back are the matches, and counting them is counting rows.
+        let residual = !predicate.residual_kinds.is_empty()
+            || predicate.residual_folder.is_some()
+            || !request.filters.tags.is_empty();
+        let columns: Vec<String> = if residual {
+            COUNT_COLUMNS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        } else {
+            vec![COUNT_COLUMN.to_owned()]
+        };
+        let mut query = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new(request.query.clone()))
+            .select(Select::Columns(columns))
+            .limit(TOTAL_COUNT_CAP);
+        if let Some(ref sql) = predicate.sql {
+            query = query.only_if(sql);
+        }
+        let batches = query
+            .execute()
+            .await
+            .map_err(lance_error)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(lance_error)?;
+        let read: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let counted = if residual {
+            let mut hits = decode_search_hits(&batches, &[])?;
+            retain_in_memory(&mut hits, &request.filters, predicate);
+            hits.len()
+        } else {
+            read
+        };
+        Ok((counted, read >= TOTAL_COUNT_CAP))
     }
 
     /// Run the vector kNN channel for a query whose BM25 result was thin.
@@ -1611,7 +1750,174 @@ fn decode_batches(batches: &[RecordBatch]) -> Result<Vec<ProjectedRecord>, Index
     Ok(rows)
 }
 
-fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexError> {
+/// What a hit says about a body without carrying it.
+struct Excerpt {
+    text: Option<String>,
+    at: Option<usize>,
+    chars: usize,
+}
+
+/// The query's terms, lowercased, ready to be looked for in a body.
+fn excerpt_terms(query: &str) -> Vec<Vec<char>> {
+    query
+        .split_whitespace()
+        .map(lower_chars)
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+/// Lowercase a string keeping one character for each character.
+///
+/// `str::to_lowercase` may change a string's length — `İ` folds to two
+/// characters — and the window this feeds is addressed by an offset into the
+/// body somebody reads afterwards. One character in, one out, keeps that
+/// address true. The few foldings it gets wrong are ones no query here turns
+/// on, and getting them wrong costs a window that starts a word early.
+fn lower_chars(text: &str) -> Vec<char> {
+    text.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// Cut the window a hit carries out of a body.
+///
+/// The window goes where the most of the query is: the position that holds the
+/// largest number of distinct terms within one width, earliest when several tie.
+/// A body no term appears in — every hit the meaning channel finds, and it is
+/// honest about it — is shown from the top instead, because there is no match
+/// to be beside and pretending otherwise would explain a rank that has nothing
+/// to do with words.
+fn excerpt_of(content: &str, terms: &[Vec<char>]) -> Excerpt {
+    let body: Vec<char> = content.chars().collect();
+    if body.is_empty() {
+        return Excerpt {
+            text: None,
+            at: None,
+            chars: 0,
+        };
+    }
+    let lowered = lower_chars(content);
+    let found = best_match(&lowered, terms);
+    let start = snap_back(&body, found.map_or(0, |at| at.saturating_sub(EXCERPT_LEAD)));
+    let end = snap_forward(&body, start.saturating_add(EXCERPT_CHARS).min(body.len()));
+
+    let mut text = String::new();
+    if start > 0 {
+        text.push('…');
+    }
+    // Line breaks and runs of spaces are folded away: what this is read
+    // against is a row in a list and a page in a context window, and neither
+    // gains anything from the shape the paragraph had.
+    let mut first = true;
+    for word in body[start..end].split(|c: &char| c.is_whitespace()) {
+        if word.is_empty() {
+            continue;
+        }
+        if !first {
+            text.push(' ');
+        }
+        text.extend(word.iter());
+        first = false;
+    }
+    if end < body.len() {
+        text.push('…');
+    }
+    if first {
+        // Nothing but whitespace in the window — a body of blank lines is not
+        // a body anybody can be shown.
+        return Excerpt {
+            text: None,
+            at: None,
+            chars: body.len(),
+        };
+    }
+    Excerpt {
+        text: Some(text),
+        at: Some(start),
+        chars: body.len(),
+    }
+}
+
+/// Where in a body the query is densest, or `None` when none of it is there.
+fn best_match(lowered: &[char], terms: &[Vec<char>]) -> Option<usize> {
+    let mut positions: Vec<(usize, usize)> = Vec::new();
+    for (index, term) in terms.iter().enumerate() {
+        for at in occurrences(lowered, term) {
+            positions.push((at, index));
+        }
+    }
+    positions.sort_unstable();
+    let mut best: Option<(usize, usize)> = None;
+    for (window_index, &(at, _)) in positions.iter().enumerate() {
+        let mut seen: Vec<usize> = Vec::new();
+        for &(other, term) in &positions[window_index..] {
+            if other >= at + EXCERPT_CHARS {
+                break;
+            }
+            if !seen.contains(&term) {
+                seen.push(term);
+            }
+        }
+        if best.is_none_or(|(count, _)| seen.len() > count) {
+            best = Some((seen.len(), at));
+        }
+    }
+    best.map(|(_, at)| at)
+}
+
+/// Every place a term appears, up to the point where more of them stop
+/// changing which window wins.
+fn occurrences(haystack: &[char], needle: &[char]) -> Vec<usize> {
+    /// Enough occurrences to find the densest window; a term repeated more
+    /// than this says the same thing about every part of the body.
+    const MAX_OCCURRENCES: usize = 64;
+    let mut found = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return found;
+    }
+    for at in 0..=(haystack.len() - needle.len()) {
+        if haystack[at..at + needle.len()] == *needle {
+            found.push(at);
+            if found.len() == MAX_OCCURRENCES {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Move a window's start back to a word boundary, if one is close enough.
+fn snap_back(body: &[char], start: usize) -> usize {
+    if start == 0 {
+        return 0;
+    }
+    let floor = start.saturating_sub(EXCERPT_SNAP);
+    for at in (floor..start).rev() {
+        if body[at].is_whitespace() {
+            return at + 1;
+        }
+    }
+    start
+}
+
+/// Move a window's end forward to a word boundary, if one is close enough.
+fn snap_forward(body: &[char], end: usize) -> usize {
+    if end >= body.len() {
+        return body.len();
+    }
+    let ceiling = (end + EXCERPT_SNAP).min(body.len());
+    for (at, character) in body.iter().enumerate().take(ceiling).skip(end) {
+        if character.is_whitespace() {
+            return at;
+        }
+    }
+    end
+}
+
+fn decode_search_hits(
+    batches: &[RecordBatch],
+    terms: &[Vec<char>],
+) -> Result<Vec<SearchHit>, IndexError> {
     let mut hits = Vec::new();
     for batch in batches {
         let strings = |name: &str| -> Result<&StringArray, IndexError> {
@@ -1623,13 +1929,16 @@ fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
         let ids = strings("id")?;
         let kinds = strings("kind")?;
         let titles = strings("title")?;
-        let contents = strings("content")?;
         let freshness = strings("freshness")?;
         let optional_column = |name: &str| -> Option<&StringArray> {
             batch
                 .column_by_name(name)
                 .and_then(|value| value.as_any().downcast_ref::<StringArray>())
         };
+        // Optional because a counting pass does not read it: the column is
+        // the largest in the table, and how many records matched is a question
+        // that can be answered without their text.
+        let contents = optional_column("content");
         let folders = optional_column("folder");
         let presences = optional_column("presence");
         let content_kinds = optional_column("content_kind");
@@ -1653,11 +1962,23 @@ fn decode_search_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
                 .unwrap_or_default();
             let fts_score = distance
                 .and_then(|array| (!array.is_null(row)).then(|| f64::from(array.value(row))));
+            let excerpt = contents
+                .and_then(|array| (!array.is_null(row)).then(|| array.value(row)))
+                .map_or_else(
+                    || Excerpt {
+                        text: None,
+                        at: None,
+                        chars: 0,
+                    },
+                    |body| excerpt_of(body, terms),
+                );
             hits.push(SearchHit {
                 id: ids.value(row).to_owned(),
                 kind: optional(kinds),
                 title: optional(titles),
-                content: optional(contents),
+                excerpt: excerpt.text,
+                excerpt_at: excerpt.at,
+                content_chars: excerpt.chars,
                 archived: archived.value(row),
                 freshness: optional(freshness),
                 tags,
@@ -2127,13 +2448,13 @@ fn decode_vector_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
         let ids = strings("id")?;
         let kinds = strings("kind")?;
         let titles = strings("title")?;
-        let contents = strings("content")?;
         let freshness = strings("freshness")?;
         let optional_column = |name: &str| -> Option<&StringArray> {
             batch
                 .column_by_name(name)
                 .and_then(|value| value.as_any().downcast_ref::<StringArray>())
         };
+        let contents = optional_column("content");
         let folders = optional_column("folder");
         let presences = optional_column("presence");
         let content_kinds = optional_column("content_kind");
@@ -2162,11 +2483,26 @@ fn decode_vector_hits(batches: &[RecordBatch]) -> Result<Vec<SearchHit>, IndexEr
                 })
             });
             let Some(score) = vector_score else { continue };
+            // No terms: this channel found the record without any of the
+            // query's words being in it, so there is nothing to cut a window
+            // around and the top of the body is the honest answer.
+            let excerpt = contents
+                .and_then(|array| (!array.is_null(row)).then(|| array.value(row)))
+                .map_or_else(
+                    || Excerpt {
+                        text: None,
+                        at: None,
+                        chars: 0,
+                    },
+                    |body| excerpt_of(body, &[]),
+                );
             hits.push(SearchHit {
                 id: ids.value(row).to_owned(),
                 kind: optional(kinds),
                 title: optional(titles),
-                content: optional(contents),
+                excerpt: excerpt.text,
+                excerpt_at: excerpt.at,
+                content_chars: excerpt.chars,
                 archived: archived.value(row),
                 freshness: optional(freshness),
                 tags,
@@ -2259,6 +2595,76 @@ mod tests {
     use memory_hub_store::{GitStore, Operation, Transaction};
 
     use super::{Projection, TABLE};
+
+    use super::{excerpt_of, excerpt_terms};
+
+    /// The window goes where the query is, not where the document begins.
+    #[test]
+    fn a_window_is_cut_around_the_densest_part_of_the_query() {
+        let body = format!(
+            "{}The engine and the window disagree about folders.{}",
+            "preamble that answers nothing. ".repeat(20),
+            " tail".repeat(40)
+        );
+
+        let cut = excerpt_of(&body, &excerpt_terms("engine window"));
+
+        let text = cut.text.unwrap();
+        assert!(text.contains("engine and the window"), "got {text:?}");
+        assert!(text.starts_with('…'), "a window that starts inside says so");
+        assert_eq!(cut.chars, body.chars().count());
+    }
+
+    /// Nothing to be beside. A hit the meaning channel found holds none of the
+    /// query's words, and inventing a window around one of them would explain
+    /// a rank that has nothing to do with words.
+    #[test]
+    fn a_body_without_the_words_is_shown_from_the_top() {
+        let body = "First line of a record nobody asked for by name. ".repeat(20);
+
+        let cut = excerpt_of(&body, &excerpt_terms("kingfisher"));
+
+        let text = cut.text.unwrap();
+        assert_eq!(cut.at, Some(0));
+        assert!(text.starts_with("First line"), "got {text:?}");
+        assert!(text.ends_with('…'), "there is more of it than the window");
+    }
+
+    /// A short body is its own window: nothing is cut, and nothing pretends to
+    /// have been.
+    #[test]
+    fn a_body_shorter_than_the_window_arrives_whole() {
+        let cut = excerpt_of("Folders are not types.", &excerpt_terms("types"));
+
+        assert_eq!(cut.text.as_deref(), Some("Folders are not types."));
+        assert_eq!(cut.at, Some(0));
+        assert_eq!(cut.chars, 22);
+    }
+
+    /// An empty body has no window and says so, rather than answering with an
+    /// empty string a caller has to tell apart from a blank document.
+    #[test]
+    fn an_empty_body_has_no_window() {
+        let cut = excerpt_of("", &excerpt_terms("anything"));
+
+        assert!(cut.text.is_none());
+        assert!(cut.at.is_none());
+        assert_eq!(cut.chars, 0);
+    }
+
+    /// The offset addresses characters, so a body of multi-byte characters is
+    /// still readable from where the window says it starts.
+    #[test]
+    fn the_offset_counts_characters_not_bytes() {
+        let body = format!("{}кингфишер живёт здесь", "тишина ".repeat(60));
+
+        let cut = excerpt_of(&body, &excerpt_terms("кингфишер"));
+
+        let at = cut.at.unwrap();
+        let from_there: String = body.chars().skip(at).collect();
+        assert!(from_there.starts_with("кингфишер") || from_there.contains("кингфишер"));
+        assert!(cut.text.unwrap().contains("кингфишер"));
+    }
 
     #[tokio::test]
     async fn synchronize_rebuilds_when_fts_metadata_is_missing() {
