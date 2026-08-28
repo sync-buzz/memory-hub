@@ -1647,6 +1647,20 @@ fn merge(body: &mut Value, fragment: Value) {
 
 /// `metadata_only` omits content, links and paths — the shape a UI list needs
 /// without transferring every body.
+///
+/// Whichever shape, the record's **product fields travel with it**. A type
+/// declares them, the validator holds records to them, and a client that lists
+/// records groups and sorts by them — so a listing that left them out handed
+/// every caller a row that reads as the type's declared defaults. Measured on a
+/// register of tasks: five records, two of them `blocked` or `in_progress` on
+/// the record itself, listed as five records with no status at all and drawn by
+/// the client as five that had not been started. Nothing failed and nothing was
+/// logged, which is what made it expensive to find.
+///
+/// They are written under the envelope's own members rather than over them: a
+/// type may not declare a field the envelope owns — that is refused where the
+/// type is published — and this is the same rule held one more time, at the
+/// only place where a stored record could ever contradict it.
 fn render_record(key: &str, envelope: &Envelope, metadata_only: bool) -> Value {
     let mut record = if metadata_only {
         json!({
@@ -1695,6 +1709,15 @@ fn render_record(key: &str, envelope: &Envelope, metadata_only: bool) -> Value {
     // bytes to find out.
     if let Some(media_type) = &envelope.media_type {
         record["media_type"] = json!(media_type);
+    }
+    // What the record's own type declared, exactly as it is stored. They live
+    // in `extensions` because the envelope flattens anything it does not own
+    // onto the top level, which is also where the validator reads them from —
+    // so this is that rule in reverse rather than a shape invented here.
+    if let Some(object) = record.as_object_mut() {
+        for (name, value) in &envelope.extensions {
+            object.entry(name.clone()).or_insert_with(|| value.clone());
+        }
     }
     record
 }
@@ -2840,9 +2863,59 @@ fn unresolved_json(unresolved: &Unresolved) -> Value {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{MCP_PROTOCOL_VERSION, MEMORY_INTERFACE_MAJOR, RecordsIn, Session, serve_io};
+    use super::{
+        MCP_PROTOCOL_VERSION, MEMORY_INTERFACE_MAJOR, RecordsIn, Session, render_record, serve_io,
+    };
+    use memory_hub_core::Envelope;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
+
+    /// A listed record carries what its own type declared.
+    ///
+    /// The defect this covers was silent in both directions. A client names the
+    /// fields its list draws — `status`, `priority` — and got rows without
+    /// them, so it drew the type's declared defaults: a register with work in
+    /// flight read as a register nobody had started. Nothing failed, nothing
+    /// was logged, and the only way to see it was to fetch a record by key and
+    /// compare.
+    ///
+    /// Both shapes, because a list is exactly what `metadata_only` is for, and
+    /// a list is what groups by these.
+    #[test]
+    fn a_listed_record_carries_its_product_fields() {
+        let mut envelope = Envelope::new("t-1", "tasks.task", "Fix it").unwrap();
+        envelope.title = Some("Fix the login redirect loop".to_owned());
+        envelope
+            .extensions
+            .insert("status".to_owned(), json!("blocked"));
+        envelope
+            .extensions
+            .insert("priority".to_owned(), json!("high"));
+        // A type may not declare a field the envelope owns, and this is that
+        // rule held once more at the last place a stored record could break it.
+        envelope
+            .extensions
+            .insert("title".to_owned(), json!("not the title"));
+
+        for metadata_only in [false, true] {
+            let row = render_record("t-1", &envelope, metadata_only);
+            assert_eq!(
+                row.get("status").and_then(Value::as_str),
+                Some("blocked"),
+                "metadata_only={metadata_only}"
+            );
+            assert_eq!(
+                row.get("priority").and_then(Value::as_str),
+                Some("high"),
+                "metadata_only={metadata_only}"
+            );
+            assert_eq!(
+                row.get("title").and_then(Value::as_str),
+                Some("Fix the login redirect loop"),
+                "the envelope's own member survives, metadata_only={metadata_only}"
+            );
+        }
+    }
 
     #[test]
     fn incompatible_interface_fails_before_creating_memory_refs() {
