@@ -307,61 +307,16 @@ fn apply_transaction(
             data: json!({"missing_revision": state.current}),
         })?;
 
-    let mut keys = BTreeSet::new();
-    for operation in operations {
-        let key = operation_key(operation)?;
-        if !keys.insert(key.to_owned()) {
-            return Err(ToolFailure {
-                kind: "duplicate_operation",
-                data: json!({"key": key}),
-            });
-        }
-        if operation.get("op").and_then(Value::as_str) == Some("delete")
-            && !current.records.contains_key(key)
-        {
-            return Err(ToolFailure {
-                kind: "record_not_found",
-                data: json!({"key": key}),
-            });
-        }
-    }
+    let keys = admissible_keys(operations, &current)?;
+    refuse_a_race(
+        &keys,
+        expected_revision,
+        &state.current,
+        &expected,
+        &current,
+    )?;
 
-    if expected_revision != state.current {
-        let conflicting_keys: Vec<_> = keys
-            .iter()
-            .filter(|key| expected.records.get(*key) != current.records.get(*key))
-            .cloned()
-            .collect();
-        if !conflicting_keys.is_empty() {
-            return Err(ToolFailure {
-                kind: "conflict",
-                data: json!({
-                    "expected_revision": expected_revision,
-                    "current_revision": state.current,
-                    "conflicting_keys": conflicting_keys,
-                    "recovery_action": "refresh_and_retry"
-                }),
-            });
-        }
-    }
-
-    let mut next = current;
-    for operation in operations {
-        let key = operation_key(operation)?.to_owned();
-        match operation.get("op").and_then(Value::as_str) {
-            Some("put") => {
-                let record = operation
-                    .get("record")
-                    .cloned()
-                    .ok_or_else(|| invalid_argument("record"))?;
-                next.records.insert(key, record);
-            }
-            Some("delete") => {
-                next.records.remove(&key);
-            }
-            _ => return Err(invalid_argument("op")),
-        }
-    }
+    let next = applied(current, operations)?;
     let revision = format!("r{}", state.next_revision);
     state.next_revision += 1;
     let parent = state.current.clone();
@@ -383,6 +338,91 @@ fn apply_transaction(
     pause_before_commit(progress_token, output)?;
     save_state(state_path, &state).map_err(state_failure)?;
     Ok(json!(result))
+}
+
+/// The keys a batch touches, refusing the batch where it cannot be applied.
+///
+/// Split out of `apply_transaction` because it is one question — *may this
+/// batch be applied at all* — and because a function long enough to need
+/// scrolling is a function whose early returns stop being read.
+fn admissible_keys(
+    operations: &[Value],
+    current: &Snapshot,
+) -> Result<BTreeSet<String>, ToolFailure> {
+    let mut keys = BTreeSet::new();
+    for operation in operations {
+        let key = operation_key(operation)?;
+        if !keys.insert(key.to_owned()) {
+            return Err(ToolFailure {
+                kind: "duplicate_operation",
+                data: json!({"key": key}),
+            });
+        }
+        if operation.get("op").and_then(Value::as_str) == Some("delete")
+            && !current.records.contains_key(key)
+        {
+            return Err(ToolFailure {
+                kind: "record_not_found",
+                data: json!({"key": key}),
+            });
+        }
+    }
+    Ok(keys)
+}
+
+/// Refuse a batch whose keys moved under it since the caller last looked.
+///
+/// A write against an older revision is fine while nobody else touched the same
+/// records — that is the rebase the real store performs — so what is compared is
+/// the keys of this batch and not the revisions.
+fn refuse_a_race(
+    keys: &BTreeSet<String>,
+    expected_revision: &str,
+    current_revision: &str,
+    expected: &Snapshot,
+    current: &Snapshot,
+) -> Result<(), ToolFailure> {
+    if expected_revision == current_revision {
+        return Ok(());
+    }
+    let conflicting_keys: Vec<_> = keys
+        .iter()
+        .filter(|key| expected.records.get(*key) != current.records.get(*key))
+        .cloned()
+        .collect();
+    if conflicting_keys.is_empty() {
+        return Ok(());
+    }
+    Err(ToolFailure {
+        kind: "conflict",
+        data: json!({
+            "expected_revision": expected_revision,
+            "current_revision": current_revision,
+            "conflicting_keys": conflicting_keys,
+            "recovery_action": "refresh_and_retry"
+        }),
+    })
+}
+
+/// The snapshot a batch leaves behind.
+fn applied(mut snapshot: Snapshot, operations: &[Value]) -> Result<Snapshot, ToolFailure> {
+    for operation in operations {
+        let key = operation_key(operation)?.to_owned();
+        match operation.get("op").and_then(Value::as_str) {
+            Some("put") => {
+                let record = operation
+                    .get("record")
+                    .cloned()
+                    .ok_or_else(|| invalid_argument("record"))?;
+                snapshot.records.insert(key, record);
+            }
+            Some("delete") => {
+                snapshot.records.remove(&key);
+            }
+            _ => return Err(invalid_argument("op")),
+        }
+    }
+    Ok(snapshot)
 }
 
 fn get_record(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
