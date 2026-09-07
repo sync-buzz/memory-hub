@@ -15,9 +15,11 @@ use sha2::{Digest, Sha256};
 
 use crate::error::GitStoreError;
 use crate::types::{GitRecordId, GitRevision};
+use memory_hub_engine::{Journal, JournalEntry};
+
 use crate::{
-    ApplyResult, ChangeKind, ExportBundle, ExportMode, MAIN_REF, Operation, RecordChange, RecordId,
-    Revision, StoreError, StoreErrorKind, StoreView, Transaction, TransactionPolicy,
+    ApplyResult, ExportBundle, ExportMode, MAIN_REF, Operation, RecordChange, RecordId, Revision,
+    StoreError, StoreErrorKind, StoreView, Transaction, TransactionPolicy,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -31,9 +33,9 @@ mod chain;
 mod records;
 use chain::{
     changes_since, find_transaction, genesis_commit, memory_commit, require_retained_revision,
-    transaction_commit,
+    transaction_commit, transaction_metadata,
 };
-use records::{build_tree, decode_record, snapshot_tree, verify_record_location};
+use records::{build_tree, decode_record, snapshot_tree, tree_changes, verify_record_location};
 
 #[derive(Clone, Debug)]
 pub struct GitStore {
@@ -259,35 +261,80 @@ impl GitStore {
         let repository = self.repository()?;
         let from_tree = snapshot_tree(&repository, from)?;
         let to_tree = snapshot_tree(&repository, to)?;
-        let diff = repository
-            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
-            .map_err(|error| StoreError::repository("diff memory trees", error))?;
-        let mut changes = Vec::new();
-        for delta in diff.deltas() {
-            let (oid, kind) = match delta.status() {
-                git2::Delta::Added => (delta.new_file().id(), ChangeKind::Added),
-                git2::Delta::Deleted => (delta.old_file().id(), ChangeKind::Deleted),
-                git2::Delta::Modified => (delta.new_file().id(), ChangeKind::Modified),
-                _ => continue,
-            };
-            let path = match kind {
-                ChangeKind::Deleted => delta.old_file().path(),
-                ChangeKind::Added | ChangeKind::Modified => delta.new_file().path(),
-            };
-            if !path
-                .and_then(Path::to_str)
-                .is_some_and(|path| path.starts_with("r-"))
-            {
-                continue;
+        Ok(tree_changes(&repository, &from_tree, &to_tree)?
+            .into_iter()
+            .map(|change| RecordChange {
+                id: change.id,
+                kind: change.change,
+            })
+            .collect())
+    }
+
+    /// Walk the transactions between two states, newest first.
+    ///
+    /// The history is a chain of first parents and this follows it, which is
+    /// why `from` has to be an ancestor of `to`: a walk that never meets its
+    /// stopping point would otherwise run to the genesis commit and report the
+    /// whole store as news.
+    ///
+    /// Each entry costs one tree comparison against the transaction's own
+    /// parent. That is the difference from [`GitStore::diff`] and the reason
+    /// the two cannot share an answer: a record written three times between the
+    /// same pair of revisions is one line in a diff and three events here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if either revision is invalid, a commit is not a
+    /// well-formed transaction, or `from` is not an ancestor of `to`.
+    pub fn journal(
+        &self,
+        from: &Revision,
+        to: &Revision,
+        limit: usize,
+    ) -> Result<Journal, StoreError> {
+        let repository = self.repository()?;
+        let from_oid = from.oid()?;
+        let to_oid = to.oid()?;
+        require_retained_revision(&repository, from_oid)?;
+        require_retained_revision(&repository, to_oid)?;
+
+        let mut entries = Vec::new();
+        let mut cursor = to_oid;
+        while cursor != from_oid {
+            if entries.len() >= limit {
+                return Ok(Journal {
+                    entries,
+                    has_more: true,
+                });
             }
-            let record = decode_record(&repository, oid)?;
-            changes.push(RecordChange {
-                id: RecordId::from_record(&record),
-                kind,
+            let commit = memory_commit(&repository, cursor)?;
+            let metadata = transaction_metadata(&commit)?;
+            let parent_oid = commit.parent_id(0).map_err(|_| {
+                StoreError::new(
+                    StoreErrorKind::RevisionNotFound,
+                    "from_revision is not an ancestor of to_revision",
+                    serde_json::json!({"from_revision": from.to_string()}),
+                )
+            })?;
+            let parent = memory_commit(&repository, parent_oid)?;
+            let tree = commit
+                .tree()
+                .map_err(|error| StoreError::repository("read transaction tree", error))?;
+            let parent_tree = parent
+                .tree()
+                .map_err(|error| StoreError::repository("read parent tree", error))?;
+            entries.push(JournalEntry {
+                revision: Revision::from_oid(cursor),
+                at_epoch_seconds: commit.time().seconds(),
+                transaction_id: metadata.transaction_id,
+                changes: tree_changes(&repository, &parent_tree, &tree)?,
             });
+            cursor = parent_oid;
         }
-        changes.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(changes)
+        Ok(Journal {
+            entries,
+            has_more: false,
+        })
     }
 
     /// Export a record-only JSON bundle in [`ExportMode::Manifest`].

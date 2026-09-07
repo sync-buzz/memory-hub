@@ -149,6 +149,67 @@ pub struct RecordChange {
     pub kind: ChangeKind,
 }
 
+/// One transaction of the history, with what it did to the records.
+///
+/// A diff answers *what is different between these two states*; this answers
+/// *what happened, one write at a time*. The difference matters to anything
+/// that shows a person what has been going on: a record written three times
+/// is one line in a diff and three events here, and only the second can say
+/// when each of them was or who made it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JournalEntry {
+    /// The state this transaction left the store in.
+    pub revision: Revision,
+    /// When it landed, in seconds since the epoch, UTC.
+    ///
+    /// A number rather than a formatted time, and the name says which unit so
+    /// nobody has to guess between seconds and milliseconds. Formatting it is
+    /// the reader's: the store has no timezone, no locale and no opinion about
+    /// either, and a string here would be all three decided in the wrong place.
+    pub at_epoch_seconds: i64,
+    /// The id the writer minted for this transaction.
+    ///
+    /// Carried as it was written rather than interpreted. Callers put their own
+    /// occasion in front of it — the engine neither imposes that shape nor
+    /// parses it, so a client that gave its writes meaningful prefixes gets
+    /// them back and one that did not loses nothing it had.
+    pub transaction_id: Option<String>,
+    /// What this transaction did, one entry per record it touched.
+    pub changes: Vec<JournalChange>,
+}
+
+/// What one transaction did to one record.
+///
+/// It carries the record's own kind and title beside the change because the
+/// alternative is reading every key back, and for a deleted record there is
+/// nothing left to read: a history that could not name what was removed would
+/// report the one event a person most wants named.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JournalChange {
+    pub id: RecordId,
+    /// Whether the record was added, changed or removed by this transaction.
+    ///
+    /// Spelled `change` rather than `kind`, because `kind` is the record's own
+    /// type everywhere else in this interface and [`RecordChange`] is the one
+    /// place it means something else. That shape is kept for the callers that
+    /// already read it; it is not repeated here.
+    pub change: ChangeKind,
+    /// The record's type, as it stood in this transaction. For a removal, as it
+    /// stood in the version that was removed.
+    pub kind: String,
+    pub title: Option<String>,
+}
+
+/// A page of the history, newest first.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Journal {
+    pub entries: Vec<JournalEntry>,
+    /// True when the walk stopped because it had filled the page, not because
+    /// it had reached the revision it was asked to stop at. A caller that wants
+    /// the rest asks again from the oldest entry it received.
+    pub has_more: bool,
+}
+
 /// What an export does with a record whose content lives outside it.
 ///
 /// Two different requests, not two opinions about one, so the caller chooses

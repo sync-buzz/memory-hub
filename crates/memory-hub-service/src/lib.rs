@@ -43,7 +43,7 @@ use memory_hub_index::{
 use memory_hub_reconcile::{DivergenceMode, ReconcileReport, Reconciler};
 use memory_hub_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition, TypeStorage};
 use memory_hub_store::{
-    ApplyResult, ExportBundle, ExportMode, FetchResult, GitStore, MemoryRemote, Operation,
+    ApplyResult, ExportBundle, ExportMode, FetchResult, GitStore, Journal, MemoryRemote, Operation,
     PushPolicyResult, RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreView,
     Transaction, TransactionPolicy,
 };
@@ -1892,6 +1892,18 @@ impl MemoryService {
     pub fn diff(&self, from: &Revision, to: &Revision) -> Result<Vec<RecordChange>> {
         self.git_store()?
             .diff(from, to)
+            .map_err(ServiceError::store)
+    }
+
+    /// Walk the transactions between two revisions, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when either revision cannot be resolved, or
+    /// when `from` is not an ancestor of `to`.
+    pub fn journal(&self, from: &Revision, to: &Revision, limit: usize) -> Result<Journal> {
+        self.git_store()?
+            .journal(from, to, limit)
             .map_err(ServiceError::store)
     }
 

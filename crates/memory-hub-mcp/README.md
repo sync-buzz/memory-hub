@@ -64,10 +64,24 @@ spans store, read, search, transport, and model operations:
 | `memory_apply_transaction` | `transaction_id`, `expected_revision`, non-empty `operations[]` | `{revision, changed_keys}` |
 | `memory_rename_folder` | `from`, `to`, `transaction_id` | `{revision, changed_keys}` |
 | `memory_diff` | `from_revision`, `to_revision` | `{fromRevision, toRevision, changes}` |
+| `memory_journal` | `from_revision` | `{fromRevision, toRevision, entries, hasMore}` |
 | `memory_export` | `revision` | `{revision, bundle}` |
 | `memory_import` | `transaction_id`, `expected_revision`, `bundle` | `{revision, changed_keys}` |
 | `memory_doctor` | none | repository/store health |
 | `memory_reindex` | none | current durable projection status |
+
+`memory_journal` walks the transactions between two revisions rather than
+comparing the two states: an entry per write, newest first, each carrying the
+revision it produced, `at_epoch_seconds` (UTC), the `transaction_id` its writer
+minted, and the records it touched — `change` beside each one's own `kind` and
+`title`, including for a record it deleted, which nothing can read afterwards.
+`from_revision` is where the walk stops and is not itself reported; `to_revision`
+defaults to the current revision; `limit` defaults to 50 and is clamped to 200,
+with `hasMore` saying the page filled before the walk reached `from_revision`.
+
+The two are not versions of one answer. Between the same pair of revisions a
+record written three times is one line of a diff and three entries here, and a
+record added and then deleted is absent from the diff entirely.
 
 `memory_rename_folder` rewrites `folder` on every record filed under `from` in
 one transaction, the record that is the folder among them. It is refused for a

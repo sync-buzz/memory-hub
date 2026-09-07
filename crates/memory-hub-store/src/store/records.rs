@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use git2::{Oid, Repository, Tree};
 use memory_hub_core::StoredRecord;
@@ -6,6 +7,8 @@ use memory_hub_core::StoredRecord;
 use super::{memory_commit, require_retained_revision, serialization_error};
 use crate::error::GitStoreError;
 use crate::types::{GitRecordId, GitRevision};
+use memory_hub_engine::{ChangeKind, JournalChange};
+
 use crate::{Operation, RecordId, Revision, StoreError, StoreErrorKind, Transaction};
 
 const FILE_MODE: i32 = 0o100_644;
@@ -97,4 +100,54 @@ pub(super) fn snapshot_tree<'repo>(
     memory_commit(repository, oid)?
         .tree()
         .map_err(|error| StoreError::repository("read snapshot tree", error))
+}
+
+/// What one tree did to the records of another, as far as the store can say.
+///
+/// One walk serving both the diff and the history, because they ask the same
+/// question of two different pairs of trees: the diff compares two revisions a
+/// caller named, and the history compares each transaction with its own parent.
+/// Two implementations would be two chances to disagree about which paths hold
+/// records and which deltas are worth reporting.
+///
+/// The record is decoded to name its kind and title. That is a blob read per
+/// change, and it is the price of a history that can say what was removed: for
+/// a deletion there is no version left to read afterwards.
+pub(super) fn tree_changes(
+    repository: &Repository,
+    from: &Tree<'_>,
+    to: &Tree<'_>,
+) -> Result<Vec<JournalChange>, StoreError> {
+    let diff = repository
+        .diff_tree_to_tree(Some(from), Some(to), None)
+        .map_err(|error| StoreError::repository("diff memory trees", error))?;
+    let mut changes = Vec::new();
+    for delta in diff.deltas() {
+        let (oid, change) = match delta.status() {
+            git2::Delta::Added => (delta.new_file().id(), ChangeKind::Added),
+            git2::Delta::Deleted => (delta.old_file().id(), ChangeKind::Deleted),
+            git2::Delta::Modified => (delta.new_file().id(), ChangeKind::Modified),
+            _ => continue,
+        };
+        let path = match change {
+            ChangeKind::Deleted => delta.old_file().path(),
+            ChangeKind::Added | ChangeKind::Modified => delta.new_file().path(),
+        };
+        if !path
+            .and_then(Path::to_str)
+            .is_some_and(|path| path.starts_with("r-"))
+        {
+            continue;
+        }
+        let record = decode_record(repository, oid)?;
+        let StoredRecord::Plaintext { envelope } = &record;
+        changes.push(JournalChange {
+            id: RecordId::from_record(&record),
+            change,
+            kind: envelope.kind.clone(),
+            title: envelope.title.clone(),
+        });
+    }
+    changes.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(changes)
 }

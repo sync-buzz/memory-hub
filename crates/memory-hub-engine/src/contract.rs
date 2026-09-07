@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use memory_hub_core::StoredRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyResult, RecordChange, RecordId, Revision, StoreError, Transaction};
+use crate::{ApplyResult, Journal, RecordChange, RecordId, Revision, StoreError, Transaction};
 
 /// Who writes to the storage.
 ///
@@ -242,6 +242,19 @@ pub trait HistoryStore {
     ///
     /// Returns [`StoreError`] if either revision is invalid.
     fn diff(&self, from: &Revision, to: &Revision) -> Result<Vec<RecordChange>, StoreError>;
+
+    /// Walk the transactions between two states, newest first.
+    ///
+    /// `from` is where the walk stops and is not itself reported: it is the
+    /// state the caller has already seen. `limit` bounds one answer rather than
+    /// the history — a page that filled says so, and the caller asks again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if either revision is invalid, or if `from` is
+    /// not an ancestor of `to` — a walk that cannot reach its stopping point is
+    /// a question about two unrelated histories rather than an empty answer.
+    fn journal(&self, from: &Revision, to: &Revision, limit: usize) -> Result<Journal, StoreError>;
 }
 
 /// A store whose contents can leave it and come back.

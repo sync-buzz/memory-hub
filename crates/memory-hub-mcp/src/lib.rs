@@ -55,7 +55,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 /// discover the difference one broken read at a time. The minor moves for
 /// additive change and is accepted in either direction.
 pub const MEMORY_INTERFACE_MAJOR: u16 = 1;
-pub const MEMORY_INTERFACE_MINOR: u16 = 0;
+pub const MEMORY_INTERFACE_MINOR: u16 = 1;
 
 /// Subscribing to this reports which records changed, not only that something
 /// did. Additive: a client that only knows `memory://revision/current` keeps
@@ -624,6 +624,7 @@ impl Session {
             "memory_create_folder" => self.create_folder(arguments),
             "memory_delete_folder" => self.delete_folder(arguments),
             "memory_diff" => self.diff(arguments),
+            "memory_journal" => self.journal(arguments),
             "memory_export" => self.export(arguments),
             "memory_import" => self.import(arguments),
             "memory_doctor" => self.doctor(),
@@ -936,6 +937,40 @@ impl Session {
         Ok(ToolOutcome::read(
             json!({"fromRevision": from, "toRevision": to, "changes": changes}),
         ))
+    }
+
+    /// The transactions between two revisions, newest first.
+    ///
+    /// `to_revision` is optional and defaults to where memory stands now,
+    /// because the question this answers is almost always "what has happened
+    /// since I last looked": a caller that had to read the current revision
+    /// first would be asking two questions to get one answer, and the store
+    /// could move between them.
+    fn journal(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
+        let from: Revision = parse_field(arguments, "from_revision")?;
+        let to: Revision = match arguments.get("to_revision") {
+            Some(_) => parse_field(arguments, "to_revision")?,
+            None => self
+                .service
+                .current_revision()
+                .map_err(ToolFailure::service)?,
+        };
+        // Clamped rather than refused, which is what `memory_search` and
+        // `memory_list_records` do with the same argument. One behaviour for
+        // one argument is worth more here than the refusal being stricter.
+        let limit = usize::try_from(arguments.get("limit").and_then(Value::as_u64).unwrap_or(50))
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let journal = self
+            .service
+            .journal(&from, &to, limit)
+            .map_err(ToolFailure::service)?;
+        Ok(ToolOutcome::read(json!({
+            "fromRevision": from,
+            "toRevision": to,
+            "entries": journal.entries,
+            "hasMore": journal.has_more,
+        })))
     }
 
     fn export(&self, arguments: &Value) -> Result<ToolOutcome, ToolCallFailure> {
@@ -1886,8 +1921,8 @@ fn builtin_instructions() -> String {
     s.push_str("## Revision Model\n\n");
     s.push_str("Memory lives on one ref, `refs/memory/main`: every transaction is a ");
     s.push_str("commit on it, and every past state is one of its parents. A record is ");
-    s.push_str("readable the moment it is written, and `memory_diff` compares any two ");
-    s.push_str("revisions.\n\n");
+    s.push_str("readable the moment it is written, `memory_diff` compares any two ");
+    s.push_str("revisions, and `memory_journal` walks the transactions between them.\n\n");
     s.push_str("Every mutation returns the new revision, and that value is what ");
     s.push_str("`expected_revision` expects: the last revision you observed. ");
     s.push_str("After mutations, the index is synchronised automatically — no manual ");
@@ -1963,6 +1998,10 @@ fn builtin_instructions() -> String {
 
     s.push_str("\n### History & Reconciliation\n\n");
     s.push_str("- **memory_diff**: Compare two revisions.\n");
+    s.push_str("- **memory_journal** (`from_revision`): What happened between two ");
+    s.push_str("revisions, one transaction at a time, newest first — when each landed, ");
+    s.push_str("the transaction id its writer minted, and the records it touched. Use it ");
+    s.push_str("for what has been going on; use `memory_diff` for what is different now.\n");
     s.push_str("- **memory_reconcile**: Sync Memory with code history. ");
     s.push_str("Code commits since the last reconciled one are processed; ");
     s.push_str("freshness of records is updated based on path overlap.\n");
@@ -2157,6 +2196,30 @@ pub fn list_tools() -> Value {
                     ("to_revision", string_schema()),
                 ],
                 &["from_revision", "to_revision"],
+            ),
+        ),
+        tool(
+            "memory_journal",
+            "What happened between two revisions, one transaction at a time, newest first. \
+             Where `memory_diff` compares two states, this reports the writes that took memory \
+             from one to the other: each entry carries the revision it produced, when it landed \
+             (`at_epoch_seconds`, UTC), the `transaction_id` its writer minted, and the records it \
+             touched with `change` (added, modified or deleted) beside each one's own `kind` and \
+             `title` — including for a record that was deleted, which nothing can read afterwards. \
+             `from_revision` is where the walk stops and is not itself reported: it is the state \
+             you have already seen. `to_revision` defaults to where memory stands now. \
+             `hasMore: true` means the page filled before the walk reached `from_revision`; ask \
+             again from the oldest entry you were given.",
+            object_schema(
+                &[
+                    ("from_revision", string_schema()),
+                    ("to_revision", string_schema()),
+                    (
+                        "limit",
+                        json!({"type":"integer","minimum":1,"maximum":200,"default":50}),
+                    ),
+                ],
+                &["from_revision"],
             ),
         ),
         tool(

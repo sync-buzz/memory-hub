@@ -4067,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4094,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-contract"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "clap",
  "fs2",
@@ -4106,7 +4106,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-core"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4115,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-embed"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4139,7 +4139,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-engine"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "memory-hub-core",
  "serde",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-folder"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "blake3",
  "fs2",
@@ -4163,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-index"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-mcp"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "base64",
  "memory-hub-core",
@@ -4203,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-reconcile"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "fs2",
  "git2",
@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-sample-consumer"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4227,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-schema"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "jsonschema",
  "memory-hub-core",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-service"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "git2",
  "memory-hub-core",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "memory-hub-store"
-version = "0.1.0"
+version = "0.2.4"
 dependencies = [
  "base64",
  "dirs 5.0.1",

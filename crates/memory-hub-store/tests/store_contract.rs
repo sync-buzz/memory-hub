@@ -380,3 +380,101 @@ fn ordinary_clone_and_heads_only_push_do_not_publish_memory_refs()
     assert!(remote_repository.find_reference(MAIN_REF).is_err());
     Ok(())
 }
+
+/// The history says what happened, one write at a time, and a diff does not.
+///
+/// The first pair of assertions is the whole reason it exists: between the same
+/// two revisions, a record written twice is one line of a diff and two events
+/// here.
+#[test]
+fn the_journal_reports_one_entry_per_transaction() -> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, store) = repository()?;
+    let empty = store.current()?.revision().clone();
+    let first = store.apply(&transaction(
+        &store,
+        "window-1",
+        vec![Operation::put(record("one", "version one")?)],
+    )?)?;
+    let second = store.apply(&Transaction {
+        id: "agent-2".into(),
+        expected_revision: first.revision.clone(),
+        operations: vec![
+            Operation::put(record("one", "version two")?),
+            Operation::put(record("two", "another")?),
+        ],
+    })?;
+    let third = store.apply(&Transaction {
+        id: "agent-3".into(),
+        expected_revision: second.revision.clone(),
+        operations: vec![Operation::delete(RecordId::plaintext("two"))],
+    })?;
+
+    assert_eq!(
+        store.diff(&empty, &third.revision)?.len(),
+        1,
+        "the diff sees one record standing"
+    );
+    let journal = store.journal(&empty, &third.revision, 50)?;
+    assert_eq!(journal.entries.len(), 3, "three writes happened");
+    assert!(!journal.has_more);
+
+    let newest = &journal.entries[0];
+    assert_eq!(newest.revision, third.revision, "newest first");
+    assert_eq!(newest.transaction_id.as_deref(), Some("agent-3"));
+    assert_eq!(newest.changes.len(), 1);
+    assert_eq!(newest.changes[0].change, ChangeKind::Deleted);
+    assert_eq!(
+        newest.changes[0].kind, "note",
+        "a removed record is still named by the version that was removed"
+    );
+    assert_eq!(newest.changes[0].id, RecordId::plaintext("two"));
+    assert!(newest.at_epoch_seconds > 0);
+
+    assert_eq!(
+        journal.entries[1].changes.len(),
+        2,
+        "one write, two records"
+    );
+    assert_eq!(
+        journal.entries[2].transaction_id.as_deref(),
+        Some("window-1"),
+        "the id is carried as its writer minted it"
+    );
+
+    let page = store.journal(&empty, &third.revision, 2)?;
+    assert_eq!(page.entries.len(), 2);
+    assert!(page.has_more, "a page that filled says so");
+
+    let nothing = store.journal(&third.revision, &third.revision, 50)?;
+    assert!(nothing.entries.is_empty());
+    assert!(
+        !nothing.has_more,
+        "reaching the stopping point is not a page"
+    );
+
+    Ok(())
+}
+
+/// Two revisions of different histories are a question, not an empty answer.
+#[test]
+fn the_journal_refuses_a_revision_it_cannot_reach() -> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, store) = repository()?;
+    let (_other_directory, other) = repository()?;
+    let here = store.apply(&transaction(
+        &store,
+        "here",
+        vec![Operation::put(record("one", "here")?)],
+    )?)?;
+    let elsewhere = other.apply(&transaction(
+        &other,
+        "elsewhere",
+        vec![Operation::put(record("one", "elsewhere")?)],
+    )?)?;
+
+    let refused = store.journal(&elsewhere.revision, &here.revision, 50);
+    assert!(
+        refused.is_err(),
+        "a walk that cannot reach its stopping point is refused"
+    );
+    Ok(())
+}

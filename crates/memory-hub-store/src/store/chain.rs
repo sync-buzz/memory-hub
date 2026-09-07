@@ -137,7 +137,7 @@ pub(super) fn memory_commit(repository: &Repository, oid: Oid) -> Result<Commit<
     Ok(commit)
 }
 
-fn transaction_metadata(commit: &Commit<'_>) -> Result<TransactionMetadata, StoreError> {
+pub(super) fn transaction_metadata(commit: &Commit<'_>) -> Result<TransactionMetadata, StoreError> {
     let metadata: TransactionMetadata =
         serde_json::from_slice(commit.message_bytes()).map_err(|error| {
             StoreError::new(

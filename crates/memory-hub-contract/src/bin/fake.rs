@@ -38,6 +38,19 @@ struct State {
     completed: BTreeMap<String, TransactionResult>,
     #[serde(default)]
     checkpoints: Vec<Checkpoint>,
+    /// The chain, newest last. A snapshot map says what each state held; this
+    /// says which state each one came from, so the history can be walked
+    /// backwards the way the real store walks its parents.
+    #[serde(default)]
+    history: Vec<HistoryEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryEntry {
+    revision: String,
+    parent: String,
+    transaction_id: String,
+    at_epoch_seconds: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,6 +75,7 @@ impl Default for State {
             snapshots: BTreeMap::from([("r0".to_owned(), Snapshot::default())]),
             completed: BTreeMap::new(),
             checkpoints: Vec::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -183,6 +197,7 @@ fn call_tool(
         }
         "memory_get_record" => get_record(state_path, &arguments),
         "memory_diff" => diff(state_path, &arguments),
+        "memory_journal" => journal(state_path, &arguments),
         "memory_export" => export(state_path, &arguments),
         "memory_import" => import(state_path, &arguments),
         "memory_search" => search(state_path, &arguments),
@@ -246,6 +261,7 @@ fn list_tools() -> Value {
                 }
             },
             {"name": "memory_diff", "description": "Diff", "inputSchema": {"type": "object"}},
+            {"name": "memory_journal", "description": "Journal", "inputSchema": {"type": "object"}},
             {"name": "memory_export", "description": "Export", "inputSchema": {"type": "object"}},
             {"name": "memory_import", "description": "Import", "inputSchema": {"type": "object"}},
             {"name": "memory_search", "description": "Search records", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
@@ -348,8 +364,15 @@ fn apply_transaction(
     }
     let revision = format!("r{}", state.next_revision);
     state.next_revision += 1;
+    let parent = state.current.clone();
     state.current.clone_from(&revision);
     state.snapshots.insert(revision.clone(), next);
+    state.history.push(HistoryEntry {
+        revision: revision.clone(),
+        parent,
+        transaction_id: transaction_id.to_owned(),
+        at_epoch_seconds: now_epoch_seconds(),
+    });
     let result = TransactionResult {
         revision,
         changed_keys: keys.into_iter().collect(),
@@ -416,6 +439,112 @@ fn diff(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
         "toRevision": to_revision,
         "changes": changes
     }))
+}
+
+/// The transactions between two revisions, newest first.
+///
+/// Walked over the recorded chain rather than derived from the snapshot map,
+/// because two states can hold the same records and still be two writes apart —
+/// which is the whole distinction this tool exists to make.
+fn journal(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
+    let from_revision = required_string(arguments, "from_revision")?;
+    let state = load_state(state_path).map_err(state_failure)?;
+    let to_revision = match arguments.get("to_revision").and_then(Value::as_str) {
+        Some(revision) => revision.to_owned(),
+        None => state.current.clone(),
+    };
+    let limit = usize::try_from(arguments.get("limit").and_then(Value::as_u64).unwrap_or(50))
+        .unwrap_or(50)
+        .clamp(1, 200);
+    for revision in [from_revision, to_revision.as_str()] {
+        if !state.snapshots.contains_key(revision) {
+            return Err(ToolFailure {
+                kind: "snapshot_not_found",
+                data: json!({"revision": revision}),
+            });
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut cursor = to_revision.clone();
+    let mut has_more = false;
+    while cursor != from_revision {
+        if entries.len() >= limit {
+            has_more = true;
+            break;
+        }
+        let Some(entry) = state
+            .history
+            .iter()
+            .find(|entry| entry.revision == cursor)
+            .cloned()
+        else {
+            return Err(ToolFailure {
+                kind: "revision_not_reachable",
+                data: json!({"from_revision": from_revision, "to_revision": to_revision}),
+            });
+        };
+        let before = state.snapshots.get(&entry.parent).ok_or(ToolFailure {
+            kind: "fake_state_invariant",
+            data: json!({"missing_revision": entry.parent}),
+        })?;
+        let after = state.snapshots.get(&entry.revision).ok_or(ToolFailure {
+            kind: "fake_state_invariant",
+            data: json!({"missing_revision": entry.revision}),
+        })?;
+        entries.push(json!({
+            "revision": entry.revision,
+            "at_epoch_seconds": entry.at_epoch_seconds,
+            "transaction_id": entry.transaction_id,
+            "changes": changes_between(before, after),
+        }));
+        cursor = entry.parent;
+    }
+
+    Ok(json!({
+        "fromRevision": from_revision,
+        "toRevision": to_revision,
+        "entries": entries,
+        "hasMore": has_more,
+    }))
+}
+
+/// What one transaction did, named the way the history names it: the change
+/// beside each record's own kind and title, including for a record that has
+/// been removed and can no longer be read.
+fn changes_between(before: &Snapshot, after: &Snapshot) -> Vec<Value> {
+    before
+        .records
+        .keys()
+        .chain(after.records.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|key| {
+            let (change, record) = match (before.records.get(key), after.records.get(key)) {
+                (None, Some(record)) => ("added", record),
+                (Some(record), None) => ("deleted", record),
+                (Some(left), Some(right)) if left != right => ("modified", right),
+                _ => return None,
+            };
+            let envelope = record.get("envelope").unwrap_or(record);
+            Some(json!({
+                "id": {"addressing": "plaintext", "value": key},
+                "change": change,
+                "kind": envelope.get("kind").and_then(Value::as_str).unwrap_or_default(),
+                "title": envelope.get("title"),
+            }))
+        })
+        .collect()
+}
+
+fn now_epoch_seconds() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default()
 }
 
 fn export(state_path: &Path, arguments: &Value) -> Result<Value, ToolFailure> {
@@ -823,6 +952,7 @@ mod tests {
                 "memory_apply_transaction",
                 "memory_get_record",
                 "memory_diff",
+                "memory_journal",
                 "memory_export",
                 "memory_import",
                 "memory_search",

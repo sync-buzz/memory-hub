@@ -10,10 +10,10 @@ Memory Hub uses three independent version dimensions:
 | Dimension | Source | Example |
 |---|---|---|
 | **MCP protocol** | `MCP_PROTOCOL_VERSION` in `memory-hub-mcp` | `2025-11-25` |
-| **Memory interface** | `MEMORY_INTERFACE_MAJOR` / `MEMORY_INTERFACE_MINOR` in `memory-hub-mcp` | `1.0` |
-| **Crate version** | `version` in workspace `Cargo.toml` | `0.1.0` |
+| **Memory interface** | `MEMORY_INTERFACE_MAJOR` / `MEMORY_INTERFACE_MINOR` in `memory-hub-mcp` | `1.1` |
+| **Crate version** | `version` in workspace `Cargo.toml` | `0.2.4` |
 
-The crate version is the release tag (`v0.1.0`). The memory interface major
+The crate version is the release tag (`v0.2.4`). The memory interface major
 is the compatibility boundary consumers negotiate during `initialize`.
 
 ## Consumer handshake
@@ -25,7 +25,7 @@ MCP `initialize` request:
 {
   "_meta": {
     "memoryHub": {
-      "memoryInterfaceVersion": {"major": 1, "minor": 0}
+      "memoryInterfaceVersion": {"major": 1, "minor": 1}
     }
   }
 }

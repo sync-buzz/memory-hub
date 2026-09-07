@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use memory_hub_core::StoredRecord;
 use memory_hub_engine::{
-    ApplyResult, Capabilities, Capability, HistoryStore, Ownership, PortableStore, RecordChange,
-    RecordId, RecordStore, Revision, StoreDescription, StoreError, Transaction,
+    ApplyResult, Capabilities, Capability, HistoryStore, Journal, Ownership, PortableStore,
+    RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreError, Transaction,
 };
 
 use crate::GitStore;
@@ -86,6 +86,10 @@ impl RecordStore for GitStore {
 impl HistoryStore for GitStore {
     fn diff(&self, from: &Revision, to: &Revision) -> Result<Vec<RecordChange>, StoreError> {
         GitStore::diff(self, from, to)
+    }
+
+    fn journal(&self, from: &Revision, to: &Revision, limit: usize) -> Result<Journal, StoreError> {
+        GitStore::journal(self, from, to, limit)
     }
 }
 

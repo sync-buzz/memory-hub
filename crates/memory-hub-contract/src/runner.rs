@@ -418,6 +418,7 @@ fn diff_import_export(target: &dyn ServerTarget, project: &Path) -> Result<(), S
     let second_revision = string_field(&second, "revision")?;
 
     assert_diff(target, project, &first_revision, &second_revision)?;
+    assert_journal(target, project, &base, &second_revision)?;
     assert_export_import_round_trip(target, project, &second_revision)
 }
 
@@ -441,6 +442,83 @@ fn assert_diff(
             ("alpha", "modified"),
             ("removed", "deleted"),
         ],
+    )
+}
+
+/// The history reports the writes, where the diff reports the difference.
+///
+/// Two transactions took this project from `base` to the second revision, and
+/// `alpha` was written in both — so the diff has one line for it and the
+/// history has two entries, which is exactly what a caller showing somebody
+/// what has been going on needs and cannot get from a diff.
+fn assert_journal(
+    target: &dyn ServerTarget,
+    project: &Path,
+    base: &str,
+    second_revision: &str,
+) -> Result<(), String> {
+    let journal = call_tool(
+        target,
+        project,
+        "memory_journal",
+        json!({"from_revision": base, "to_revision": second_revision}),
+    )
+    .map_err(display)?;
+    let entries = journal
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("journal response has no entries: {journal}"))?;
+    equal(entries.len(), 2, "journal entry count differs")?;
+    equal(
+        entries[0].get("revision").and_then(Value::as_str),
+        Some(second_revision),
+        "the journal does not lead with the newest transaction",
+    )?;
+    equal(
+        entries[0].get("transaction_id").and_then(Value::as_str),
+        Some("history-second"),
+        "the journal does not carry the id its writer minted",
+    )?;
+    if entries[0]
+        .get("at_epoch_seconds")
+        .and_then(Value::as_i64)
+        .is_none_or(|at| at <= 0)
+    {
+        return Err(format!("journal entry has no timestamp: {}", entries[0]));
+    }
+    let removed = entries[0]
+        .get("changes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("journal entry has no changes: {}", entries[0]))?
+        .iter()
+        .find(|change| change.pointer("/id/value").and_then(Value::as_str) == Some("removed"))
+        .ok_or_else(|| format!("journal entry does not mention `removed`: {}", entries[0]))?;
+    equal(
+        removed.get("change").and_then(Value::as_str),
+        Some("deleted"),
+        "the journal does not say what happened to a removed record",
+    )?;
+    equal(
+        removed.get("kind").and_then(Value::as_str),
+        Some("note"),
+        "the journal does not name the kind of a record it can no longer read",
+    )?;
+    let paged = call_tool(
+        target,
+        project,
+        "memory_journal",
+        json!({"from_revision": base, "to_revision": second_revision, "limit": 1}),
+    )
+    .map_err(display)?;
+    equal(
+        paged.get("entries").and_then(Value::as_array).map(Vec::len),
+        Some(1),
+        "journal limit was not honoured",
+    )?;
+    equal(
+        paged.get("hasMore").and_then(Value::as_bool),
+        Some(true),
+        "a journal page that filled does not say so",
     )
 }
 
