@@ -12,10 +12,29 @@ pub trait KindResolver {
     fn resolve_kind(&self, key: &str) -> Option<String>;
 }
 
+/// A relationship target that names a kind the registry holds no definition for.
+///
+/// Produced by [`SchemaRegistry::from_type_definitions_lenient`] when a
+/// `relationships.*.target` points at a kind that is not in the set. The strict
+/// [`SchemaRegistry::from_type_definitions`] refuses such a set outright; the
+/// lenient constructor records these instead, so a registry can be read from a
+/// corpus that already carries a dangling target — and the type that carries it
+/// can be removed to heal the corpus.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DanglingTarget {
+    /// The kind whose relationship points at a missing target.
+    pub kind: String,
+    /// The relation name on that kind.
+    pub relation: String,
+    /// The target kind that is not defined.
+    pub target: String,
+}
+
 /// A collection of [`TypeDefinition`]s, looked up by kind name.
 #[derive(Clone, Debug, Default)]
 pub struct SchemaRegistry {
     types: BTreeMap<String, TypeDefinition>,
+    dangling: Vec<DanglingTarget>,
 }
 
 impl SchemaRegistry {
@@ -59,6 +78,53 @@ impl SchemaRegistry {
         Ok(registry)
     }
 
+    /// Build a registry without refusing a dangling relationship target.
+    ///
+    /// Like [`from_type_definitions`](Self::from_type_definitions) for every
+    /// structural check — self-validation, duplicate kinds — but where the strict
+    /// constructor returns the first [`ValidationError`] for a `target` naming a
+    /// kind that is not in the set, this one records it in
+    /// [`dangling_targets`](Self::dangling_targets) and builds the registry
+    /// anyway. The definitions are kept intact: a dangling target is a fact
+    /// about the corpus, not a reason to hide the type that carries it.
+    ///
+    /// This is the recovery path. A corpus can arrive at a dangling target by a
+    /// deletion that predates the guard in the transaction policy that now
+    /// prevents it, and a registry that cannot be built from a corpus that
+    /// exists is one the system cannot read its way out of — every reader, the
+    /// policy itself, and the command that removes a type all need a registry to
+    /// answer. The strict constructor stays the contract for a clean corpus;
+    /// this one is taken when that one has already failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`ValidationError`] from self-validation or a
+    /// duplicate kind. A dangling target is not an error here.
+    pub fn from_type_definitions_lenient(
+        definitions: impl IntoIterator<Item = TypeDefinition>,
+    ) -> Result<Self, ValidationError> {
+        let mut registry = Self::new();
+        for definition in definitions {
+            definition.validate_self()?;
+            if registry.types.contains_key(&definition.kind_name) {
+                return Err(ValidationError::with_data(
+                    ValidationErrorKind::InvalidTypeDefinition,
+                    "kind_name",
+                    format!(
+                        "duplicate type definition for kind `{}`",
+                        definition.kind_name
+                    ),
+                    serde_json::json!({"kind_name": definition.kind_name}),
+                ));
+            }
+            registry
+                .types
+                .insert(definition.kind_name.clone(), definition);
+        }
+        registry.dangling = registry.collect_dangling_targets();
+        Ok(registry)
+    }
+
     /// Look up a type definition by kind name.
     #[must_use]
     pub fn get(&self, kind: &str) -> Option<&TypeDefinition> {
@@ -80,6 +146,32 @@ impl SchemaRegistry {
     /// Iterate over all registered type definitions.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &TypeDefinition)> {
         self.types.iter()
+    }
+
+    /// The dangling relationship targets this registry was built with, if any.
+    ///
+    /// Empty for a registry built through the strict
+    /// [`from_type_definitions`](Self::from_type_definitions) — that one
+    /// refuses a dangling target rather than recording it. Populated only by
+    /// [`from_type_definitions_lenient`](Self::from_type_definitions_lenient),
+    /// the recovery path. A reader uses this to tell a person which type to
+    /// remove.
+    #[must_use]
+    pub fn dangling_targets(&self) -> &[DanglingTarget] {
+        &self.dangling
+    }
+
+    /// Whether this registry was built from a corpus carrying a dangling target.
+    ///
+    /// True only for a registry built through
+    /// [`from_type_definitions_lenient`](Self::from_type_definitions_lenient)
+    /// whose corpus had a `relationships.*.target` naming a kind not in the
+    /// set. The transaction policy gates recovery on this: a clean corpus keeps
+    /// the strict refusal of a new dangling target, a broken one relaxes so it
+    /// can be read and healed.
+    #[must_use]
+    pub fn is_broken(&self) -> bool {
+        !self.dangling.is_empty()
     }
 
     /// Where records of `kind` live.
@@ -264,5 +356,32 @@ impl SchemaRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Every `relationships.*.target` naming a kind not in the set.
+    ///
+    /// The collection behind
+    /// [`from_type_definitions_lenient`](Self::from_type_definitions_lenient).
+    /// [`validate_cross_type_targets`](Self::validate_cross_type_targets) is
+    /// the strict form — it returns the first of these as an error — and this
+    /// is the lenient one, so the two answer the same question on the same terms
+    /// and diverge only in whether they stop.
+    fn collect_dangling_targets(&self) -> Vec<DanglingTarget> {
+        let mut dangling = Vec::new();
+        for (kind_name, definition) in &self.types {
+            for (relation, rel_def) in &definition.relationships {
+                if rel_def.target == "any" {
+                    continue;
+                }
+                if !self.types.contains_key(&rel_def.target) {
+                    dangling.push(DanglingTarget {
+                        kind: kind_name.clone(),
+                        relation: relation.clone(),
+                        target: rel_def.target.clone(),
+                    });
+                }
+            }
+        }
+        dangling
     }
 }

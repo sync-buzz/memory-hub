@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use memory_hub_core::{Envelope, RecordLink};
 use memory_hub_schema::{
-    KindResolver, SchemaRegistry, TypeDefinition, ValidationErrorKind, type_key,
+    DanglingTarget, KindResolver, SchemaRegistry, TypeDefinition, ValidationErrorKind, type_key,
 };
 use serde_json::{Value, json};
 
@@ -443,6 +443,59 @@ fn registry_rejects_dangling_relationship_target() {
 fn registry_rejects_duplicate_kind() {
     let error =
         SchemaRegistry::from_type_definitions([decision_type(), decision_type()]).unwrap_err();
+    assert_eq!(error.kind, ValidationErrorKind::InvalidTypeDefinition);
+    assert!(error.message.contains("duplicate"));
+}
+
+#[test]
+fn lenient_registry_records_a_dangling_target_instead_of_refusing() {
+    // The strict constructor refuses this set outright (see
+    // `registry_rejects_dangling_relationship_target`); the lenient one records
+    // the dangling target and builds, so a corpus that has arrived at this
+    // state can still be read and the offending type removed.
+    let orphan = TypeDefinition::from_content(
+        r#"{
+          "kind_name": "orphan",
+          "relationships": {
+            "parent": { "target": "missing_kind" }
+          }
+        }"#,
+    )
+    .unwrap();
+    let registry = SchemaRegistry::from_type_definitions_lenient([orphan]).unwrap();
+    assert!(registry.is_broken());
+    assert_eq!(
+        registry.dangling_targets(),
+        [DanglingTarget {
+            kind: "orphan".to_owned(),
+            relation: "parent".to_owned(),
+            target: "missing_kind".to_owned()
+        }]
+    );
+    // The type carrying the dangling target is still present and lookup-able:
+    // a reader needs it to tell a person which type to remove.
+    assert!(registry.get("orphan").is_some());
+}
+
+#[test]
+fn lenient_registry_reports_no_dangling_for_a_clean_corpus() {
+    let registry = SchemaRegistry::from_type_definitions_lenient([
+        decision_type(),
+        spec_type(),
+        milestone_type(),
+    ])
+    .unwrap();
+    assert!(!registry.is_broken());
+    assert!(registry.dangling_targets().is_empty());
+}
+
+#[test]
+fn lenient_registry_still_refuses_a_duplicate_kind() {
+    // Structural checks (self-validation, duplicates) are not relaxed — only
+    // the cross-type target check is. A duplicate is a malformed corpus, not
+    // a dangling reference to heal.
+    let error = SchemaRegistry::from_type_definitions_lenient([decision_type(), decision_type()])
+        .unwrap_err();
     assert_eq!(error.kind, ValidationErrorKind::InvalidTypeDefinition);
     assert!(error.message.contains("duplicate"));
 }

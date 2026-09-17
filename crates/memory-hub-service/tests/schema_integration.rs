@@ -698,3 +698,100 @@ fn reject_undeclared_link_relation() {
             .contains("depends_on")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dangling relationship target: refuse to create, recover from one left behind
+// ---------------------------------------------------------------------------
+
+/// A type whose `relationships.parent.target` names a kind that is separate.
+const REFERENCING_TYPE_CONTENT: &str = r#"{
+  "kind_name": "referencing",
+  "relationships": {
+    "parent": { "target": "referenced" }
+  }
+}"#;
+
+const REFERENCED_TYPE_CONTENT: &str = r#"{ "kind_name": "referenced" }"#;
+
+#[test]
+fn deleting_a_type_referenced_by_another_is_refused() {
+    let (_dir, store) = setup();
+    apply(
+        &store,
+        "tx-create",
+        vec![
+            Operation::put(type_record("referencing", REFERENCING_TYPE_CONTENT)),
+            Operation::put(type_record("referenced", REFERENCED_TYPE_CONTENT)),
+        ],
+    )
+    .unwrap();
+
+    // The corpus is clean; deleting `referenced` would leave
+    // `referencing.relationships.parent.target` pointing at a kind that no
+    // longer exists. Before the fix, the policy built the effective registry
+    // from the corpus *minus nothing* — deletes were not applied — so the
+    // dangling target went unnoticed and the broken state landed in the store.
+    let type_key = memory_hub_schema::type_key("referenced");
+    let error = apply(
+        &store,
+        "tx-delete-referenced",
+        vec![Operation::delete(RecordId::plaintext(type_key))],
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, StoreErrorKind::InvalidRecord);
+    assert!(
+        error.data["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not defined")
+    );
+    assert_eq!(
+        error.data["field"].as_str().unwrap(),
+        "referencing.relationships.parent.target"
+    );
+}
+
+#[test]
+fn broken_corpus_can_still_be_read_and_healed() {
+    let directory = tempfile::tempdir().unwrap();
+    git2::Repository::init(directory.path()).unwrap();
+    // A store with no policy enforces nothing, so it accepts the broken
+    // corpus directly: a type whose relationship target names a kind that was
+    // never written. This is the state a deletion that predates the guard
+    // above would leave behind, and it is what locked the system: every reader
+    // of the registry failed, and so did the policy on the next transaction.
+    let raw = GitStore::open(directory.path()).unwrap();
+    apply(
+        &raw,
+        "tx-broken",
+        vec![Operation::put(type_record(
+            "referencing",
+            REFERENCING_TYPE_CONTENT,
+        ))],
+    )
+    .unwrap();
+
+    // A store carrying the policy can still read this corpus — the strict
+    // constructor fails on the dangling target, the lenient fallback builds and
+    // records it, so `load_registry` does not lock every reader out.
+    let store = GitStore::open(directory.path())
+        .unwrap()
+        .with_policy(Arc::new(SchemaPolicy::default()));
+    let registry = load_registry(&store, &revision(&store)).unwrap();
+    assert!(registry.is_broken());
+    assert!(registry.get("referencing").is_some());
+
+    // The offending type can be removed, healing the corpus. On a broken
+    // corpus the policy relaxes to lenient, so the delete that fixes the state
+    // is not refused for the state it is fixing.
+    let type_key = memory_hub_schema::type_key("referencing");
+    apply(
+        &store,
+        "tx-heal",
+        vec![Operation::delete(RecordId::plaintext(type_key))],
+    )
+    .unwrap();
+    let registry = load_registry(&store, &revision(&store)).unwrap();
+    assert!(!registry.is_broken());
+    assert!(registry.is_empty());
+}

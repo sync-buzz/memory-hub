@@ -76,14 +76,22 @@ impl Default for SchemaPolicy {
 /// # Errors
 ///
 /// Returns [`StoreError`] if the revision cannot be read or a type record is
-/// malformed.
+/// malformed. A dangling relationship target — a kind whose `target` names a
+/// kind that is not in the corpus — does not fail here: the strict constructor
+/// is tried first, and on its failure the lenient one builds a registry that
+/// carries the dangling target as a diagnostic. A corpus that has arrived at
+/// that state (by a deletion that predates the guard in
+/// [`SchemaPolicy::check`]) must still be readable, or the type that carries
+/// the dangling target could not be removed.
 pub fn load_registry(
     store: &dyn RecordStore,
     revision: &Revision,
 ) -> Result<SchemaRegistry, StoreError> {
     let view = StoreView::open(store, revision)?;
     let records = view.records()?;
-    SchemaRegistry::from_type_definitions(filter_type_definitions(&records)?)
+    let definitions = filter_type_definitions(&records)?;
+    SchemaRegistry::from_type_definitions(definitions.clone())
+        .or_else(|_| SchemaRegistry::from_type_definitions_lenient(definitions))
         .map_err(|error| schema_registry_error(&error))
 }
 
@@ -118,18 +126,74 @@ impl TransactionPolicy for SchemaPolicy {
         // *before* it — a guard reading the merged one would compare a
         // definition against itself and wave every storage move through.
         let corpus = filter_type_definitions(existing)?;
+        // `stored` answers what a type is moving *away* from, so it is read
+        // from the corpus as it stands. The strict constructor is tried first;
+        // a corpus that already carries a dangling relationship target — a
+        // deletion that predates the guard below — is built lenient, so the
+        // corpus can be read and the type carrying the target removed. That
+        // removal is the only way back to a corpus the strict constructor
+        // accepts, and refusing to read would lock the system out of it.
         let stored = SchemaRegistry::from_type_definitions(corpus.clone())
+            .or_else(|_| SchemaRegistry::from_type_definitions_lenient(corpus))
             .map_err(|error| schema_registry_error(&error))?;
-        let mut definitions: BTreeMap<String, TypeDefinition> = corpus
+        // The state the transaction leaves standing: the corpus minus the
+        // `__type__` records this transaction deletes, plus the ones it puts.
+        // A delete is how a type is removed, so the effective registry must
+        // drop a type whose definition record a delete takes — the state a
+        // transaction is checked against is the one it produces. Missing this
+        // let a type go while another still named it in a relationship target,
+        // and the next reader of the registry found a dangling reference and
+        // could build nothing from it.
+        let deleted: BTreeSet<RecordId> = transaction
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Delete { id } => Some(id.clone()),
+                Operation::Put { .. } => None,
+            })
+            .collect();
+        let mut definitions: BTreeMap<String, TypeDefinition> = existing
+            .iter()
+            .filter_map(|(id, record)| {
+                if deleted.contains(id) {
+                    return None;
+                }
+                match record {
+                    StoredRecord::Plaintext { envelope } if envelope.kind == TYPE_KIND => {
+                        Some(TypeDefinition::from_content(&envelope.content))
+                    }
+                    StoredRecord::Plaintext { .. } => None,
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                StoreError::new(
+                    StoreErrorKind::InvalidRecord,
+                    "type definition record has malformed JSON",
+                    serde_json::json!({"detail": error.to_string()}),
+                )
+            })?
             .into_iter()
             .map(|definition| (definition.kind_name.clone(), definition))
             .collect();
         for definition in filter_type_definitions_of(transaction)? {
             definitions.insert(definition.kind_name.clone(), definition);
         }
-        let effective =
-            SchemaRegistry::from_type_definitions(definitions.into_values().collect::<Vec<_>>())
-                .map_err(|error| schema_registry_error(&error))?;
+        let effective_definitions = definitions.into_values().collect::<Vec<_>>();
+        // On a clean corpus the strict constructor refuses a transaction that
+        // leaves a dangling target — which is the guard this whole block
+        // restores, a delete taking a type another still names. On a corpus
+        // already carrying a dangling target the strict one fails on the
+        // pre-existing breakage; the lenient one relaxes so the transaction
+        // that heals it (the delete of the offending type) is not itself
+        // refused for the state it is fixing.
+        let effective = if stored.is_broken() {
+            SchemaRegistry::from_type_definitions_lenient(effective_definitions)
+                .map_err(|error| schema_registry_error(&error))?
+        } else {
+            SchemaRegistry::from_type_definitions(effective_definitions)
+                .map_err(|error| schema_registry_error(&error))?
+        };
         validate_operations_against_schema(*self, &stored, &effective, transaction, existing)?;
         require_one_record_per_folder(transaction, existing)
     }

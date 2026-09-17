@@ -17,7 +17,7 @@ pub use definition::{
     RelationshipDefinition, TypeDefinition,
 };
 pub use error::{ValidationError, ValidationErrorKind};
-pub use registry::{KindResolver, SchemaRegistry};
+pub use registry::{DanglingTarget, KindResolver, SchemaRegistry};
 pub use storage::{STORAGE_FOLDER_RULE, TypeStorage};
 
 /// Reserved record kind for document type definitions.
