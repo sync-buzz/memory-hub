@@ -187,7 +187,19 @@ impl TransactionPolicy for SchemaPolicy {
         // pre-existing breakage; the lenient one relaxes so the transaction
         // that heals it (the delete of the offending type) is not itself
         // refused for the state it is fixing.
-        let effective = if stored.is_broken() {
+        //
+        // A transaction that only deletes — never puts — is allowed to leave
+        // a dangling target. The person who owns the project owns its types:
+        // removing one that another still names is a decision, not a mistake,
+        // and the lenient constructor records the dangling target rather than
+        // refusing the delete. The strict constructor stays for transactions
+        // that put, so a new type declaring a target nothing defines is still
+        // refused at the moment it can be acted on.
+        let has_puts = transaction
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::Put { .. }));
+        let effective = if stored.is_broken() || !has_puts {
             SchemaRegistry::from_type_definitions_lenient(effective_definitions)
                 .map_err(|error| schema_registry_error(&error))?
         } else {

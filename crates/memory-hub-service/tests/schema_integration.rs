@@ -714,7 +714,7 @@ const REFERENCING_TYPE_CONTENT: &str = r#"{
 const REFERENCED_TYPE_CONTENT: &str = r#"{ "kind_name": "referenced" }"#;
 
 #[test]
-fn deleting_a_type_referenced_by_another_is_refused() {
+fn deleting_a_type_referenced_by_another_is_allowed() {
     let (_dir, store) = setup();
     apply(
         &store,
@@ -728,27 +728,43 @@ fn deleting_a_type_referenced_by_another_is_refused() {
 
     // The corpus is clean; deleting `referenced` would leave
     // `referencing.relationships.parent.target` pointing at a kind that no
-    // longer exists. Before the fix, the policy built the effective registry
-    // from the corpus *minus nothing* — deletes were not applied — so the
-    // dangling target went unnoticed and the broken state landed in the store.
+    // longer exists. The person who owns the project owns its types: removing
+    // one that another still names is a decision, not a mistake, and a
+    // delete-only transaction is allowed to leave a dangling target. The
+    // lenient constructor records it rather than refusing the delete.
     let type_key = memory_hub_schema::type_key("referenced");
-    let error = apply(
+    apply(
         &store,
         "tx-delete-referenced",
         vec![Operation::delete(RecordId::plaintext(type_key))],
     )
-    .unwrap_err();
-    assert_eq!(error.kind, StoreErrorKind::InvalidRecord);
-    assert!(
-        error.data["reason"]
-            .as_str()
-            .unwrap()
-            .contains("not defined")
-    );
+    .unwrap();
+
+    // The registry is now broken — `referencing` still names `referenced` as
+    // a target — and that is the honest state to leave it in. Healing it is
+    // removing the referencing type, which the same rule allows.
+    let registry = load_registry(&store, &revision(&store)).unwrap();
+    assert!(registry.is_broken());
     assert_eq!(
-        error.data["field"].as_str().unwrap(),
-        "referencing.relationships.parent.target"
+        registry.dangling_targets(),
+        &[memory_hub_schema::DanglingTarget {
+            kind: "referencing".to_owned(),
+            relation: "parent".to_owned(),
+            target: "referenced".to_owned(),
+        }]
     );
+
+    // Healing: removing the type that carries the dangling target clears it.
+    let referencing_key = memory_hub_schema::type_key("referencing");
+    apply(
+        &store,
+        "tx-heal",
+        vec![Operation::delete(RecordId::plaintext(referencing_key))],
+    )
+    .unwrap();
+    let registry = load_registry(&store, &revision(&store)).unwrap();
+    assert!(!registry.is_broken());
+    assert!(registry.is_empty());
 }
 
 #[test]
