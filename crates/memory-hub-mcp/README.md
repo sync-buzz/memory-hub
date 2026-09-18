@@ -12,7 +12,7 @@ Memory Hub handshake in `capabilities.experimental.memoryHub` and
 
 ```json
 {
-  "memoryInterfaceVersion": {"major": 1, "minor": 0},
+  "memoryInterfaceVersion": {"major": 1, "minor": 2},
   "storeVersion": {"major": 1, "minor": 1},
   "envelopeVersion": {"major": 1, "minor": 0},
   "indexVersion": {"major": 1, "minor": 0},
@@ -99,11 +99,26 @@ disk, which a person does the ordinary way and the next scan follows.
 | `memory_backlinks` | `key` (optional `revision`) | `{entries}` |
 
 `memory_list_records` accepts `limit` (max 200), `offset`, `kind`, `tags` (AND),
-`archived`, `freshness`, `sort` (`key`/`kind`/`title`/`freshness`/`archived`),
+`archived`, `freshness`, `sort`
+(`key`/`kind`/`title`/`freshness`/`archived`/`created`/`updated`),
 `sort_order` (`asc`/`desc`), and `metadata_only`. The response always includes
 `counts` (total, by_kind, by_freshness, archived/live, service) over the full
 filtered corpus — even on page 2 — so a UI can render facet tabs without a
 second call.
+
+`created` and `updated` order by the record's own
+`created_at_epoch_seconds` and `updated_at_epoch_seconds`, which every record
+carries in both listing shapes and when read by key. They are read from the
+transaction chain rather than stored in the record, so a corpus written before
+they existed has them too, and a write stating either is refused: the name is
+the envelope's. A store that keeps no history — records in a folder somebody
+else edits — reports neither, and those records order before the dated ones
+rather than being given a file's time, which would mean something different for
+every row.
+
+The order is computed over the whole filtered corpus and then paged. Sorting a
+page after it arrives orders fifty records out of a thousand and calls the
+result the newest fifty.
 
 Type definitions are left out of both listing and search: schema is not an
 answer to a question about the subject matter. Ask for `kind: "__type__"`, or

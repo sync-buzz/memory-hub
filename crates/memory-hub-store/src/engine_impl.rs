@@ -3,12 +3,14 @@
 //! Nothing new happens here: every method forwards to the inherent one. The
 //! value is that callers can hold a `&dyn RecordStore` and stop naming Git.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use memory_hub_core::StoredRecord;
 use memory_hub_engine::{
     ApplyResult, Capabilities, Capability, HistoryStore, Journal, Ownership, PortableStore,
-    RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreError, Transaction,
+    RecordChange, RecordId, RecordStore, RecordTimes, Revision, StoreDescription, StoreError,
+    Transaction,
 };
 
 use crate::GitStore;
@@ -90,6 +92,13 @@ impl HistoryStore for GitStore {
 
     fn journal(&self, from: &Revision, to: &Revision, limit: usize) -> Result<Journal, StoreError> {
         GitStore::journal(self, from, to, limit)
+    }
+
+    fn record_times(
+        &self,
+        revision: &Revision,
+    ) -> Result<BTreeMap<RecordId, RecordTimes>, StoreError> {
+        GitStore::record_times(self, revision)
     }
 }
 

@@ -1,11 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
 use memory_hub_core::StoredRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyResult, Journal, RecordChange, RecordId, Revision, StoreError, Transaction};
+use crate::{
+    ApplyResult, Journal, RecordChange, RecordId, RecordTimes, Revision, StoreError, Transaction,
+};
 
 /// Who writes to the storage.
 ///
@@ -255,6 +257,28 @@ pub trait HistoryStore {
     /// not an ancestor of `to` — a walk that cannot reach its stopping point is
     /// a question about two unrelated histories rather than an empty answer.
     fn journal(&self, from: &Revision, to: &Revision, limit: usize) -> Result<Journal, StoreError>;
+
+    /// When each record of a state first appeared and when it last changed.
+    ///
+    /// Every record at once rather than one at a time, because the history is
+    /// walked to answer it and walking it per record would be the same walk
+    /// repeated for every row of a list. The answer covers the whole past
+    /// behind `revision`, so a key written before anybody asked for times has
+    /// them too — the alternative, stamping a time as records are written,
+    /// leaves an established corpus with nothing to order by.
+    ///
+    /// A key absent from the map is one this history does not mention, which
+    /// for a record that is there is a store answering about a state it did not
+    /// produce. Callers report no time rather than guessing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the revision is invalid or the history is
+    /// unreadable.
+    fn record_times(
+        &self,
+        revision: &Revision,
+    ) -> Result<BTreeMap<RecordId, RecordTimes>, StoreError>;
 }
 
 /// A store whose contents can leave it and come back.

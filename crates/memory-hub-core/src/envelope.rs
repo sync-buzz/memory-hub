@@ -23,6 +23,8 @@ const RESERVED_FIELDS: &[&str] = &[
     "folder",
     "is_folder",
     "profile",
+    "created_at_epoch_seconds",
+    "updated_at_epoch_seconds",
 ];
 
 /// Hash of the exact UTF-8 content stored in an envelope.
@@ -302,6 +304,39 @@ pub struct Envelope {
     /// record is in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_folder: bool,
+    /// When the oldest transaction naming this record landed, in seconds since
+    /// the epoch, UTC. The journal states a transaction's time the same way,
+    /// and for the same reason: a number nobody has to agree a format for.
+    ///
+    /// Read from the store's own history, and it is the first transaction that
+    /// *named the key* rather than the first that created a record. A key
+    /// deleted and written again therefore reports the older of the two: the
+    /// chain records that a key changed, not how, and finding out would mean a
+    /// tree comparison per transaction to answer a question about one column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_epoch_seconds: Option<i64>,
+    /// When the newest transaction naming this record landed, in seconds since
+    /// the epoch, UTC.
+    ///
+    /// Both of these are **derived, never stored**. Nothing writes them into
+    /// the record: they are filled from the transaction chain when a record is
+    /// read out, and stripped again where a record becomes a blob. Three
+    /// things follow, and each is why it is done this way rather than by
+    /// stamping a write.
+    ///
+    /// Every record has them, back to the first one ever written — a stamped
+    /// field would leave a corpus written before it existed with nothing to
+    /// order by, which for an established project is most of it.
+    ///
+    /// No client can state them. A write carrying either is refused, because
+    /// they are reserved names, and a claim about when something happened that
+    /// its own author supplies is not evidence.
+    ///
+    /// A write that changes nothing stays a write that changes nothing. A
+    /// stamped `updated_at` would put fresh bytes in the blob on every save,
+    /// so re-stating a record verbatim would land in the history as a change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_epoch_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ClientProfile>,
     /// Compatible fields introduced by future envelope minor versions.
@@ -418,6 +453,8 @@ impl Envelope {
             content_ref: None,
             folder: None,
             is_folder: false,
+            created_at_epoch_seconds: None,
+            updated_at_epoch_seconds: None,
             profile: None,
             extensions: BTreeMap::new(),
         };
@@ -458,6 +495,8 @@ impl Envelope {
             source_paths: SourcePaths::default(),
             archive: ArchiveState::default(),
             freshness: Freshness::default(),
+            created_at_epoch_seconds: None,
+            updated_at_epoch_seconds: None,
             profile: None,
             extensions: BTreeMap::new(),
         };
@@ -624,6 +663,12 @@ impl<'de> Deserialize<'de> for Envelope {
             media_type: raw.media_type,
             folder: raw.folder,
             is_folder: raw.is_folder,
+            // Not read, from a blob or from a caller. `RawEnvelope` has no
+            // member for either, so the only way one arrives is as an
+            // extension — which `RESERVED_FIELDS` refuses below. The store
+            // fills them after this, on the way out.
+            created_at_epoch_seconds: None,
+            updated_at_epoch_seconds: None,
             profile: raw.profile,
             extensions: raw.extensions,
         };
@@ -773,6 +818,54 @@ mod tests {
                 Envelope::reference("guide", "doc", path, ContentHash::for_content("anything"));
             assert!(envelope.is_err(), "accepted {path}");
         }
+    }
+
+    /// A record's dates are read from the store's history, so a client stating
+    /// one would be supplying its own evidence. The name is reserved, which
+    /// means the attempt is refused where any other unknown member would be
+    /// kept as a product field — silently becoming a field of the type, under
+    /// a name the envelope owns.
+    #[test]
+    fn a_record_may_not_state_its_own_dates() {
+        for field in ["created_at_epoch_seconds", "updated_at_epoch_seconds"] {
+            let mut wire = serde_json::to_value(reference()).unwrap();
+            wire[field] = json!(1_700_000_000_i64);
+            let refusal = serde_json::from_value::<Envelope>(wire).map(|_| ());
+            let Err(error) = refusal else {
+                panic!("{field} was accepted from a caller");
+            };
+            assert!(
+                error.to_string().contains(field),
+                "the refusal names the field: {error}"
+            );
+        }
+    }
+
+    /// Absent from what is written and present on what is read: the two
+    /// together are what makes the date a statement about the history rather
+    /// than a member of the record.
+    #[test]
+    fn the_dates_are_not_written_and_are_not_read_back() {
+        let mut envelope = reference();
+        assert!(envelope.created_at_epoch_seconds.is_none());
+        envelope.created_at_epoch_seconds = Some(1_700_000_000);
+        envelope.updated_at_epoch_seconds = Some(1_700_000_001);
+
+        let wire = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(wire["created_at_epoch_seconds"], json!(1_700_000_000));
+        assert_eq!(wire["updated_at_epoch_seconds"], json!(1_700_000_001));
+
+        // Take them off again and what is left round-trips to the record
+        // without them — which is the whole claim: the dates are something a
+        // reader adds, not a member the record carries through a write.
+        let mut stored = wire;
+        let object = stored.as_object_mut().unwrap();
+        object.remove("created_at_epoch_seconds");
+        object.remove("updated_at_epoch_seconds");
+        assert_eq!(
+            serde_json::from_value::<Envelope>(stored).unwrap(),
+            reference()
+        );
     }
 
     #[test]

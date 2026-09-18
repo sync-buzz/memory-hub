@@ -44,8 +44,8 @@ use memory_hub_reconcile::{DivergenceMode, ReconcileReport, Reconciler};
 use memory_hub_schema::{SchemaRegistry, TYPE_KIND, TypeDefinition, TypeStorage};
 use memory_hub_store::{
     ApplyResult, ExportBundle, ExportMode, FetchResult, GitStore, Journal, MemoryRemote, Operation,
-    PushPolicyResult, RecordChange, RecordId, RecordStore, Revision, StoreDescription, StoreView,
-    Transaction, TransactionPolicy,
+    PushPolicyResult, RecordChange, RecordId, RecordStore, RecordTimes, Revision, StoreDescription,
+    StoreView, Transaction, TransactionPolicy,
 };
 
 use crate::attach::key_for;
@@ -1154,13 +1154,15 @@ impl MemoryService {
             None => StoreView::current(&*store),
         }
         .map_err(ServiceError::store)?;
-        let record = snapshot
+        let mut record = snapshot
             .get(&RecordId::plaintext(key))
             .map_err(ServiceError::store)?;
-        Ok(RecordView {
-            revision: snapshot.revision().clone(),
-            record,
-        })
+        let revision = snapshot.revision().clone();
+        drop(snapshot);
+        if let Some(StoredRecord::Plaintext { envelope }) = record.as_mut() {
+            stamp_times(envelope, &self.record_times(&revision)?);
+        }
+        Ok(RecordView { revision, record })
     }
 
     /// Filter, sort and page the corpus.
@@ -1173,8 +1175,33 @@ impl MemoryService {
         query: &ListingQuery,
         revision: Option<&Revision>,
     ) -> Result<Listing> {
-        let (revision, envelopes) = self.corpus(revision)?;
+        let (revision, mut envelopes) = self.corpus(revision)?;
+        // Before the query, not after: `apply` sorts and then pages, so a date
+        // filled in afterwards would be one the order never saw.
+        let times = self.record_times(&revision)?;
+        for (_, envelope) in &mut envelopes {
+            stamp_times(envelope, &times);
+        }
         Ok(query.apply(revision, &envelopes))
+    }
+
+    /// What the store's history says about when each record was written.
+    ///
+    /// An empty map from a store that keeps none — a folder somebody else
+    /// edits has no past to walk — so those records come back with no dates
+    /// rather than with the working tree's file times, which would mean
+    /// something different for every row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the store is locked or its history is
+    /// unreadable.
+    fn record_times(&self, revision: &Revision) -> Result<BTreeMap<RecordId, RecordTimes>> {
+        let store = self.record_store()?;
+        let Some(history) = store.history() else {
+            return Ok(BTreeMap::new());
+        };
+        history.record_times(revision).map_err(ServiceError::store)
     }
 
     /// Every folder the project has, from both sources at once.
@@ -2866,6 +2893,19 @@ impl ContentResolver for WorkingTreeContent {
             return ResolvedContent::Missing;
         };
         String::from_utf8(bytes).map_or(ResolvedContent::Binary, ResolvedContent::Text)
+    }
+}
+
+/// Put what the history says about a record onto the record.
+///
+/// Silent where the history does not mention the key: the record keeps no
+/// dates, which is the honest answer and the one the order reads. The
+/// alternative — the time the walk happened, or the epoch — is a date that
+/// looks like a fact.
+fn stamp_times(envelope: &mut Envelope, times: &BTreeMap<RecordId, RecordTimes>) {
+    if let Some(known) = times.get(&RecordId::plaintext(envelope.key.clone())) {
+        envelope.created_at_epoch_seconds = Some(known.created_at_epoch_seconds);
+        envelope.updated_at_epoch_seconds = Some(known.updated_at_epoch_seconds);
     }
 }
 

@@ -1,7 +1,7 @@
 // serde/git2 errors are mapped at one-shot ownership boundaries.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,8 +18,8 @@ use crate::types::{GitRecordId, GitRevision};
 use memory_hub_engine::{Journal, JournalEntry};
 
 use crate::{
-    ApplyResult, ExportBundle, ExportMode, MAIN_REF, Operation, RecordChange, RecordId, Revision,
-    StoreError, StoreErrorKind, StoreView, Transaction, TransactionPolicy,
+    ApplyResult, ExportBundle, ExportMode, MAIN_REF, Operation, RecordChange, RecordId,
+    RecordTimes, Revision, StoreError, StoreErrorKind, StoreView, Transaction, TransactionPolicy,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -335,6 +335,54 @@ impl GitStore {
             entries,
             has_more: false,
         })
+    }
+
+    /// When each record first appeared and when it last changed, for every key
+    /// the history behind `revision` mentions.
+    ///
+    /// One walk of the commit chain, and it reads no blobs: a transaction says
+    /// in its own message which keys it touched, so the commit's time and that
+    /// list are the whole answer. Walking newest first, the first sighting of a
+    /// key is its last change and the last sighting is its first appearance.
+    ///
+    /// The walk is the whole history rather than a page of it, because the
+    /// question is about the oldest transaction as much as the newest. That is
+    /// the same walk [`require_retained_revision`] already makes to open a past
+    /// snapshot, over commit messages rather than records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the revision is malformed, is not retained, or
+    /// the chain is unreadable.
+    pub fn record_times(
+        &self,
+        revision: &Revision,
+    ) -> Result<BTreeMap<RecordId, RecordTimes>, StoreError> {
+        let repository = self.repository()?;
+        let mut cursor = revision.oid()?;
+        require_retained_revision(&repository, cursor)?;
+        let mut times: BTreeMap<RecordId, RecordTimes> = BTreeMap::new();
+        loop {
+            let commit = memory_commit(&repository, cursor)?;
+            let metadata = transaction_metadata(&commit)?;
+            let at = commit.time().seconds();
+            for id in metadata.changed_keys {
+                times
+                    .entry(id)
+                    // Older than anything seen for this key so far, because the
+                    // walk only goes backwards — so this keeps overwriting
+                    // until the oldest transaction naming the key wins.
+                    .and_modify(|known| known.created_at_epoch_seconds = at)
+                    .or_insert(RecordTimes {
+                        created_at_epoch_seconds: at,
+                        updated_at_epoch_seconds: at,
+                    });
+            }
+            let Ok(parent) = commit.parent_id(0) else {
+                return Ok(times);
+            };
+            cursor = parent;
+        }
     }
 
     /// Export a record-only JSON bundle in [`ExportMode::Manifest`].

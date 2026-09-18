@@ -55,7 +55,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 /// discover the difference one broken read at a time. The minor moves for
 /// additive change and is accepted in either direction.
 pub const MEMORY_INTERFACE_MAJOR: u16 = 1;
-pub const MEMORY_INTERFACE_MINOR: u16 = 1;
+pub const MEMORY_INTERFACE_MINOR: u16 = 2;
 
 /// Subscribing to this reports which records changed, not only that something
 /// did. Additive: a client that only knows `memory://revision/current` keeps
@@ -1745,6 +1745,17 @@ fn render_record(key: &str, envelope: &Envelope, metadata_only: bool) -> Value {
     if let Some(media_type) = &envelope.media_type {
         record["media_type"] = json!(media_type);
     }
+    // When it appeared and when it last changed, in both shapes: a list orders
+    // by them and a record read on its own is the place a person asks how old
+    // this is. Said only when the store has a history to read them from, so
+    // their absence is a store that keeps no past rather than a record nobody
+    // has touched.
+    if let Some(created) = envelope.created_at_epoch_seconds {
+        record["created_at_epoch_seconds"] = json!(created);
+    }
+    if let Some(updated) = envelope.updated_at_epoch_seconds {
+        record["updated_at_epoch_seconds"] = json!(updated);
+    }
     // What the record's own type declared, exactly as it is stored. They live
     // in `extensions` because the envelope flattens anything it does not own
     // onto the top level, which is also where the validator reads them from —
@@ -2115,7 +2126,7 @@ pub fn list_tools() -> Value {
                     ),
                     (
                         "sort",
-                        json!({"type":"string","enum":["key","kind","title","freshness","archived"],"default":"key"}),
+                        json!({"type":"string","enum":["key","kind","title","freshness","archived","created","updated"],"default":"key"}),
                     ),
                     (
                         "sort_order",
