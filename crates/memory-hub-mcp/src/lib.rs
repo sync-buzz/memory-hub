@@ -2702,7 +2702,7 @@ impl RpcFailure {
     fn invalid_argument(field: &str) -> Self {
         Self::new(
             -32_602,
-            "invalid tool arguments",
+            format!("invalid tool arguments: `{field}` is missing, empty or malformed"),
             json!({"kind": "invalid_argument", "field": field}),
         )
     }
