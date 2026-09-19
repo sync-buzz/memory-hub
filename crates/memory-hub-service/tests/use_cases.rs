@@ -122,36 +122,6 @@ fn listing_filters_sorts_and_pages_over_the_whole_corpus() -> TestResult {
     Ok(())
 }
 
-/// Whether the order can be computed at all is decided here rather than in the
-/// sort: a record read out with no date is one nothing can order.
-#[test]
-fn a_listed_record_carries_when_it_was_written() -> TestResult {
-    let (_project, service) = service()?;
-    seed(&service, vec![put("note-1", "note", "first body")?])?;
-
-    let listing = service.list_records(&ListingQuery::default(), None)?;
-    let (_, envelope) = listing.records.first().ok_or("nothing was listed")?;
-    let created = envelope
-        .created_at_epoch_seconds
-        .ok_or("a listed record has no created date")?;
-    assert_eq!(
-        envelope.updated_at_epoch_seconds,
-        Some(created),
-        "written once, so both dates are the one transaction that wrote it"
-    );
-
-    // The same record read on its own says the same thing. Two read paths, and
-    // a date that reached only one of them is the kind of gap a list makes
-    // look like a record nobody has touched.
-    let view = service.get_record("note-1", None)?;
-    let Some(StoredRecord::Plaintext { envelope }) = view.record else {
-        return Err("expected a plaintext record".into());
-    };
-    assert_eq!(envelope.created_at_epoch_seconds, Some(created));
-    assert_eq!(envelope.updated_at_epoch_seconds, Some(created));
-    Ok(())
-}
-
 #[test]
 fn export_and_import_round_trip_a_corpus() -> TestResult {
     let (_source_dir, source) = service()?;

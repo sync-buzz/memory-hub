@@ -23,5 +23,5 @@ pub use contract::{
 pub use error::{StoreError, StoreErrorKind};
 pub use types::{
     ApplyResult, ChangeKind, ExportBundle, ExportMode, Journal, JournalChange, JournalEntry,
-    Operation, RecordChange, RecordId, RecordTimes, Revision, Transaction,
+    Operation, RecordChange, RecordId, Revision, Transaction,
 };

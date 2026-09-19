@@ -27,7 +27,7 @@ pub(super) fn build_tree(
         let name = id.tree_name();
         match operation {
             Operation::Put { record, .. } => {
-                let bytes = serde_json::to_vec(&stored(record))
+                let bytes = serde_json::to_vec(record)
                     .map_err(|error| serialization_error("serialize record", error))?;
                 let blob = repository
                     .blob(&bytes)
@@ -61,28 +61,6 @@ pub(super) fn build_tree(
         .write()
         .map_err(|error| StoreError::repository("write transaction tree", error))?;
     Ok((tree, changed))
-}
-
-/// The record as it is kept, with what the history says about it taken back
-/// off.
-///
-/// `created_at_epoch_seconds` and `updated_at_epoch_seconds` are read out of
-/// the commit chain and handed to callers on the envelope; they are not part of
-/// what a record *is*. Writing them would make the chain describe itself — and
-/// worse, a record re-stated verbatim would carry a new time, so its bytes
-/// would differ, so the transaction below would count it as a change and put an
-/// entry in the history for a write that changed nothing.
-///
-/// A client cannot reach this: both names are reserved, and a write carrying
-/// either is refused before it arrives. This is for the writes that begin with
-/// a record this store itself read out — a scan settling a locator, a folder
-/// being renamed.
-fn stored(record: &StoredRecord) -> StoredRecord {
-    let StoredRecord::Plaintext { envelope } = record;
-    let mut envelope = envelope.clone();
-    envelope.created_at_epoch_seconds = None;
-    envelope.updated_at_epoch_seconds = None;
-    StoredRecord::Plaintext { envelope }
 }
 
 pub(super) fn decode_record(repository: &Repository, oid: Oid) -> Result<StoredRecord, StoreError> {

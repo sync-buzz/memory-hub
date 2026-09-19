@@ -112,16 +112,6 @@ pub enum ListingSort {
     Title,
     Freshness,
     Archived,
-    /// When the record first appeared, oldest first.
-    Created,
-    /// When the record last changed, oldest first.
-    ///
-    /// Descending, this is the order a person means by *what has been going on*
-    /// — which is why it is computed here, over the whole selection, rather
-    /// than by whatever drew the page. A client sorting the page it was given
-    /// would order fifty records out of a thousand and call the result the
-    /// newest fifty.
-    Updated,
 }
 
 impl ListingSort {
@@ -132,8 +122,6 @@ impl ListingSort {
             "title" => Self::Title,
             "freshness" => Self::Freshness,
             "archived" => Self::Archived,
-            "created" => Self::Created,
-            "updated" => Self::Updated,
             _ => Self::Key,
         }
     }
@@ -233,32 +221,13 @@ impl ListingQuery {
                 freshness_str(left.1.freshness.state).cmp(freshness_str(right.1.freshness.state))
             }
             ListingSort::Archived => left.1.archive.archived.cmp(&right.1.archive.archived),
-            // A record with no time is one the history does not mention, which
-            // for a store that keeps a history should not happen and for one
-            // that keeps none is every record. Either way it sorts before the
-            // dated records rather than being given a plausible time, and
-            // reversing the order moves it to the other end with them.
-            ListingSort::Created => left
-                .1
-                .created_at_epoch_seconds
-                .cmp(&right.1.created_at_epoch_seconds),
-            ListingSort::Updated => left
-                .1
-                .updated_at_epoch_seconds
-                .cmp(&right.1.updated_at_epoch_seconds),
             ListingSort::Key => left.0.cmp(&right.0),
         };
-        let ordering = if self.descending {
+        if self.descending {
             ordering.reverse()
         } else {
             ordering
-        };
-        // Every order but the key's has ties, and a whole transaction's records
-        // share a second — so paging a list sorted by time would otherwise
-        // shuffle the tied rows between one page and the next. The key breaks
-        // them, in its own direction always, because a stable order is the
-        // point rather than a second opinion about the sort.
-        ordering.then_with(|| left.0.cmp(&right.0))
+        }
     }
 
     /// Filter, count, sort and page a corpus in one pass.
@@ -429,111 +398,4 @@ fn folder_matches(wanted: &str, subtree: bool, actual: Option<&str>) -> bool {
         return false;
     };
     actual == wanted || (subtree && actual.starts_with(&format!("{wanted}/")))
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use memory_hub_store::Revision;
-
-    use super::{Envelope, ListingQuery, ListingSort};
-
-    /// Envelopes in key order, which is the order a corpus arrives in — so a
-    /// test that gets the dates back in a different order is watching the sort
-    /// work rather than watching the input.
-    fn corpus() -> Vec<(String, Envelope)> {
-        [("a-note", 300_i64), ("b-note", 100), ("c-note", 200)]
-            .into_iter()
-            .map(|(key, at)| {
-                let mut envelope = Envelope::new(key, "note", "body").unwrap();
-                envelope.created_at_epoch_seconds = Some(at);
-                envelope.updated_at_epoch_seconds = Some(at);
-                (key.to_owned(), envelope)
-            })
-            .collect()
-    }
-
-    fn keys(sort: ListingSort, descending: bool) -> Vec<String> {
-        ListingQuery {
-            sort,
-            descending,
-            ..ListingQuery::default()
-        }
-        .apply(Revision::new("r"), &corpus())
-        .records
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect()
-    }
-
-    #[test]
-    fn a_listing_orders_by_when_a_record_changed() {
-        assert_eq!(
-            keys(ListingSort::Updated, false),
-            ["b-note", "c-note", "a-note"]
-        );
-        assert_eq!(
-            keys(ListingSort::Updated, true),
-            ["a-note", "c-note", "b-note"]
-        );
-        assert_eq!(
-            keys(ListingSort::Created, false),
-            ["b-note", "c-note", "a-note"]
-        );
-    }
-
-    /// A record the history says nothing about sorts with the ones that have
-    /// no date rather than being given a plausible one — and it moves to the
-    /// other end when the order is reversed, like any other value.
-    #[test]
-    fn a_record_with_no_date_is_not_given_one() {
-        let mut envelopes = corpus();
-        let mut undated = Envelope::new("d-note", "note", "body").unwrap();
-        undated.created_at_epoch_seconds = None;
-        undated.updated_at_epoch_seconds = None;
-        envelopes.push(("d-note".to_owned(), undated));
-
-        let ordered: Vec<String> = ListingQuery {
-            sort: ListingSort::Updated,
-            ..ListingQuery::default()
-        }
-        .apply(Revision::new("r"), &envelopes)
-        .records
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
-        assert_eq!(ordered, ["d-note", "b-note", "c-note", "a-note"]);
-    }
-
-    /// A whole transaction's records share a second, so an order by time is
-    /// full of ties — and a page of a list whose ties are resolved differently
-    /// each call shows a record twice and another not at all.
-    #[test]
-    fn records_written_together_are_ordered_by_key_within_the_second() {
-        let envelopes: Vec<(String, Envelope)> = ["c-note", "a-note", "b-note"]
-            .into_iter()
-            .map(|key| {
-                let mut envelope = Envelope::new(key, "note", "body").unwrap();
-                envelope.updated_at_epoch_seconds = Some(100);
-                (key.to_owned(), envelope)
-            })
-            .collect();
-        for descending in [false, true] {
-            let ordered: Vec<String> = ListingQuery {
-                sort: ListingSort::Updated,
-                descending,
-                ..ListingQuery::default()
-            }
-            .apply(Revision::new("r"), &envelopes)
-            .records
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-            assert_eq!(
-                ordered,
-                ["a-note", "b-note", "c-note"],
-                "descending={descending}"
-            );
-        }
-    }
 }

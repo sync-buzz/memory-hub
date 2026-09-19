@@ -14,8 +14,8 @@ pub use engine_impl::REFS_BACKEND;
 pub use memory_hub_engine::{
     ApplyResult, Capabilities, Capability, ChangeKind, ExportBundle, ExportMode, HistoryStore,
     Journal, JournalChange, JournalEntry, Operation, Ownership, PortableStore, RecordChange,
-    RecordId, RecordStore, RecordTimes, Revision, StoreDescription, StoreError, StoreErrorKind,
-    StoreView, Transaction, TransactionPolicy,
+    RecordId, RecordStore, Revision, StoreDescription, StoreError, StoreErrorKind, StoreView,
+    Transaction, TransactionPolicy,
 };
 pub use store::{EXPORT_SCHEMA_VERSION, GitStore, bundle};
 pub use transport::{

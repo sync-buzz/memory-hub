@@ -10,7 +10,7 @@ Start the only public machine interface with an explicit repository:
 memory-hub mcp --project /absolute/path/to/repository
 ```
 
-The server speaks MCP `2025-11-25` over stdio and Memory interface `1.2`. Initialization publishes the
+The server speaks MCP `2025-11-25` over stdio and Memory interface `1.1`. Initialization publishes the
 Memory interface, store, envelope, and index versions together with capability
 availability, installation/project identifiers, and the resolved Git
 directory. Clients may require a Memory interface major through

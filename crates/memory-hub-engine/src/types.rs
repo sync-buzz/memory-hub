@@ -149,22 +149,6 @@ pub struct RecordChange {
     pub kind: ChangeKind,
 }
 
-/// When a record first appeared in a history and when it last changed.
-///
-/// Both in seconds since the epoch, UTC, spelled the way [`JournalEntry`]
-/// spells a transaction's time — the store has no timezone and no locale, and
-/// a formatted string here would be both decided in the wrong place.
-///
-/// This is a fact about the history, not about the record, which is why it is
-/// asked of [`HistoryStore`](crate::HistoryStore) rather than carried in the
-/// record. A store that keeps no past has no answer, and says so by not
-/// implementing that trait rather than by inventing a time.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct RecordTimes {
-    pub created_at_epoch_seconds: i64,
-    pub updated_at_epoch_seconds: i64,
-}
-
 /// One transaction of the history, with what it did to the records.
 ///
 /// A diff answers *what is different between these two states*; this answers
