@@ -478,3 +478,37 @@ fn the_journal_refuses_a_revision_it_cannot_reach() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+/// The cheap count and the expensive read agree, which is what lets the
+/// question "is there any memory here?" be answered off the tree.
+#[test]
+fn counting_records_answers_what_reading_them_would() -> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, store) = repository()?;
+    let empty = store.current()?.revision().clone();
+    assert_eq!(store.record_count(&empty)?, 0);
+
+    let written = store.apply(&transaction(
+        &store,
+        "counted",
+        vec![
+            Operation::put(record("one", "first")?),
+            Operation::put(record("two", "second")?),
+        ],
+    )?)?;
+    assert_eq!(store.record_count(&written.revision)?, 2);
+    assert_eq!(
+        store.record_count(&written.revision)?,
+        store.read_records_pub(&written.revision)?.len()
+    );
+
+    let deleted = store.apply(&Transaction {
+        id: "uncounted".into(),
+        expected_revision: written.revision.clone(),
+        operations: vec![Operation::delete(RecordId::plaintext("one"))],
+    })?;
+    assert_eq!(store.record_count(&deleted.revision)?, 1);
+    // The older snapshot still counts what it held: a count is a question
+    // about a revision, not about the ref.
+    assert_eq!(store.record_count(&written.revision)?, 2);
+    Ok(())
+}

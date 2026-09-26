@@ -674,6 +674,12 @@ pub fn memory_presence(project: &Path) -> Result<MemoryPresence, StoreError> {
 /// whether any memory was ever written. Listing the refs first keeps the common
 /// empty case from opening a store at all, which is what stops the question
 /// from answering itself.
+///
+/// Counted off the tree rather than by reading the records. The answer is a
+/// number, and the caller compares it against zero; reading every envelope to
+/// produce it made the cheapest question in the interface cost as much as the
+/// most expensive one — and this is the question a client asks before every
+/// write, to find out whether there is memory to write into at all.
 fn local_record_count(git_dir: &Path) -> Result<usize, StoreError> {
     let repo = Repository::open(git_dir).map_err(|e| StoreError::repository("open", e))?;
     let mut refs = repo
@@ -684,7 +690,8 @@ fn local_record_count(git_dir: &Path) -> Result<usize, StoreError> {
     }
     drop(refs);
     let store = GitStore::open(git_dir)?;
-    Ok(store.current()?.records()?.len())
+    let revision = store.current()?.revision().clone();
+    store.record_count(&revision)
 }
 
 /// Fetch from the configured memory remote into a temporary ref and return

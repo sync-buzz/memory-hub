@@ -170,8 +170,11 @@ impl GitStore {
                 .tree()
                 .map_err(|error| StoreError::repository("find current tree", error))?;
 
+            // Back as far as the revision this request was built on, and no
+            // further — see [`find_transaction`] for what that bound means and
+            // what it costs.
             if let Some((revision, metadata)) =
-                find_transaction(&repository, current_oid, &transaction.id)?
+                find_transaction(&repository, current_oid, expected_oid, &transaction.id)?
             {
                 if metadata.request_hash.as_deref() == Some(request_hash.as_str()) {
                     return Ok(ApplyResult {
@@ -438,6 +441,26 @@ impl GitStore {
         id: &RecordId,
     ) -> Result<Option<StoredRecord>, StoreError> {
         self.read_record(revision, id)
+    }
+
+    /// How many records a snapshot holds, without reading any of them.
+    ///
+    /// The tree already names every record, so counting them walks one object.
+    /// [`Self::read_records`] answers the same number by inflating every blob
+    /// and parsing every envelope — the whole corpus of work to learn one
+    /// integer, and the caller that asks most often, `memory_presence`, only
+    /// needs to know whether that integer is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the revision or its tree cannot be read.
+    pub fn record_count(&self, revision: &Revision) -> Result<usize, StoreError> {
+        let repository = self.repository()?;
+        let tree = snapshot_tree(&repository, revision)?;
+        Ok((&tree)
+            .into_iter()
+            .filter(|entry| entry.name().ok().is_some_and(|name| name.starts_with("r-")))
+            .count())
     }
 
     pub(crate) fn read_records(
