@@ -201,12 +201,35 @@ pub(super) fn changes_since(
     Ok(changed)
 }
 
+/// Find the commit a transaction id already wrote, looking no further back
+/// than the state the request was built on.
+///
+/// `stop_at` is the caller's `expected_revision`, and the walk ends there
+/// without reading it. That bound is what the question means rather than an
+/// approximation of it: a request that is a repeat of an earlier one carries
+/// the revision that earlier one carried, so the commit it produced is
+/// somewhere after that revision by construction. Everything before it is
+/// history the request never saw.
+///
+/// Without the bound this walks the whole chain, every time, for an id that is
+/// almost never there — a new transaction is a new id, so the search that
+/// finds nothing is the normal case and it inflates every commit object in the
+/// repository to reach that answer. Measured on a project with 2643
+/// transactions it was 215 ms spent before a write began, growing with the
+/// history for ever and never with what was being written.
+///
+/// What the bound gives up is narrow and is not the guarantee anybody relies
+/// on: an id reused for a *different* request, built on a revision newer than
+/// the one that first used it, is no longer recognised as reuse. That is a
+/// client minting ids that collide rather than a delivery repeated, and the
+/// repeated delivery — the case idempotence exists for — is still caught.
 pub(super) fn find_transaction(
     repository: &Repository,
     mut cursor: Oid,
+    stop_at: Oid,
     transaction_id: &str,
 ) -> Result<Option<(Oid, TransactionMetadata)>, StoreError> {
-    loop {
+    while cursor != stop_at {
         let commit = memory_commit(repository, cursor)?;
         let metadata = transaction_metadata(&commit)?;
         if metadata.transaction_id.as_deref() == Some(transaction_id) {
@@ -217,4 +240,5 @@ pub(super) fn find_transaction(
         };
         cursor = parent;
     }
+    Ok(None)
 }
